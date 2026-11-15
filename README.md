@@ -27,8 +27,9 @@
 | 工件链（idea/discussion/proposal/requirement/design/task/changelog） | ✅ 7 类 |
 | L0 / L1 记忆最小实现 | ✅ |
 | 前端（终末地控制台风格：运行列表 / 运行详情 / 人工门 / 工件编辑 / 供应商 / 角色模板） | ✅ 已构建 |
+| 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 编辑 → 提交） | ✅ ORCH-01 |
 | 离线 Mock 供应商（流式 + 工具调用） | ✅ `scripts/mock_provider.py` |
-| 单元测试 | ✅ 14 passed |
+| 单元测试 | ✅ 26 passed |
 
 一次完整端到端运行（Mock 模型，含需求门驳回重做）：
 
@@ -93,6 +94,10 @@ cd frontend
 npm run dev            # http://127.0.0.1:5173，/api 代理到 8099
 ```
 
+> 若 Windows 的端口排除范围占用了 8099/8100（`netsh int ipv4 show excludedportrange protocol=tcp`），
+> 可改用 8375/8376：启动命令加 `--port 8375` / `--port 8376`，并把供应商 Base URL 与
+> `AM_API_TARGET` 同步改成对应端口。
+
 ### 2.4 离线演示（一条命令跑完整个流程）
 
 ```powershell
@@ -124,9 +129,32 @@ SiliconFlow / OpenRouter / Anthropic / Gemini / 自建），填 Base URL 与 API
 开发前端时，`AM_API_TARGET` 可覆盖 `/api` 代理目标（默认 `http://127.0.0.1:8099`）：
 
 ```powershell
-$env:AM_API_TARGET="http://127.0.0.1:8099"
+$env:AM_API_TARGET="http://127.0.0.1:8375"
 npm run dev
 ```
+
+### 2.7 编排工作台（ORCH-01）
+
+「编排 / PLANS」把一段设计规格变成可编辑、可校验、可提交的执行计划：
+
+1. 新建计划：粘贴 Markdown、上传 `.md`，或从某次运行的 `design` 工件导入；
+2. 点「生成任务」：PM Agent 只负责提议任务；依赖校验、波次、并行组、关键路径全部由服务端确定性计算；
+3. 图 / 表共享选中；右栏可改标题、描述、角色、effort、priority、章节、依赖与验收，400ms 防抖自动重新校验；
+   成环、缺依赖、章节不可追溯都会给出错误码、位置与修复提示；
+4. 有效后可提交：
+   - **仅保存**：计划置 `committed`，不创建 Run；
+   - **创建运行**：写入 `Task`，按任务生成 `dev_*` 节点与一个 `verify` 节点，注入 design 工件并立即开始执行；
+5. 已提交计划只读，状态条提供运行链接。
+
+离线演示（Mock）：
+
+```powershell
+cd backend
+..\.venv\Scripts\python.exe scripts\smoke_plan.py
+```
+
+脚本会用 `tests/fixtures/designs/chat-product.md` 创建计划、生成、校验并仅保存提交，打印任务数与波次/关键路径指标。
+产品名只存在于 `tests/fixtures/designs/`；页面、API、模板与断言不依赖具体产品。
 
 ---
 
@@ -138,14 +166,17 @@ am-workflow/
 │   ├── app/
 │   │   ├── main.py            FastAPI 入口、lifespan、静态托管
 │   │   ├── config.py          路径与环境配置
-│   │   ├── db/                engine/session（SQLite WAL + 单连接池）与 ORM（13 张表）
-│   │   ├── api/               providers/models/agent-templates/runs/artifacts/gates/tasks/nodes/memories
+│   │   ├── db/                engine/session（SQLite WAL + 单连接池）与 ORM（16 张表，含 plans/plan_tasks/plan_snapshots）
+│   │   ├── api/               providers/models/agent-templates/runs/artifacts/gates/tasks/nodes/memories/plans
 │   │   ├── engine/
 │   │   │   ├── orchestrator.py 调度循环、重试、门禁决策、恢复
 │   │   │   ├── runners.py      节点执行器（PASS/AGENT/VERIFY/TASKGRAPH/HUMAN_GATE…）
 │   │   │   ├── gates.py        人工门状态迁移与下游重置
 │   │   │   ├── templates.py    模板加载、seed、节点固化
 │   │   │   ├── tasks.py        任务清单行格式解析与校验
+│   │   │   ├── planner.py      计划校验、波次、关键路径、快照
+│   │   │   ├── plan_generation.py PM Agent 生成、JSON 修复、SSE
+│   │   │   ├── plan_bus.py     计划生成事件总线
 │   │   │   ├── events.py       事件总线（seq 单调、内存直推、SSE 格式）
 │   │   │   ├── agent_loop.py   模型↔工具循环、JSON 协议降级
 │   │   │   └── context.py      提示词拼装、平台规则、角色输出约束
@@ -153,9 +184,9 @@ am-workflow/
 │   │   ├── tools/registry.py  文件读写、命令执行、finish
 │   │   ├── artifacts/store.py 工件版本、front-matter、文件落盘
 │   │   ├── memory/store.py    L0/L1/L2 记忆
-│   │   └── agents/templates/roles.py  8 个角色的提示词与工具集
-│   ├── scripts/               mock_provider / e2e_demo / drive_run / check_sse
-│   ├── tests/                 core / gates / api
+│   │   └── agents/templates/roles.py  9 个角色的提示词与工具集（含 pm）
+│   ├── scripts/               mock_provider / e2e_demo / drive_run / check_sse / smoke_plan
+│   ├── tests/                 core / gates / api / planner / plans_api / fixtures
 │   └── requirements.txt
 ├── frontend/                  Vite + React 18 + TS + AntD 5 + @xyflow/react + zustand
 ├── templates/sdlc_workflow.json  固定 SDLC 模板（8 阶段 5 门）
@@ -227,6 +258,18 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 
 验收演示：跑到门 → 杀 API 进程 → 重启 → 页面刷新，门仍在，继续通过即可跑完。
 
+### 4.8 编排工作台
+
+- **提议与判定分离**：PM 只输出候选任务（严格 JSON）；uid 唯一性、依赖存在性、环、章节可追溯、任务数、
+  验收数量与质量全部由 `engine/planner.py` 校验。环错误返回具体路径（如 `T3→T5→T3`）。
+- **确定性编排**：`compute_waves` 拓扑分层；关键路径按 effort 点数（S1/M2/L3/XL5）做最长路 DP；
+  指标包含任务数、波次数、最大并行、关键路径任务/点数、总点数、角色分布。
+- **快照可追溯**：每次校验写一条 `plan_snapshots`，同一计划只保留一个 `is_valid`；编辑保留上一版，
+  支持按版本恢复。PM 原始输出、设计原文、模型 ID 一并保存。
+- **提交两种模式**：`save` 只锁定计划；`run` 复用任务依赖写入 `Task`，按任务生成 `dev_*` AGENT 节点、
+  追加 `verify` 节点，落盘 design 工件后启动现有编排器。提交幂等，重复提交返回同一 Run。
+- **人工确认**：生成结果默认待确认，只有校验通过才能提交；提交弹窗展示任务数、节点数与预算。
+
 ---
 
 ## 5. API 一览（前缀 `/api`）
@@ -243,6 +286,7 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 | 任务 | `GET/POST /runs/{id}/tasks`；`PATCH/DELETE /runs/{id}/tasks/{uid}` |
 | 节点 | `GET /nodes/{id}`；`POST /nodes/{id}/retry` |
 | 记忆 | `GET /memories`；`PATCH /memories/{id}` |
+| 编排 | `POST/GET /plans`；`GET /plans/{id}`；`POST /plans/{id}/generate`；`GET /plans/{id}/events`（SSE）；`POST /plans/{id}/validate`；`POST /plans/{id}/commit`；`POST /plans/{id}/cancel`；`POST /plans/{id}/archive`；`GET /plans/{id}/snapshots`；`POST /plans/{id}/restore/{version}`；任务增删改 `/plans/{id}/tasks` |
 
 ---
 
@@ -270,7 +314,9 @@ cd backend
 ..\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
-覆盖：图/任务解析/front-matter/预算估算、门禁通过/驳回/升级重试、供应商与模型 CRUD、模板绑定校验。
+覆盖：图/任务解析/front-matter/预算估算、门禁通过/驳回/升级重试、供应商与模型 CRUD、模板绑定校验；
+编排工作台的章节索引/校验错误码/波次/关键路径/环路径、两份 fixture 的差异、计划 API 的生成/编辑/提交
+（save 与 run）/幂等/归档。
 
 ---
 
@@ -280,6 +326,9 @@ cd backend
 - 未做：向量检索、记忆面板、执行看板、Twin 数字分身、多 run 调度面板、容器化执行、MCP 工具接入。
 - 前端单包体积 ~1.4MB（AntD + xyflow），未做路由级代码分割。
 - 任务清单暂不支持独立 `TASKGRAPH validate` 节点（解析时已校验唯一性与依赖合法性）。
+- 编排工作台 v1：一个 plan 只对应一个 run；任务数上限 8–40；提交 run 后所有任务由 `dev` 执行器执行
+  （计划里的 `test/design/ops` 目前只是标签）；生成失败自动修复一次，仍失败保留原文与错误。
+- 1440 宽度下工作台为 300/1fr/360 三栏，执行图需要横向滚动；1080 宽度单栏可看全 6 个波次。
 - Windows 下命令执行把 `python` 前缀替换为当前解释器；Linux 行为一致但未在 CI 验证。
 
 ---

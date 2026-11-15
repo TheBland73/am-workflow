@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import agent_templates, artifacts, gates, memories, model_entries, nodes
-from app.api import providers, runs, tasks
+from app.api import plans, providers, runs, tasks
 from app.config import settings
 from app.db.base import init_db
 from app.engine.orchestrator import orchestrator
@@ -47,7 +47,7 @@ app.add_middleware(
 
 API_PREFIX = "/api"
 for module in (providers, model_entries, agent_templates, runs, artifacts, gates,
-               tasks, nodes, memories):
+               tasks, nodes, memories, plans):
     app.include_router(module.router, prefix=API_PREFIX)
 
 

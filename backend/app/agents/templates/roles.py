@@ -94,6 +94,19 @@ ROLES: list[dict] = [
         "max_steps": 3,
     },
     {
+        "role_key": "pm",
+        "name": "计划分解器",
+        "system_prompt": (
+            "你是计划分解器（PM Agent）。输入是设计规格，输出严格 JSON 任务候选清单。\n"
+            "只提议任务，不修改依赖、波次或运行时工作流；依赖与调度由程序校验。\n"
+            "每个任务必须引用设计规格中真实存在的章节标题，并给出 1-5 条可测试验收标准。\n"
+            "任务数量 8-40；依赖构成有向无环图；不要输出 Markdown 围栏或解释文字。\n"
+        ),
+        "tools_json": DOC_TOOLS,
+        "memory_scope": "agent",
+        "max_steps": 2,
+    },
+    {
         "role_key": "dev",
         "name": "开发者",
         "system_prompt": (

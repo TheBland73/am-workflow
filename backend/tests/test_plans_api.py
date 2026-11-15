@@ -1,0 +1,158 @@
+"""编排工作台 API：创建 / 校验 / 编辑 / 提交（save）/ 幂等 / 归档边界。"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from app.db.base import session_scope
+from app.db.models import PlanTask
+from app.main import app
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+DESIGN = (BACKEND_DIR / "tests" / "fixtures" / "designs" / "chat-product.md").read_text(encoding="utf-8")
+
+TASK_TITLES = [
+    "梳理目标与范围", "建立会话模型", "实现检索与知识库", "实现界面与交互",
+    "补齐权限与安全", "编写测试与回归", "配置部署与监控", "输出验收与文档",
+]
+
+
+def seed_tasks(plan_id: str, count: int = 8) -> None:
+    from app.engine.planner import extract_sections
+
+    sections = extract_sections(DESIGN)
+    with session_scope() as session:
+        for index in range(count):
+            session.add(
+                PlanTask(
+                    plan_id=plan_id,
+                    task_uid=f"T{index + 1}",
+                    title=TASK_TITLES[index],
+                    description=(
+                        "依据设计章节完成实现、边界处理与自测，产出可运行代码并保证"
+                        "与上下游接口一致，失败路径有明确提示。"
+                    ),
+                    deps_json=[f"T{index}"] if index else [],
+                    design_section=sections[index]["title"],
+                    acceptance_json=["主流程有单元测试覆盖", "验收命令退出码为 0"],
+                    role_key="dev",
+                    effort="M",
+                    priority="P1",
+                    order_index=index,
+                )
+            )
+
+
+def test_plan_create_validate_commit_and_idempotent() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/plans", json={
+            "product_name": "客户反馈收集与归类",
+            "source_type": "text",
+            "design_text": DESIGN,
+        })
+        assert created.status_code == 201, created.text
+        detail = created.json()
+        plan_id = detail["plan"]["id"]
+        assert detail["plan"]["status"] == "draft"
+        assert len(detail["plan"]["sections"]) == 10
+        assert detail["tasks"] == []
+
+        seed_tasks(plan_id)
+        validated = client.post(f"/api/plans/{plan_id}/validate")
+        assert validated.status_code == 200, validated.text
+        body = validated.json()
+        assert body["status"] == "valid"
+        assert body["snapshot"]["metrics"]["task_count"] == 8
+        assert body["snapshot"]["metrics"]["wave_count"] == 8
+        assert body["snapshot"]["critical_path"][0] == "T1"
+        assert client.get(f"/api/plans/{plan_id}").json()["plan"]["status"] == "valid"
+
+        committed = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "save"})
+        assert committed.status_code == 200, committed.text
+        assert committed.json()["plan"]["status"] == "committed"
+        assert committed.json()["plan"]["run_id"] is None
+
+        again = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "save"})
+        assert again.status_code == 200, again.text
+        assert again.json()["plan"]["status"] == "committed"
+
+        listed = client.get("/api/plans").json()["items"]
+        assert any(item["id"] == plan_id and item["task_count"] == 8 for item in listed)
+
+
+def test_plan_edit_delete_and_archive() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/plans", json={
+            "product_name": "内容选题与素材库",
+            "source_type": "text",
+            "design_text": (BACKEND_DIR / "tests" / "fixtures" / "designs" / "content-product.md").read_text(encoding="utf-8"),
+        })
+        assert created.status_code == 201, created.text
+        plan_id = created.json()["plan"]["id"]
+
+        added = client.post(f"/api/plans/{plan_id}/tasks", json={
+            "title": "实现选题池", "description": "覆盖录入、筛选与状态流转，失败路径给出提示。",
+            "design_section": "选题池", "deps": [], "acceptance": ["主流程可运行"],
+            "role_key": "dev", "effort": "M", "priority": "P1",
+        })
+        assert added.status_code in (200, 201), added.text
+        uid = added.json()["task_uid"]
+
+        patched = client.patch(f"/api/plans/{plan_id}/tasks/{uid}", json={"title": "实现选题池与筛选"})
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["title"] == "实现选题池与筛选"
+
+        removed = client.delete(f"/api/plans/{plan_id}/tasks/{uid}")
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["removed_from"] == []
+
+        archived = client.post(f"/api/plans/{plan_id}/archive")
+        assert archived.status_code == 200, archived.text
+        assert archived.json()["plan"]["status"] == "archived"
+
+
+def test_plan_commit_run_creates_nodes(monkeypatch) -> None:
+    from app.api import plans as plans_api
+
+    started: list[str] = []
+    monkeypatch.setattr(plans_api.orchestrator, "start", lambda run_id: started.append(run_id))
+
+    with TestClient(app) as client:
+        created = client.post("/api/plans", json={
+            "product_name": "客户反馈收集与归类",
+            "source_type": "text",
+            "design_text": DESIGN,
+        })
+        plan_id = created.json()["plan"]["id"]
+        seed_tasks(plan_id)
+        validated = client.post(f"/api/plans/{plan_id}/validate")
+        assert validated.status_code == 200, validated.text
+
+        committed = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "run"})
+        assert committed.status_code == 200, committed.text
+        run_id = committed.json()["run_id"]
+        assert run_id
+        assert started == [run_id]
+
+        detail = client.get(f"/api/runs/{run_id}").json()
+        node_keys = {node["node_key"] for node in detail["nodes"]}
+        assert "dev_T1" in node_keys and "dev_T8" in node_keys and "verify" in node_keys
+        assert len(detail["tasks"]) == 8
+        kinds = {artifact["kind"] for artifact in detail["artifacts"]}
+        assert "design" in kinds
+
+        again = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "run"})
+        assert again.status_code == 200
+        assert again.json()["run_id"] == run_id
+        assert started == [run_id]
+
+
+def test_plan_rejects_short_design_and_missing_plan() -> None:
+    with TestClient(app) as client:
+        bad = client.post("/api/plans", json={
+            "product_name": "太短", "source_type": "text", "design_text": "# 标题\n\n太短了",
+        })
+        assert bad.status_code == 400
+        assert bad.json()["detail"]["code"] == "design_too_short"
+        assert client.get("/api/plans/nope").status_code == 404

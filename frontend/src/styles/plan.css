@@ -1,0 +1,875 @@
+/* 编排工作台（ORCH-01）：纸白 + 墨 + 单一信号黄，直角与 1px 线。 */
+.plans-page,
+.plan-page {
+  padding: 24px 40px 56px;
+  max-width: 1560px;
+  margin: 0 auto;
+}
+
+.plan-page {
+  padding-top: 20px;
+}
+
+/* ---------- 头部 ---------- */
+.plan-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 8px 0 16px;
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.plan-crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ef-ink-2);
+}
+
+.plan-crumb a {
+  color: var(--ef-ink);
+  text-decoration: none;
+  border-bottom: 1px solid var(--ef-ink);
+}
+
+.plan-title {
+  margin: 8px 0 4px;
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  color: var(--ef-ink);
+}
+
+.plan-sub {
+  font-size: 11px;
+  color: var(--ef-ink-2);
+}
+
+.plan-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 18px;
+}
+
+/* ---------- 状态条 ---------- */
+.plan-statusbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-panel);
+  font-size: 11px;
+}
+
+.plan-status-note {
+  color: var(--ef-ink-2);
+}
+
+.plan-status-error {
+  margin-left: auto;
+  color: #b42318;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.status-pill.is-generating,
+.status-pill.is-validating {
+  border-style: dashed;
+  animation: plan-pulse 1.2s steps(2, end) infinite;
+}
+
+.status-pill.is-valid,
+.status-pill.is-committed {
+  background: var(--ef-ink);
+  color: var(--ef-paper);
+  border-color: var(--ef-ink);
+}
+
+.status-pill.is-invalid,
+.status-pill.is-failed {
+  color: #b42318;
+  border-color: #b42318;
+}
+
+.status-pill.is-editing {
+  border-color: var(--ef-ink);
+}
+
+@keyframes plan-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ---------- 指标 ---------- */
+.plan-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin: 14px 0 0;
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-panel);
+}
+
+.plan-metrics > div {
+  padding: 10px 12px;
+  border-right: 1px solid var(--ef-rule);
+}
+
+.plan-metrics > div:last-child {
+  border-right: 0;
+}
+
+.plan-metrics span {
+  display: block;
+  font-family: var(--ef-mono, "Cascadia Mono", monospace);
+  font-size: 8.5px;
+  letter-spacing: 0.14em;
+  color: var(--ef-ink-2);
+}
+
+.plan-metrics b {
+  display: block;
+  margin-top: 4px;
+  font-family: "Saira", "Arial Narrow", sans-serif;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 生成流 ---------- */
+.plan-stream {
+  margin-top: 14px;
+  border: 1px solid var(--ef-ink);
+  background: var(--ef-ink);
+  color: var(--ef-paper);
+}
+
+.plan-stream-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.18);
+  font-family: var(--ef-mono, "Cascadia Mono", monospace);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+}
+
+.plan-stream-head .ant-progress {
+  width: 120px;
+  margin: 0;
+}
+
+.plan-stream-head .ant-progress-inner {
+  background: rgba(255, 255, 255, 0.2) !important;
+}
+
+.plan-stream-head .ant-progress-bg {
+  background: var(--ef-accent) !important;
+}
+
+.plan-stream pre {
+  margin: 0;
+  max-height: 128px;
+  overflow: auto;
+  padding: 10px 12px;
+  font-family: var(--ef-mono, "Cascadia Mono", monospace);
+  font-size: 10px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---------- 校验错误 ---------- */
+.plan-error-list {
+  margin-top: 14px;
+  border: 1px solid #b42318;
+  background: #fff8f7;
+}
+
+.plan-error-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(180, 35, 24, 0.25);
+  color: #b42318;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.plan-error-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.plan-error-grid button {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 4px 8px;
+  padding: 8px 12px;
+  border: 0;
+  border-right: 1px solid rgba(180, 35, 24, 0.2);
+  border-bottom: 1px solid rgba(180, 35, 24, 0.2);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: var(--ef-ink);
+}
+
+.plan-error-grid button:hover {
+  background: rgba(180, 35, 24, 0.06);
+}
+
+.plan-error-grid b {
+  grid-row: span 2;
+  font-family: var(--ef-mono, monospace);
+  font-size: 10px;
+  color: #b42318;
+}
+
+.plan-error-grid span {
+  font-size: 11px;
+}
+
+.plan-error-grid small {
+  grid-column: 2;
+  color: var(--ef-ink-2);
+  font-size: 10px;
+}
+
+/* ---------- 三栏 ---------- */
+.plan-workbench {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 360px;
+  gap: 16px;
+  align-items: start;
+  margin-top: 16px;
+}
+
+.plan-source-wrap,
+.plan-inspector-wrap {
+  min-width: 0;
+}
+
+.plan-source,
+.plan-inspector,
+.plan-stage {
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-panel);
+}
+
+.plan-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ef-rule);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.plan-panel-head b {
+  font-weight: 700;
+}
+
+.plan-panel-head > span {
+  color: var(--ef-ink-2);
+  font-size: 9px;
+}
+
+.plan-kicker {
+  font-family: var(--ef-mono, "Cascadia Mono", monospace);
+  font-size: 8.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ef-ink-2);
+}
+
+/* ---------- 来源 ---------- */
+.plan-source-meta {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.plan-source-meta > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 10px;
+}
+
+.plan-source-meta span {
+  color: var(--ef-ink-2);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.plan-source-meta b {
+  font-weight: 500;
+  font-family: var(--ef-mono, monospace);
+  font-size: 10px;
+  text-align: right;
+  word-break: break-all;
+}
+
+.plan-section-index {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.plan-section-row {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 10px;
+  line-height: 1.35;
+  border-bottom: 1px dotted rgba(22, 22, 22, 0.12);
+}
+
+.plan-section-row span {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8.5px;
+  color: var(--ef-ink-2);
+  padding-top: 2px;
+}
+
+.plan-section-row b {
+  font-weight: 500;
+}
+
+.plan-section-row.is-l1 b {
+  font-weight: 700;
+}
+
+.plan-design-text {
+  padding: 10px 12px;
+}
+
+.plan-design-text pre {
+  margin: 6px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--ef-rule);
+  background: #fbfbf9;
+  font-family: var(--ef-mono, "Cascadia Mono", monospace);
+  font-size: 9.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.plan-raw-output {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  font-family: var(--ef-mono, monospace);
+  font-size: 9px;
+  white-space: pre-wrap;
+}
+
+/* ---------- 舞台 ---------- */
+.plan-stage {
+  min-width: 0;
+  position: relative;
+}
+
+.plan-scroll-hint {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  padding: 3px 6px;
+  background: var(--ef-paper);
+  border: 1px solid var(--ef-rule);
+  font-family: var(--ef-mono, monospace);
+  font-size: 7.5px;
+  letter-spacing: 0.08em;
+  color: var(--ef-ink-2);
+  pointer-events: none;
+}
+
+.plan-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.plan-stage-head > div:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.plan-stage-head b {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.plan-stage-head span {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8.5px;
+  color: var(--ef-ink-2);
+  white-space: nowrap;
+}
+
+.plan-stage-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-mobile-only {
+  display: none;
+}
+
+/* ---------- 图 ---------- */
+.plan-graph-wrap {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  mask-image: linear-gradient(to right, #000 94%, rgba(0, 0, 0, 0.28) 100%);
+}
+
+.plan-graph {
+  position: relative;
+  display: grid;
+  gap: 0;
+  min-height: 220px;
+  padding: 0 12px 16px;
+}
+
+.plan-wave {
+  min-width: 150px;
+  border-right: 1px dotted rgba(22, 22, 22, 0.14);
+}
+
+.plan-wave:last-of-type {
+  border-right: 0;
+}
+
+.plan-wave-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 8px;
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.plan-wave-head b {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+}
+
+.plan-wave-head span {
+  color: var(--ef-ink-2);
+  font-size: 8px;
+}
+
+.plan-wave-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 8px;
+}
+
+.plan-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 7px 8px 7px 10px;
+  border: 1px solid var(--ef-rule);
+  border-left: 4px solid transparent;
+  background: var(--ef-panel);
+  text-align: left;
+  cursor: pointer;
+  color: var(--ef-ink);
+  transition: border-color 120ms steps(2, end), background 120ms steps(2, end);
+}
+
+.plan-node:hover {
+  border-color: var(--ef-ink);
+}
+
+.plan-node.is-selected {
+  border-left-color: var(--ef-accent);
+  background: #fffef0;
+}
+
+.plan-node.is-critical {
+  border-color: var(--ef-ink);
+}
+
+.plan-node.is-critical:not(.is-selected) {
+  border-left-color: var(--ef-ink);
+}
+
+.plan-node.is-error {
+  border-color: #b42318;
+  border-style: dashed;
+}
+
+.plan-node-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.plan-node-top b {
+  font-family: var(--ef-mono, monospace);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+}
+
+.plan-node-top span {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8px;
+  color: var(--ef-ink-2);
+}
+
+.plan-node-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.plan-node-meta {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  color: var(--ef-ink-2);
+}
+
+.plan-edges {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.plan-edges path {
+  fill: none;
+  stroke: rgba(22, 22, 22, 0.55);
+  stroke-width: 1.2;
+}
+
+.plan-edges path.is-critical {
+  stroke: var(--ef-ink);
+  stroke-width: 2.2;
+}
+
+/* ---------- 表 ---------- */
+.plan-table {
+  padding: 0 0 8px;
+}
+
+.plan-table .ant-table {
+  background: transparent;
+}
+
+.plan-table .ant-table-thead > tr > th {
+  background: #f4f4f1;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.plan-table .ant-table-tbody > tr {
+  cursor: pointer;
+}
+
+.plan-table .ant-table-tbody > tr.is-selected > td {
+  background: #fffef0;
+}
+
+.plan-table .ant-table-tbody > tr.is-error > td {
+  background: #fff8f7;
+}
+
+.plan-title-cell {
+  display: grid;
+  gap: 1px;
+}
+
+.plan-title-cell b {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.plan-title-cell span {
+  color: var(--ef-ink-2);
+  font-size: 10px;
+}
+
+.plan-muted {
+  color: var(--ef-ink-2);
+}
+
+.plan-role {
+  font-family: var(--ef-mono, monospace);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+/* ---------- 检查器 ---------- */
+.plan-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.plan-inspector .plan-panel-head {
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.plan-errors {
+  display: grid;
+  gap: 6px;
+  margin: 10px 12px 0;
+  padding: 8px;
+  border: 1px solid #b42318;
+  background: #fff8f7;
+}
+
+.plan-errors > div {
+  display: grid;
+  gap: 2px;
+}
+
+.plan-errors b {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8px;
+  color: #b42318;
+  letter-spacing: 0.08em;
+}
+
+.plan-errors span {
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.plan-field {
+  display: grid;
+  gap: 4px;
+  padding: 8px 12px 0;
+}
+
+.plan-field > span {
+  font-family: var(--ef-mono, monospace);
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  color: var(--ef-ink-2);
+}
+
+.plan-field .ant-input,
+.plan-field .ant-input-affix-wrapper,
+.plan-field .ant-select-selector {
+  border-radius: 0 !important;
+}
+
+.plan-field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 4px;
+}
+
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--ef-rule);
+}
+
+.plan-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 44px 18px;
+  color: var(--ef-ink-2);
+}
+
+.plan-empty b {
+  font-size: 14px;
+  color: var(--ef-ink);
+}
+
+.plan-empty span {
+  font-size: 11px;
+  max-width: 420px;
+  line-height: 1.5;
+}
+
+.plan-loading {
+  display: flex;
+  justify-content: center;
+  padding: 120px 0;
+}
+
+/* ---------- 提交 ---------- */
+.plan-commit-note {
+  font-size: 12px;
+  color: var(--ef-ink-2);
+  line-height: 1.6;
+}
+
+.plan-commit-options {
+  display: flex;
+  margin: 12px 0;
+}
+
+.plan-commit-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ef-rule);
+  font-size: 11px;
+  color: var(--ef-ink-2);
+}
+
+.plan-commit-run {
+  margin-top: 10px;
+  font-size: 11px;
+}
+
+.plan-footnote {
+  display: block;
+  margin-top: 14px;
+  font-family: var(--ef-mono, monospace);
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: var(--ef-ink-2);
+}
+
+/* ---------- 抽屉（小屏） ---------- */
+.plan-drawer-backdrop {
+  display: none;
+}
+
+@media (max-width: 1360px) {
+  .plan-workbench {
+    grid-template-columns: 264px minmax(0, 1fr) 320px;
+  }
+  .plans-page,
+  .plan-page {
+    padding-left: 28px;
+    padding-right: 28px;
+  }
+}
+
+@media (max-width: 1180px) {
+  .plan-workbench {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plan-source-wrap,
+  .plan-inspector-wrap {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 60;
+    width: min(360px, 88vw);
+    overflow-y: auto;
+    background: var(--ef-paper);
+    box-shadow: 0 0 0 1px var(--ef-rule);
+    transition: transform 160ms steps(2, end);
+  }
+
+  .plan-source-wrap {
+    left: 0;
+    transform: translateX(-100%);
+  }
+
+  .plan-inspector-wrap {
+    right: 0;
+    transform: translateX(100%);
+  }
+
+  .plan-source-wrap.is-open,
+  .plan-inspector-wrap.is-open {
+    transform: translateX(0);
+  }
+
+  .plan-drawer-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(22, 22, 22, 0.35);
+  }
+
+  .plan-drawer-backdrop.is-open {
+    display: block;
+  }
+
+  .plan-mobile-only {
+    display: inline-flex;
+  }
+
+  .plan-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .plan-error-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .plans-page,
+  .plan-page {
+    padding: 16px 14px 40px;
+  }
+  .plan-head {
+    flex-direction: column;
+    gap: 8px;
+  }
+  .plan-head-actions {
+    justify-content: flex-start;
+    padding-top: 0;
+  }
+  .plan-title {
+    font-size: 24px;
+  }
+  .plan-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .plan-field-row {
+    grid-template-columns: 1fr;
+  }
+}
