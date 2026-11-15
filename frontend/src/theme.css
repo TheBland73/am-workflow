@@ -1,0 +1,110 @@
+:root {
+  --am-bg: #f6f7fb;
+  --am-ink: #1f2333;
+  --am-muted: #6b7280;
+  --am-border: #e5e7eb;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background: var(--am-bg);
+  color: var(--am-ink);
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.am-shell { min-height: 100%; }
+
+.am-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 20px 14px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.am-logo-mark {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #4f46e5, #8b5cf6);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-size: 15px;
+}
+
+.am-content { padding: 20px 24px 32px; }
+
+.am-page-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.am-page-title { font-size: 20px; font-weight: 700; margin: 0; }
+.am-page-sub { color: var(--am-muted); margin-top: 4px; font-size: 13px; }
+
+.am-card { background: #fff; border: 1px solid var(--am-border); border-radius: 12px; }
+
+.am-mono {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.am-log {
+  background: #10131c;
+  color: #dbe1ff;
+  border-radius: 10px;
+  padding: 10px 12px;
+  height: 340px;
+  overflow: auto;
+  font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.am-log-line { white-space: pre-wrap; word-break: break-word; }
+.am-log-time { color: #6f7a9c; margin-right: 8px; }
+.am-log-node { color: #7dd3fc; margin-right: 6px; }
+.am-log-warn { color: #fbbf24; }
+.am-log-error { color: #fb7185; }
+
+.am-artifact {
+  white-space: pre-wrap;
+  background: #fbfbfd;
+  border: 1px solid var(--am-border);
+  border-radius: 10px;
+  padding: 14px;
+  font-size: 13px;
+  line-height: 1.75;
+  max-height: 480px;
+  overflow: auto;
+}
+
+.am-phase-strip { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.am-phase {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--am-border);
+  color: var(--am-muted);
+  background: #fff;
+}
+
+.am-phase.active {
+  color: #3730a3;
+  border-color: #c7d2fe;
+  background: #eef2ff;
+  font-weight: 600;
+}
+
+.am-phase.done { color: #047857; border-color: #a7f3d0; background: #ecfdf5; }
+
+.react-flow__node { font-size: 12px; }

@@ -1,0 +1,111 @@
+"""请求/响应模型（设计规格 §5.5）。"""
+from __future__ import annotations
+
+from pydantic import BaseModel, Field
+
+
+class ProviderIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    protocol: str = "openai_chat"
+    base_url: str = ""
+    api_key: str | None = None
+    extra_headers: dict = Field(default_factory=dict)
+    timeout_s: int = 60
+    max_concurrency: int = 4
+    enabled: bool = True
+
+
+class ProviderPatch(BaseModel):
+    name: str | None = None
+    protocol: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    extra_headers: dict | None = None
+    timeout_s: int | None = None
+    max_concurrency: int | None = None
+    enabled: bool | None = None
+
+
+class ModelIn(BaseModel):
+    provider_id: int
+    model_name: str = Field(min_length=1, max_length=160)
+    display_name: str = ""
+    context_window: int = 32768
+    max_output_tokens: int = 4096
+    cap_tools: bool = True
+    cap_json: bool = True
+    cap_vision: bool = False
+    price_in: float = 0.0
+    price_out: float = 0.0
+    enabled: bool = True
+
+
+class ModelPatch(BaseModel):
+    model_name: str | None = None
+    display_name: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    cap_tools: bool | None = None
+    cap_json: bool | None = None
+    cap_vision: bool | None = None
+    price_in: float | None = None
+    price_out: float | None = None
+    enabled: bool | None = None
+
+
+class TemplatePatch(BaseModel):
+    system_prompt: str | None = None
+    tools_json: list[str] | None = None
+    default_model_id: int | None = None
+    max_steps: int | None = None
+    stop_condition: list[str] | None = None
+
+
+class RunIn(BaseModel):
+    idea: str = Field(min_length=1, max_length=20000)
+    template_key: str = "sdlc_v1"
+    budget_tokens: int | None = None
+
+
+class ArtifactPatch(BaseModel):
+    body: str = Field(min_length=1)
+    status: str = "reviewed"
+
+
+class GateDecision(BaseModel):
+    feedback: str | None = None
+    target_node: str | None = None
+    decided_by: str = "human"
+    artifact_body: str | None = None
+    artifact_kind: str | None = None
+
+
+class TaskIn(BaseModel):
+    task_uid: str
+    title: str
+    deps: list[str] = Field(default_factory=list)
+    design_section: str | None = None
+    test_cases: list[str] = Field(default_factory=list)
+    assignee: str = "dev"
+    wave: int | None = None
+    status: str = "pending"
+
+
+class TaskPatch(BaseModel):
+    title: str | None = None
+    deps: list[str] | None = None
+    design_section: str | None = None
+    test_cases: list[str] | None = None
+    assignee: str | None = None
+    wave: int | None = None
+    status: str | None = None
+
+
+class MemoryPatch(BaseModel):
+    content: str | None = None
+    status: str | None = None
+    subject: str | None = None
+
+
+class RetryIn(BaseModel):
+    feedback: str | None = None

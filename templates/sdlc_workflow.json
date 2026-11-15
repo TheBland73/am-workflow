@@ -1,0 +1,108 @@
+{
+  "key": "sdlc_v1",
+  "name": "标准软件研发流程（W1）",
+  "description": "想法 → 讨论 → 方案 → 需求 → 设计 → 任务分解 → 并行执行 → 交付；含 5 个人工门。",
+  "phases": [
+    {"key": "idea", "name": "想法"},
+    {"key": "discussion", "name": "讨论"},
+    {"key": "proposal", "name": "方案"},
+    {"key": "requirement", "name": "需求"},
+    {"key": "design", "name": "设计"},
+    {"key": "tasks", "name": "任务分解"},
+    {"key": "execution", "name": "执行"},
+    {"key": "delivery", "name": "交付"}
+  ],
+  "nodes": [
+    {
+      "key": "idea", "type": "PASS", "name": "想法录入", "phase": "idea", "deps": [],
+      "config": {}
+    },
+    {
+      "key": "discuss_pro", "type": "AGENT", "name": "讨论·主张", "phase": "discussion",
+      "deps": ["idea"], "assignee": {"role": "discuss_pro"},
+      "config": {"artifact": "discussion", "append": false,
+                 "instruction": "针对用户想法，提出一条可落地的建设路径（主张）。"}
+    },
+    {
+      "key": "discuss_con", "type": "AGENT", "name": "讨论·质疑", "phase": "discussion",
+      "deps": ["discuss_pro"], "assignee": {"role": "discuss_con"},
+      "config": {"artifact": "discussion", "append": true,
+                 "instruction": "阅读已有讨论稿（主张），输出「质疑」部分并追加到讨论稿。"}
+    },
+    {
+      "key": "proposal", "type": "AGENT", "name": "方案架构师", "phase": "proposal",
+      "deps": ["discuss_con"], "assignee": {"role": "proposal"},
+      "config": {"artifact": "proposal", "inputs": ["idea", "discussion"],
+                 "instruction": "综合想法与讨论稿，输出建设方案，逐条回应质疑。"}
+    },
+    {
+      "key": "gate_proposal", "type": "HUMAN_GATE", "name": "方案确认", "phase": "proposal",
+      "deps": ["proposal"],
+      "config": {"artifact": "proposal", "title": "方案确认",
+                 "description": "确认建设方案的范围与路线；驳回时请选择目标节点并写明反馈。"}
+    },
+    {
+      "key": "requirement", "type": "AGENT", "name": "需求分析师", "phase": "requirement",
+      "deps": ["gate_proposal"], "assignee": {"role": "requirement"},
+      "config": {"artifact": "requirement", "inputs": ["proposal"],
+                 "instruction": "基于已确认方案产出 EARS 需求规格与验收标准。"}
+    },
+    {
+      "key": "gate_requirement", "type": "HUMAN_GATE", "name": "需求审查", "phase": "requirement",
+      "deps": ["requirement"],
+      "config": {"artifact": "requirement", "title": "需求审查",
+                 "description": "审查需求是否可验收；可直接编辑后通过。"}
+    },
+    {
+      "key": "design", "type": "AGENT", "name": "系统设计师", "phase": "design",
+      "deps": ["gate_requirement"], "assignee": {"role": "design"},
+      "config": {"artifact": "design", "inputs": ["requirement", "proposal"],
+                 "instruction": "基于需求规格输出编号章节的设计规格。"}
+    },
+    {
+      "key": "gate_design", "type": "HUMAN_GATE", "name": "设计审查", "phase": "design",
+      "deps": ["design"],
+      "config": {"artifact": "design", "title": "设计审查",
+                 "description": "审查设计是否可实施；可直接编辑后通过。"}
+    },
+    {
+      "key": "tasks", "type": "AGENT", "name": "任务分解器", "phase": "tasks",
+      "deps": ["gate_design"], "assignee": {"role": "task_breaker"},
+      "config": {"artifact": "task", "inputs": ["design"],
+                 "instruction": "把设计拆成 2-4 个可并行/可验证的开发任务。"}
+    },
+    {
+      "key": "taskgraph", "type": "TASKGRAPH", "name": "任务图构建", "phase": "tasks",
+      "deps": ["tasks"], "config": {"mode": "parse"}
+    },
+    {
+      "key": "gate_tasks", "type": "HUMAN_GATE", "name": "任务图确认", "phase": "tasks",
+      "deps": ["taskgraph"],
+      "config": {"artifact": "task", "title": "任务图确认",
+                 "description": "确认任务依赖与 wave；通过后展开并行开发节点。"}
+    },
+    {
+      "key": "expand_exec", "type": "TASKGRAPH", "name": "展开执行图", "phase": "execution",
+      "deps": ["gate_tasks"], "config": {"mode": "expand"}
+    },
+    {
+      "key": "verify", "type": "VERIFY", "name": "测试验证", "phase": "execution",
+      "deps": ["expand_exec"],
+      "config": {"command": "python -m unittest discover -s . -p \"test_*.py\"",
+                 "timeout_s": 180, "dynamic": true}
+    },
+    {
+      "key": "gate_accept", "type": "HUMAN_GATE", "name": "验收确认", "phase": "execution",
+      "deps": ["verify"],
+      "config": {"title": "验收确认",
+                 "description": "确认执行结果与测试证据；通过后生成 changelog。"}
+    },
+    {
+      "key": "delivery", "type": "AGENT", "name": "集成交付", "phase": "delivery",
+      "deps": ["gate_accept"], "assignee": {"role": "delivery"},
+      "config": {"artifact": "changelog",
+                 "inputs": ["proposal", "requirement", "design", "task"],
+                 "instruction": "汇总工件链与验证证据，产出 changelog。"}
+    }
+  ]
+}
