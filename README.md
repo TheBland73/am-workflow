@@ -7,7 +7,7 @@
 固定 SDLC 模板跑通「想法 → 讨论 → 方案 → 需求 → 设计 → 任务 → 并行开发 → 交付」，
 含 5 个人工门、SSE 实时事件、工件链落盘、断点恢复，以及一个可离线演示的 Mock 供应商。
 
-设计依据（三份文档在 PR #1 `docs/survey-and-design-spec` 分支，暂未合入 main）：
+设计依据（已合入 main，见 `docs/`）：
 
 - `docs/设计规格说明书.md`：实现基线（§4 数据模型、§5 API、§7 W1 范围）
 - `docs/research/前沿技术调研与技术选型.md`：选型论据
@@ -144,7 +144,7 @@ am-workflow/
 │   └── requirements.txt
 ├── frontend/                  Vite + React 18 + TS + AntD 5 + @xyflow/react + zustand
 ├── templates/sdlc_workflow.json  固定 SDLC 模板（8 阶段 5 门）
-├── docs/                      预留
+├── docs/                      设计文档（调研 / 设计规格 / 模型接入）
 ├── runs/                      运行产物（工件、工作区），git 忽略
 └── data/                      SQLite 与密钥，git 忽略
 ```
