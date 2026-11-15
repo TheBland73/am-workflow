@@ -88,6 +88,39 @@ class TaskIn(BaseModel):
     test_cases: list[str] = Field(default_factory=list)
     assignee: str = "dev"
     wave: int | None = None
+
+
+class PlanCreate(BaseModel):
+    product_name: str = Field(min_length=1, max_length=160)
+    source_type: str = "text"  # artifact/upload/text
+    source_ref: str | None = None
+    design_text: str | None = None
+
+
+class PlanTaskPatch(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    deps: list[str] | None = None
+    design_section: str | None = None
+    acceptance: list[str] | None = None
+    role_key: str | None = None
+    effort: str | None = None
+    priority: str | None = None
+
+
+class PlanTaskCreate(BaseModel):
+    title: str = ""
+    description: str = ""
+    deps: list[str] = Field(default_factory=list)
+    design_section: str | None = None
+    acceptance: list[str] = Field(default_factory=list)
+    role_key: str = "dev"
+    effort: str = "M"
+    priority: str = "P1"
+
+
+class PlanCommit(BaseModel):
+    mode: str = "save"  # save/run
     status: str = "pending"
 
 
