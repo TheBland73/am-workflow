@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import {
-  Button, Card, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch,
-  Table, Tag, message,
+  Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch,
+  Table, message,
 } from "antd";
 import {
   ApiOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ThunderboltOutlined,
@@ -112,7 +112,7 @@ export default function ProvidersPage() {
         <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>新增供应商</Button>
       </div>
 
-      <Card size="small">
+      <div className="am-card" style={{ padding: 8 }}>
         <Table
           rowKey="id"
           size="middle"
@@ -152,10 +152,10 @@ export default function ProvidersPage() {
                         title: "能力", width: 220,
                         render: (_: unknown, model: ModelEntry) => (
                           <Space size={4}>
-                            {model.cap_tools && <Tag color="blue">tools</Tag>}
-                            {model.cap_json && <Tag color="purple">json</Tag>}
-                            {model.cap_vision && <Tag color="cyan">vision</Tag>}
-                            {!model.enabled && <Tag>disabled</Tag>}
+                            {model.cap_tools && <span className="ef-tag">tools</span>}
+                            {model.cap_json && <span className="ef-tag">json</span>}
+                            {model.cap_vision && <span className="ef-tag">vision</span>}
+                            {!model.enabled && <span className="ef-tag">disabled</span>}
                           </Space>
                         ),
                       },
@@ -188,11 +188,13 @@ export default function ProvidersPage() {
               render: (protocol: string) => <span className="am-mono">{protocol}</span> },
             { title: "Base URL", dataIndex: "base_url", ellipsis: true },
             { title: "密钥", dataIndex: "api_key_masked", width: 130,
-              render: (masked: string) => masked ? <span className="am-mono">{masked}</span> : <Tag>未配置</Tag> },
+              render: (masked: string) => masked ? <span className="am-mono">{masked}</span> : <span className="ef-tag">未配置</span> },
             { title: "并发", dataIndex: "max_concurrency", width: 70 },
             { title: "模型", dataIndex: "models_count", width: 70 },
             { title: "启用", dataIndex: "enabled", width: 80,
-              render: (enabled: boolean) => enabled ? <Tag color="success">启用</Tag> : <Tag>停用</Tag> },
+              render: (enabled: boolean) => enabled
+                ? <span className="ef-tag is-signal">启用</span>
+                : <span className="ef-tag">停用</span> },
             {
               title: "", width: 190,
               render: (_: unknown, provider: Provider) => (
@@ -213,7 +215,7 @@ export default function ProvidersPage() {
             },
           ]}
         />
-      </Card>
+      </div>
 
       <Modal
         title={providerModal.edit ? "编辑供应商" : "新增供应商"}
