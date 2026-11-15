@@ -1236,3 +1236,285 @@ body {
   border-color: var(--ef-signal);
   color: var(--ef-on-signal);
 }
+
+/* ---------- left rail (command bar moved off the top) ---------- */
+.ef-shell {
+  display: flex;
+  align-items: stretch;
+  min-height: 100vh;
+}
+
+.ef-shell .am-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.am-rail {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  align-self: flex-start;
+  display: flex;
+  flex: 0 0 216px;
+  flex-direction: column;
+  width: 216px;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--ef-panel);
+  border-right: 1px solid var(--ef-rule);
+  transition: flex-basis 0.18s ease, width 0.18s ease;
+}
+
+.ef-shell.is-collapsed .am-rail {
+  flex-basis: 64px;
+  width: 64px;
+}
+
+.am-rail-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 10px;
+  border-bottom: 1px solid var(--ef-rule);
+}
+
+.am-rail-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.am-rail-brand .seal {
+  display: grid;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  background: var(--ef-ink);
+  color: var(--ef-panel);
+  font-family: var(--ef-font-ui);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.am-rail-name {
+  overflow: hidden;
+  color: var(--ef-ink);
+  font-family: var(--ef-font-ui);
+  font-size: 0.68rem;
+  font-weight: 800;
+  font-stretch: var(--ef-wider, 115%);
+  letter-spacing: 0.13em;
+  white-space: nowrap;
+}
+
+.am-rail-toggle {
+  display: grid;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--ef-ink-2);
+  cursor: pointer;
+}
+
+.am-rail-toggle:hover {
+  border-color: var(--ef-rule);
+  color: var(--ef-ink);
+}
+
+.am-rail-nav {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 8px;
+  overflow-y: auto;
+}
+
+.am-rail-nav a {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 9px;
+  border: 1px solid transparent;
+  color: var(--ef-ink-2);
+  text-decoration: none;
+}
+
+.am-rail-nav a:hover {
+  background: color-mix(in srgb, var(--ef-ink) 4%, transparent);
+  color: var(--ef-ink);
+}
+
+.am-rail-nav a[aria-current="page"] {
+  background: var(--ef-ink);
+  color: var(--ef-panel);
+  font-weight: 700;
+}
+
+.am-rail-nav a[aria-current="page"]::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  background: var(--ef-signal);
+}
+
+.am-rail-icon {
+  display: inline-flex;
+  flex: none;
+  font-size: 1rem;
+}
+
+.am-rail-label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.1;
+}
+
+.am-rail-label b {
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.am-rail-label small {
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.5rem;
+  font-weight: 600;
+  font-stretch: var(--ef-wider, 115%);
+  letter-spacing: 0.14em;
+}
+
+.am-rail-nav a[aria-current="page"] .am-rail-label small {
+  color: color-mix(in srgb, var(--ef-panel) 72%, transparent);
+}
+
+.am-rail-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: auto;
+  padding: 12px 12px 16px;
+  border-top: 1px solid var(--ef-rule);
+}
+
+.am-rail-meta {
+  overflow: hidden;
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.52rem;
+  font-weight: 600;
+  font-stretch: var(--ef-wider, 115%);
+  letter-spacing: 0.12em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.am-rail-w1 {
+  align-self: center;
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.ef-shell.is-collapsed .am-rail-top {
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+}
+
+.ef-shell.is-collapsed .am-rail-toggle {
+  margin-left: 0;
+}
+
+.ef-shell.is-collapsed .am-rail-name,
+.ef-shell.is-collapsed .am-rail-label {
+  display: none;
+}
+
+.ef-shell.is-collapsed .am-rail-nav a {
+  justify-content: center;
+  padding: 12px 0;
+}
+
+.ef-shell.is-collapsed .am-rail-nav a[aria-current="page"]::after {
+  top: 7px;
+  right: 7px;
+  margin-top: 0;
+}
+
+.ef-shell.is-collapsed .am-rail-foot {
+  align-items: center;
+  padding: 12px 0;
+}
+
+/* rail layout: keep the 3-column board at 1080, collapse to a stack below 900 */
+@media (max-width: 1080px) {
+  .board {
+    grid-template-columns: minmax(0, 1fr) 16rem minmax(0, 1fr);
+    grid-template-rows: repeat(3, minmax(0, auto));
+    height: auto;
+    min-height: 0;
+  }
+
+  .hub {
+    grid-column: 2;
+    grid-row: 1 / 4;
+  }
+
+  .l1, .l2, .l3 { grid-column: 1; }
+  .r1, .r2, .r3 { grid-column: 3; }
+  .l1, .r1 { grid-row: 1; }
+  .l2, .r2 { grid-row: 2; }
+  .l3, .r3 { grid-row: 3; }
+  .l2 { margin: 0 1rem 0 0; }
+  .r2 { margin: 0 0 0 1rem; }
+
+  .hub .ef-dial { width: min(100%, 16rem); }
+}
+
+@media (max-width: 900px) {
+  .board {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+    height: auto;
+    min-height: 0;
+  }
+
+  .hub, .l1, .l2, .l3, .r1, .r2, .r3 {
+    grid-column: 1;
+    grid-row: auto;
+    margin: 0;
+  }
+
+  .hub { order: 4; }
+  .l1 { order: 1; }
+  .l2 { order: 2; }
+  .l3 { order: 3; }
+  .r1 { order: 5; }
+  .r2 { order: 6; }
+  .r3 { order: 7; }
+}
