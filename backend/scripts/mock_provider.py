@@ -332,11 +332,98 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------- 响应构造
+def _pm_plan(messages: list[dict]) -> str:
+    """把设计章节索引变成一份可校验的任务候选 JSON（离线演示用）。"""
+    joined = "\n".join(str(m.get("content") or "") for m in messages)
+    product = "示例产品"
+    match = re.search(r"^产品：(.+)$", joined, re.M)
+    if match:
+        product = match.group(1).strip()[:60]
+    sections: list[str] = []
+    index_block = re.search(r"## 设计章节索引\n(.+?)\n\n## 设计规格正文", joined, re.S)
+    if index_block:
+        for line in index_block.group(1).splitlines():
+            line = line.strip()
+            if line.startswith("- "):
+                title = line[2:].strip()
+                if title and title != "（未识别到章节标题）":
+                    sections.append(title[:40])
+    if len(sections) < 8:
+        base = sections[0] if sections else "总体设计"
+        filler = [
+            "数据模型与存储", "接口与错误处理", "前端交互", "权限与安全",
+            "测试与回归", "部署与监控", "验收与文档", "边界与降级",
+        ]
+        for title in filler:
+            if len(sections) >= 8:
+                break
+            sections.append(f"{base}·{title}")
+    sections = sections[:10]
+    tasks = []
+    for i, section in enumerate(sections):
+        uid = f"T{i + 1}"
+        if i == 0:
+            deps: list[str] = []
+        elif i in (1, 2):
+            deps = ["T1"]
+        elif i == 3:
+            deps = ["T2"]
+        elif i == 4:
+            deps = ["T3"]
+        elif i == 5:
+            deps = ["T4", "T5"]
+        elif i in (6, 7):
+            deps = ["T6"]
+        else:
+            deps = ["T7"]
+        role = "dev"
+        if any(word in section for word in ("测试", "回归", "验收")):
+            role = "test" if "测试" in section or "回归" in section else "review"
+        elif any(word in section for word in ("设计", "交互", "界面")):
+            role = "design"
+        elif any(word in section for word in ("部署", "监控", "运维")):
+            role = "ops"
+        if i == 0:
+            role = "pm"
+        effort = ["M", "L", "M", "S", "L", "M", "L", "S", "M", "M"][i]
+        priority = "P0" if i < 2 else ("P2" if i >= 7 else "P1")
+        title = f"实现{section}"[:40]
+        if len(title) < 6:
+            title = f"实现章节{section}"[:40]
+        tasks.append(
+            {
+                "uid": uid,
+                "title": title,
+                "description": (
+                    f"依据设计章节「{section}」完成该模块的实现、边界处理与自测，"
+                    "产出可运行代码、测试与必要的说明，确保与上下游接口一致。"
+                )[:200],
+                "deps": deps,
+                "design_section": section,
+                "acceptance": [
+                    f"「{section}」的实现可运行，主流程有单元测试覆盖",
+                    "失败路径有明确错误提示，验收命令退出码为 0",
+                ],
+                "role": role,
+                "effort": effort,
+                "priority": priority,
+            }
+        )
+    payload = {
+        "product": product,
+        "summary": f"依据设计规格拆分出 {len(tasks)} 个可独立验收的任务，按依赖分波执行。",
+        "tasks": tasks,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _pick(messages: list[dict], tools: list[dict] | None) -> tuple[str, dict | None]:
     system = next((m.get("content") or "" for m in messages if m.get("role") == "system"), "")
     if tools:
         call = _dev_tool_call(messages)
         return "", call
+    if "计划分解器" in system or "只输出一个 JSON 对象" in system:
+        return _pm_plan(messages), None
     if "EARS" in system:
         return _requirement(messages), None
     if "任务清单必须使用规定行格式" in system:
