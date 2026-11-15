@@ -176,3 +176,116 @@ export interface Preset {
     cap_json?: boolean;
   }>;
 }
+
+/* ---------- 编排工作台（ORCH-01） ---------- */
+
+export type PlanStatus =
+  | "draft" | "generating" | "generated" | "validating"
+  | "valid" | "invalid" | "editing" | "committed" | "archived" | "failed";
+
+export type PlanSourceType = "artifact" | "upload" | "text";
+export type TaskRole = "dev" | "test" | "design" | "pm" | "review" | "ops";
+export type TaskEffort = "S" | "M" | "L" | "XL";
+export type TaskPriority = "P0" | "P1" | "P2";
+
+export interface PlanSection {
+  level: number;
+  title: string;
+  line: number;
+  key: string;
+}
+
+export interface PlanTask {
+  id: number;
+  task_uid: string;
+  title: string;
+  description: string;
+  deps: string[];
+  design_section: string;
+  acceptance: string[];
+  role_key: TaskRole;
+  effort: TaskEffort;
+  priority: TaskPriority;
+  order_index: number;
+}
+
+export interface PlanMetrics {
+  task_count?: number;
+  wave_count?: number;
+  max_parallel?: number;
+  critical_path_tasks?: number;
+  critical_path_points?: number;
+  total_points?: number;
+  role_distribution?: Record<string, number>;
+}
+
+export interface PlanValidationError {
+  code: string;
+  message: string;
+  task_uid?: string | null;
+  hint?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface PlanValidation {
+  ok: boolean;
+  errors: PlanValidationError[];
+}
+
+export interface PlanDagEdge {
+  from: string;
+  to: string;
+}
+
+export interface PlanSnapshot {
+  version: number;
+  metrics: PlanMetrics;
+  waves: Record<string, string[]>;
+  critical_path: string[];
+  dag: { nodes?: string[]; edges?: PlanDagEdge[] };
+  validation: PlanValidation;
+  is_valid: boolean;
+  created_at: string | null;
+}
+
+export interface PlanHeader {
+  id: string;
+  product_name: string;
+  source_type: PlanSourceType;
+  source_ref: string | null;
+  status: PlanStatus;
+  model_id: number | null;
+  model_name?: string | null;
+  error: string | null;
+  run_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  design_text?: string;
+  raw_output?: string | null;
+  sections: PlanSection[];
+  budget_tokens?: number;
+}
+
+export interface PlanDetail {
+  plan: PlanHeader;
+  tasks: PlanTask[];
+  snapshot: PlanSnapshot | null;
+}
+
+export interface PlanListItem {
+  id: string;
+  product_name: string;
+  source_type: PlanSourceType;
+  status: PlanStatus;
+  error: string | null;
+  run_id: string | null;
+  task_count: number;
+  metrics: PlanMetrics;
+  updated_at: string | null;
+}
+
+export interface PlanEvent {
+  seq: number;
+  type: "plan_token" | "plan_generated" | "plan_failed";
+  payload: { token?: string; status?: string; plan_id?: string; error?: string; [key: string]: unknown };
+}

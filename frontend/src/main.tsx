@@ -7,6 +7,7 @@ import zhCN from "antd/locale/zh_CN";
 import App from "./App";
 import "./styles/endfield.css";
 import "./styles/console.css";
+import "./styles/plan.css";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, refetchOnWindowFocus: false } },

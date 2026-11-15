@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   CloudServerOutlined,
+  DeploymentUnitOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   PlayCircleOutlined,
@@ -9,11 +10,14 @@ import {
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import RunsPage from "./pages/RunsPage";
 import RunPage from "./pages/RunPage";
+import PlansPage from "./pages/PlansPage";
+import PlanPage from "./pages/PlanPage";
 import ProvidersPage from "./pages/ProvidersPage";
 import TemplatesPage from "./pages/TemplatesPage";
 
 const NAV = [
   { to: "/runs", label: "运行", en: "RUNS", icon: <PlayCircleOutlined /> },
+  { to: "/plans", label: "编排", en: "PLANS", icon: <DeploymentUnitOutlined /> },
   { to: "/providers", label: "供应商", en: "PROVIDERS", icon: <CloudServerOutlined /> },
   { to: "/templates", label: "角色", en: "AGENTS", icon: <TeamOutlined /> },
 ];
@@ -104,6 +108,8 @@ export default function App() {
           <Route path="/" element={<Navigate to="/runs" replace />} />
           <Route path="/runs" element={<RunsPage />} />
           <Route path="/runs/:runId" element={<RunPage />} />
+          <Route path="/plans" element={<PlansPage />} />
+          <Route path="/plans/:planId" element={<PlanPage />} />
           <Route path="/providers" element={<ProvidersPage />} />
           <Route path="/templates" element={<TemplatesPage />} />
           <Route path="*" element={<Navigate to="/runs" replace />} />

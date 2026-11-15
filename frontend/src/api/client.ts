@@ -1,6 +1,6 @@
 import type {
-  AgentTemplate, ArtifactRecord, Gate, ModelEntry, Preset, Provider, Run, Snapshot,
-  StreamEvent, Task,
+  AgentTemplate, ArtifactRecord, Gate, ModelEntry, PlanDetail, PlanEvent, PlanListItem,
+  PlanTask, Preset, Provider, Run, Snapshot, StreamEvent, Task,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -103,6 +103,39 @@ export const api = {
   templates: () => request<{ items: AgentTemplate[] }>("/agent-templates"),
   patchTemplate: (id: number, body: Record<string, unknown>) =>
     request<AgentTemplate>(`/agent-templates/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+
+  /* ---------- 编排工作台（ORCH-01） ---------- */
+  plans: (status?: string) =>
+    request<{ items: PlanListItem[] }>(`/plans${status ? `?status=${status}` : ""}`),
+  createPlan: (body: {
+    product_name: string; source_type: "text" | "upload" | "artifact";
+    source_ref?: string; design_text?: string;
+  }) => request<PlanDetail>("/plans", { method: "POST", body: JSON.stringify(body) }),
+  getPlan: (planId: string) => request<PlanDetail>(`/plans/${planId}`),
+  generatePlan: (planId: string) =>
+    request<{ id: string; status: string }>(`/plans/${planId}/generate`, { method: "POST" }),
+  cancelPlan: (planId: string) =>
+    request<PlanDetail>(`/plans/${planId}/cancel`, { method: "POST" }),
+  validatePlan: (planId: string) =>
+    request<PlanDetail>(`/plans/${planId}/validate`, { method: "POST" }),
+  patchPlanTask: (planId: string, uid: string, body: Record<string, unknown>) =>
+    request<PlanTask>(`/plans/${planId}/tasks/${uid}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  createPlanTask: (planId: string, body: Record<string, unknown>) =>
+    request<PlanTask>(`/plans/${planId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
+  deletePlanTask: (planId: string, uid: string) =>
+    request<{ removed_from: string[] }>(`/plans/${planId}/tasks/${uid}`, { method: "DELETE" }),
+  commitPlan: (planId: string, mode: "save" | "run") =>
+    request<{ plan: PlanDetail["plan"]; run_id?: string | null; run?: Run | null }>(
+      `/plans/${planId}/commit`, { method: "POST", body: JSON.stringify({ mode }) },
+    ),
+  archivePlan: (planId: string) =>
+    request<PlanDetail>(`/plans/${planId}/archive`, { method: "POST" }),
+  planSnapshots: (planId: string) =>
+    request<{ items: Array<{ version: number; metrics: Record<string, number>; is_valid: boolean; validation: unknown; created_at: string | null }> }>(
+      `/plans/${planId}/snapshots`,
+    ),
 };
 
 /** 订阅 run 的 SSE；返回取消订阅函数。事件类型逐个注册（后端用的是命名事件）。 */
@@ -130,5 +163,24 @@ export function subscribeRun(
   source.onerror = () => {
     // EventSource 自带重连；后端关闭终态连接后浏览器会重试，这里不主动报错。
   };
+  return () => source.close();
+}
+
+/** 订阅 plan 生成事件（plan_token / plan_generated / plan_failed）。 */
+export function subscribePlan(
+  planId: string,
+  onEvent: (event: PlanEvent) => void,
+): () => void {
+  const source = new EventSource(`${BASE}/plans/${planId}/events`);
+  const handler = (raw: MessageEvent) => {
+    try {
+      onEvent(JSON.parse(raw.data) as PlanEvent);
+    } catch {
+      // 忽略非法帧
+    }
+  };
+  ["plan_token", "plan_generated", "plan_failed"].forEach((type) =>
+    source.addEventListener(type, handler as EventListener),
+  );
   return () => source.close();
 }
