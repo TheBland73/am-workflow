@@ -220,6 +220,68 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Plan(Base):
+    __tablename__ = "plans"
+
+    id: Mapped[str] = mapped_column(String(24), primary_key=True, default=new_run_id)
+    product_name: Mapped[str] = mapped_column(String(160), default="")
+    source_type: Mapped[str] = mapped_column(String(20), default="text")  # artifact/upload/text
+    source_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    design_text: Mapped[str] = mapped_column(Text, default="")
+    sections_json: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(30), default="draft")
+    model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model_entries.id", ondelete="SET NULL"), nullable=True
+    )
+    raw_output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class PlanTask(Base):
+    __tablename__ = "plan_tasks"
+    __table_args__ = (UniqueConstraint("plan_id", "task_uid", name="uq_plan_task_uid"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), index=True
+    )
+    task_uid: Mapped[str] = mapped_column(String(40))
+    title: Mapped[str] = mapped_column(String(300), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    deps_json: Mapped[list] = mapped_column(JSON, default=list)
+    design_section: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    acceptance_json: Mapped[list] = mapped_column(JSON, default=list)
+    role_key: Mapped[str] = mapped_column(String(40), default="dev")
+    effort: Mapped[str] = mapped_column(String(10), default="M")
+    priority: Mapped[str] = mapped_column(String(10), default="P1")
+    order_index: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlanSnapshot(Base):
+    __tablename__ = "plan_snapshots"
+    __table_args__ = (UniqueConstraint("plan_id", "version", name="uq_plan_snapshot_ver"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    tasks_json: Mapped[list] = mapped_column(JSON, default=list)
+    dag_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    waves_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    critical_path_json: Mapped[list] = mapped_column(JSON, default=list)
+    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    validation_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    is_valid: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Memory(Base):
     __tablename__ = "memories"
     __table_args__ = (Index("ix_memory_scope", "scope_type", "scope_id"),)
