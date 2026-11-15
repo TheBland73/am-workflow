@@ -1,0 +1,402 @@
+"""节点运行时：按节点类型执行（设计规格 §5.2、§5.6、§5.7）。"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from app.artifacts.store import (
+    latest_artifact,
+    parse_front_matter,
+    read_artifact,
+    strip_outer_fence,
+    workspace_dir,
+    write_artifact,
+)
+from app.db.base import session_scope
+from app.db.models import AgentTemplate, Node, Run, Task
+from app.engine.agent_loop import AgentExceeded, run_agent
+from app.engine.context import build_system, build_user, dev_workspace_rules, doc_output_rules
+from app.engine.events import emit
+from app.engine.graph import GraphError, compute_waves
+from app.engine.tasks import parse_tasks, validate_tasks
+from app.engine.validate import validate_artifact
+from app.engine.usage import BudgetExceeded
+from app.memory.store import memory_block, record_lesson
+from app.models.budget import ContextBudget
+from app.models.pool import pool
+from app.models.types import ProviderError
+from app.tools.registry import Toolbox
+
+
+class NodeFailure(RuntimeError):
+    def __init__(self, message: str, *, fatal: bool = False) -> None:
+        super().__init__(message)
+        self.fatal = fatal
+
+
+@dataclass
+class NodeContext:
+    run_id: str
+    node_id: int
+    node_key: str
+    type: str
+    name: str
+    phase: str
+    config: dict
+    assignee: dict
+    attempt_id: int
+    attempt_no: int
+    feedback: str | None = None
+    idea: str = ""
+    extra: dict = field(default_factory=dict)
+
+
+DEFAULT_INPUTS: dict[str, list[str]] = {
+    "discussion": ["idea"],
+    "proposal": ["idea", "discussion"],
+    "review": ["proposal"],
+    "requirement": ["proposal"],
+    "design": ["requirement", "proposal"],
+    "task": ["design"],
+    "test": ["design"],
+    "changelog": ["idea", "discussion", "proposal", "requirement", "design", "task"],
+}
+
+
+# ---------------- 通用读取 ----------------
+def _agent_template(role_key: str) -> dict | None:
+    with session_scope() as s:
+        row = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
+        if row is None:
+            return None
+        return {
+            "role_key": row.role_key,
+            "name": row.name,
+            "system_prompt": row.system_prompt,
+            "tools_json": list(row.tools_json or []),
+            "max_steps": row.max_steps,
+        }
+
+
+def _artifact_body(run_id: str, kind: str) -> str:
+    raw = read_artifact(run_id, kind)
+    if raw is None:
+        return ""
+    _meta, body = parse_front_matter(raw)
+    return body.strip()
+
+
+def _input_artifacts(run_id: str, kinds: list[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for kind in kinds:
+        body = _artifact_body(run_id, kind)
+        if body:
+            out.append((kind, body))
+    return out
+
+
+def _task_row(run_id: str, task_uid: str) -> dict | None:
+    with session_scope() as s:
+        row = (
+            s.query(Task)
+            .filter(Task.run_id == run_id, Task.task_uid == task_uid)
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        return {
+            "task_uid": row.task_uid, "title": row.title, "deps": list(row.deps_json or []),
+            "design_section": row.design_section, "test_cases": list(row.test_cases_json or []),
+            "wave": row.wave, "status": row.status,
+        }
+
+
+def _mark_task(run_id: str, task_uid: str, status: str) -> None:
+    with session_scope() as s:
+        row = (
+            s.query(Task)
+            .filter(Task.run_id == run_id, Task.task_uid == task_uid)
+            .one_or_none()
+        )
+        if row:
+            row.status = status
+
+
+# ---------------- 入口 ----------------
+async def execute_node(ctx: NodeContext) -> dict:
+    if ctx.type == "PASS":
+        return {"summary": "输入已记录"}
+    if ctx.type == "AGENT":
+        if (ctx.config or {}).get("task_uid"):
+            return await _run_dev(ctx)
+        return await _run_doc_agent(ctx)
+    if ctx.type == "VERIFY":
+        return await _run_verify(ctx)
+    if ctx.type == "TASKGRAPH":
+        return await _run_taskgraph(ctx)
+    if ctx.type in ("DECISION",):
+        return {"summary": "无分支条件，直接通过"}
+    if ctx.type in ("RESTORE", "CHECKPOINT"):
+        return {"summary": f"{ctx.type} 节点已通过"}
+    raise NodeFailure(f"暂不支持的节点类型：{ctx.type}", fatal=True)
+
+
+# ---------------- 文档类 Agent ----------------
+async def _run_doc_agent(ctx: NodeContext) -> dict:
+    role = (ctx.assignee or {}).get("role")
+    if not role:
+        raise NodeFailure("AGENT 节点缺少 assignee.role", fatal=True)
+    template = _agent_template(role)
+    if template is None:
+        raise NodeFailure(f"角色模板不存在：{role}", fatal=True)
+    model = pool.pick_role_model(role)
+    if model is None:
+        raise NodeFailure(
+            "尚未配置可用模型：请先在「设置 → 供应商」添加供应商与模型并测试连接", fatal=True
+        )
+
+    kind = (ctx.config or {}).get("artifact")
+    if not kind:
+        raise NodeFailure("AGENT 节点缺少 config.artifact", fatal=True)
+    inputs = list((ctx.config or {}).get("inputs") or DEFAULT_INPUTS.get(kind, []))
+    artifacts = _input_artifacts(ctx.run_id, inputs)
+    missing = [k for k in inputs if k not in {label for label, _ in artifacts}]
+    if missing:
+        await emit(ctx.run_id, "node_log", ctx.node_id,
+                   {"level": "warn", "message": f"输入工件缺失：{', '.join(missing)}"})
+
+    previous = _artifact_body(ctx.run_id, kind) if (ctx.config or {}).get("append") else ""
+    memory = memory_block(role_key=role, run_id=ctx.run_id)
+    budget = ContextBudget(model.context_window, model.max_output_tokens)
+    system_prompt = build_system(template["system_prompt"], memory, doc_output_rules(kind))
+    instruction = (ctx.config or {}).get("instruction") or f"完成「{ctx.name}」节点的工作。"
+    user_prompt = build_user(
+        brief=instruction, artifacts=artifacts, feedback=ctx.feedback, budget=budget
+    )
+    result = await run_agent(
+        run_id=ctx.run_id, node_id=ctx.node_id, attempt_id=ctx.attempt_id, model=model,
+        system_prompt=system_prompt, user_prompt=user_prompt, toolbox=None,
+        max_steps=max(1, int(template["max_steps"] or 3)),
+    )
+    body = strip_outer_fence(result.content)
+    if previous:
+        body = previous.rstrip() + "\n\n---\n\n" + body
+    issues = validate_artifact(kind, body)
+    if issues:
+        raise NodeFailure("工件校验未通过：" + "；".join(issues))
+    record = write_artifact(
+        ctx.run_id, kind, body, created_by=role, inputs=inputs, status="draft"
+    )
+    return {
+        "summary": f"{kind} v{record['version']} 已生成（{len(body)} 字）",
+        "artifact": record,
+    }
+
+
+# ---------------- 开发 Agent ----------------
+async def _run_dev(ctx: NodeContext) -> dict:
+    task_uid = str((ctx.config or {}).get("task_uid"))
+    task = _task_row(ctx.run_id, task_uid)
+    if task is None:
+        raise NodeFailure(f"任务不存在：{task_uid}", fatal=True)
+    template = _agent_template("dev")
+    if template is None:
+        raise NodeFailure("角色模板不存在：dev", fatal=True)
+    model = pool.pick_role_model("dev")
+    if model is None:
+        raise NodeFailure(
+            "尚未配置可用模型：请先在「设置 → 供应商」添加供应商与模型并测试连接", fatal=True
+        )
+
+    workspace = workspace_dir(ctx.run_id)
+    design = _artifact_body(ctx.run_id, "design")
+    requirement = _artifact_body(ctx.run_id, "requirement")
+    section = task["design_section"] or ""
+    brief = (
+        f"开发任务 {task_uid}：{task['title']}\n"
+        f"设计章节：{section or '（未指定）'}\n"
+        f"验收用例：{', '.join(task['test_cases']) or '（未指定）'}\n\n"
+        "要求：只实现该任务范围内的代码与单元测试；测试必须实际运行并通过。"
+    )
+    budget = ContextBudget(model.context_window, model.max_output_tokens)
+    memory = memory_block(role_key="dev", run_id=ctx.run_id)
+    system_prompt = build_system(
+        template["system_prompt"], memory, dev_workspace_rules(str(workspace))
+    )
+    user_prompt = build_user(
+        brief=brief,
+        artifacts=[("design", design), ("requirement", requirement)],
+        feedback=ctx.feedback,
+        budget=budget,
+    )
+    toolbox = Toolbox(workspace, allow_shell=True)
+    result = await run_agent(
+        run_id=ctx.run_id, node_id=ctx.node_id, attempt_id=ctx.attempt_id, model=model,
+        system_prompt=system_prompt, user_prompt=user_prompt, toolbox=toolbox,
+        max_steps=max(1, int(template["max_steps"] or 16)),
+    )
+    if result.stopped_by != "finish":
+        raise NodeFailure("Agent 没有调用 finish 声明完成，视为未完成")
+    _mark_task(ctx.run_id, task_uid, "done")
+    return {"summary": result.content[:1000], "task_uid": task_uid, "steps": result.steps}
+
+
+# ---------------- 验证 ----------------
+async def _run_verify(ctx: NodeContext) -> dict:
+    command = (ctx.config or {}).get("command")
+    if not command:
+        raise NodeFailure("VERIFY 节点缺少 config.command", fatal=True)
+    workspace = workspace_dir(ctx.run_id)
+    toolbox = Toolbox(workspace, allow_shell=True)
+    outcome = await toolbox.execute(
+        "run_command",
+        {"command": command, "timeout_s": int((ctx.config or {}).get("timeout_s") or 180)},
+    )
+    await emit(ctx.run_id, "node_log", ctx.node_id,
+               {"level": "info" if not outcome.is_error else "error",
+                "message": outcome.output[-2000:]})
+    if outcome.is_error:
+        raise NodeFailure(f"验证命令失败：\n{outcome.output[-2000:]}")
+    return {"summary": f"验证通过：{command}", "command": command,
+            "output": outcome.output[-1500:]}
+
+
+# ---------------- 任务图 ----------------
+async def _run_taskgraph(ctx: NodeContext) -> dict:
+    mode = (ctx.config or {}).get("mode", "parse")
+    if mode == "parse":
+        return await _taskgraph_parse(ctx)
+    if mode == "expand":
+        return await _taskgraph_expand(ctx)
+    raise NodeFailure(f"未知 TASKGRAPH 模式：{mode}", fatal=True)
+
+
+async def _taskgraph_parse(ctx: NodeContext) -> dict:
+    raw = read_artifact(ctx.run_id, "task")
+    if raw is None:
+        raise NodeFailure("未找到 task.md 工件", fatal=True)
+    _meta, body = parse_front_matter(raw)
+    parsed = parse_tasks(body)
+    try:
+        validate_tasks(parsed)
+    except GraphError as exc:
+        raise NodeFailure(f"任务图非法：{exc}") from exc
+
+    created: list[dict] = []
+    updated: list[dict] = []
+    with session_scope() as s:
+        existing = {
+            row.task_uid: row
+            for row in s.query(Task).filter(Task.run_id == ctx.run_id).all()
+        }
+        wanted = {t["task_uid"] for t in parsed}
+        for uid, row in existing.items():
+            if uid not in wanted:
+                s.delete(row)
+        for item in parsed:
+            row = existing.get(item["task_uid"])
+            if row is None:
+                row = Task(
+                    run_id=ctx.run_id, task_uid=item["task_uid"], title=item["title"],
+                    deps_json=item["deps"], design_section=item["design_section"],
+                    test_cases_json=item["test_cases"],
+                    assignee_json={"role": item["assignee"] or "dev"},
+                    wave=item["wave"], status=item["status"],
+                )
+                s.add(row)
+                created.append({"task_uid": item["task_uid"], "title": item["title"],
+                                "wave": item["wave"], "deps": item["deps"]})
+            else:
+                row.title = item["title"]
+                row.deps_json = item["deps"]
+                row.design_section = item["design_section"]
+                row.test_cases_json = item["test_cases"]
+                row.wave = item["wave"]
+                updated.append({"task_uid": item["task_uid"], "title": item["title"],
+                                "wave": item["wave"], "deps": item["deps"]})
+    for item in created:
+        await emit(ctx.run_id, "task_created", ctx.node_id, item)
+    for item in updated:
+        await emit(ctx.run_id, "task_updated", ctx.node_id, item)
+    return {"summary": f"任务图已构建：{len(parsed)} 个任务", "tasks": created or updated}
+
+
+async def _taskgraph_expand(ctx: NodeContext) -> dict:
+    with session_scope() as s:
+        tasks = (
+            s.query(Task).filter(Task.run_id == ctx.run_id).order_by(Task.wave, Task.id).all()
+        )
+        task_list = [
+            {"task_uid": t.task_uid, "title": t.title, "deps": list(t.deps_json or []),
+             "wave": t.wave, "design_section": t.design_section}
+            for t in tasks
+        ]
+    if not task_list:
+        raise NodeFailure("没有可展开的任务", fatal=True)
+
+    created: list[dict] = []
+    with session_scope() as s:
+        nodes = {n.node_key: n for n in s.query(Node).filter(Node.run_id == ctx.run_id).all()}
+        for task in task_list:
+            key = f"dev_{task['task_uid']}"
+            deps = ["expand_exec"] + [f"dev_{d}" for d in task["deps"]]
+            config = {"task_uid": task["task_uid"], "task_title": task["title"],
+                      "design_section": task["design_section"]}
+            node = nodes.get(key)
+            if node is None:
+                node = Node(
+                    run_id=ctx.run_id, node_key=key, type="AGENT",
+                    name=f"开发 {task['task_uid']} {task['title']}", phase="execution",
+                    status="pending", assignee_json={"role": "dev"}, deps_json=deps,
+                    config_json=config, max_attempts=3, order_index=100 + len(nodes),
+                )
+                s.add(node)
+                s.flush()
+                nodes[key] = node
+                created.append({"node_key": key, "name": node.name})
+            else:
+                node.deps_json = deps
+                node.config_json = {**config, "feedback": (node.config_json or {}).get("feedback")}
+                node.status = "pending"
+                node.wave = None
+        verify = nodes.get("verify")
+        if verify is not None:
+            verify.deps_json = [f"dev_{t['task_uid']}" for t in task_list]
+        s.flush()
+        all_nodes = s.query(Node).filter(Node.run_id == ctx.run_id).all()
+        deps_map = {n.node_key: list(n.deps_json or []) for n in all_nodes}
+        waves = compute_waves(deps_map)
+        for node in all_nodes:
+            node.wave = waves.get(node.node_key, node.wave)
+        task_count = len(task_list)
+    for item in created:
+        await emit(ctx.run_id, "node_created", ctx.node_id, item)
+    return {"summary": f"已展开 {task_count} 个并行开发节点", "nodes": created}
+
+
+# ---------------- 供调度器使用 ----------------
+def classify_failure(exc: Exception) -> tuple[str, bool]:
+    message = str(exc) or exc.__class__.__name__
+    if isinstance(exc, BudgetExceeded):
+        return message, True
+    if isinstance(exc, ProviderError) and "尚未配置" in message:
+        return message, True
+    if isinstance(exc, NodeFailure):
+        return message, exc.fatal
+    if isinstance(exc, AgentExceeded):
+        return message, False
+    return message, False
+
+
+def lesson_for(ctx: NodeContext, message: str) -> None:
+    role = (ctx.assignee or {}).get("role") or ctx.node_key
+    try:
+        record_lesson(
+            role_key=role, run_id=ctx.run_id, subject=f"{ctx.node_key} 失败经验",
+            content=message[:600], created_by="orchestrator",
+        )
+    except Exception:  # 经验卡写入失败不应影响主流程
+        pass
+
+
+def latest_artifact_info(run_id: str, kind: str) -> dict | None:
+    return latest_artifact(run_id, kind)
