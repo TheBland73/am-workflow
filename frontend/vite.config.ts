@@ -6,8 +6,20 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5173,
+    watch: {
+      ignored: [
+        "**/.tmp/**",
+        "**/*.tmpdir/**",
+        "**/.*.tmpdir/**",
+        "**/node_modules/**",
+        "**/dist/**",
+      ],
+    },
     proxy: {
-      "/api": { target: "http://127.0.0.1:8099", changeOrigin: true },
+      "/api": {
+        target: process.env.AM_API_TARGET || "http://127.0.0.1:8099",
+        changeOrigin: true,
+      },
     },
   },
   build: { outDir: "dist" },

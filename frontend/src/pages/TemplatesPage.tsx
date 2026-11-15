@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  Button, Card, Form, Input, InputNumber, Modal, Select, Space, Table, Tag, Tooltip, message,
+  Button, Form, Input, InputNumber, Modal, Select, Space, Table, Tooltip, message,
 } from "antd";
 import { EditOutlined } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -48,7 +48,7 @@ export default function TemplatesPage() {
         </div>
       </div>
 
-      <Card size="small">
+      <div className="am-card" style={{ padding: 8 }}>
         <Table
           rowKey="id" size="middle" loading={templates.isLoading}
           dataSource={templates.data?.items ?? []} pagination={false}
@@ -68,16 +68,16 @@ export default function TemplatesPage() {
               ) },
             { title: "工具", dataIndex: "tools_json", width: 190,
               render: (tools: string[]) => tools.length
-                ? <Space size={2} wrap>{tools.map((tool) => <Tag key={tool}>{tool}</Tag>)}</Space>
-                : <span style={{ color: "#9ca3af" }}>无</span> },
+                ? <Space size={2} wrap>{tools.map((tool) => <span className="ef-tag" key={tool}>{tool}</span>)}</Space>
+                : <span style={{ color: "var(--ef-ink-2)" }}>无</span> },
             { title: "记忆范围", dataIndex: "memory_scope", width: 110,
-              render: (scope: string) => <Tag color="purple">{SCOPE_LABEL[scope] ?? scope}</Tag> },
+              render: (scope: string) => <span className="ef-tag">{SCOPE_LABEL[scope] ?? scope}</span> },
             { title: "默认模型", dataIndex: "default_model_id", width: 210,
               render: (id: number | null) => {
                 const model = (models.data?.items ?? []).find((item) => item.id === id);
                 return model
                   ? <span>{model.display_name}</span>
-                  : <span style={{ color: "#f59e0b" }}>未绑定（取第一个可用模型）</span>;
+                  : <span style={{ color: "var(--ef-ink-2)" }}>未绑定 · 取第一个可用模型</span>;
               } },
             { title: "最大步数", dataIndex: "max_steps", width: 90 },
             { title: "", width: 50,
@@ -97,7 +97,7 @@ export default function TemplatesPage() {
               ) },
           ]}
         />
-      </Card>
+      </div>
 
       <Modal
         title={`编辑角色：${modal.edit?.name ?? ""}`}

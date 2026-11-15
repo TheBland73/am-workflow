@@ -99,8 +99,26 @@ def get_run(run_id: str) -> dict:
                 .all()
             )
         }
+        latest_attempts: dict[int, NodeAttempt] = {}
+        for attempt in (
+            s.query(NodeAttempt)
+            .join(Node, Node.id == NodeAttempt.node_id)
+            .filter(Node.run_id == run_id)
+            .order_by(NodeAttempt.node_id.asc(), NodeAttempt.attempt_no.asc())
+            .all()
+        ):
+            latest_attempts[attempt.node_id] = attempt
         tasks = s.query(Task).filter(Task.run_id == run_id).order_by(Task.wave, Task.id).all()
         gates = s.query(Gate).filter(Gate.run_id == run_id).order_by(Gate.id.desc()).all()
+        event_stats = (
+            s.query(
+                func.count(Event.id),
+                func.count(func.distinct(Event.type)),
+                func.count(Event.id).filter(Event.type == "node_tool_call"),
+            )
+            .filter(Event.run_id == run_id)
+            .one()
+        )
         usage = (
             s.query(func.coalesce(func.sum(NodeAttempt.tokens_in), 0),
                      func.coalesce(func.sum(NodeAttempt.tokens_out), 0))
@@ -108,22 +126,31 @@ def get_run(run_id: str) -> dict:
             .filter(Node.run_id == run_id)
             .one()
         )
-        node_rows = [
-            {
+        node_rows = []
+        for n in nodes:
+            attempt = latest_attempts.get(n.id)
+            node_rows.append({
                 "id": n.id, "node_key": n.node_key, "type": n.type, "name": n.name,
                 "phase": n.phase, "status": n.status, "assignee": n.assignee_json or {},
                 "deps": list(n.deps_json or []), "wave": n.wave,
                 "max_attempts": n.max_attempts, "attempts": attempts.get(n.id, 0),
                 "config": n.config_json or {},
-            }
-            for n in nodes
-        ]
+                "attempt": {
+                    "attempt_no": attempt.attempt_no,
+                    "status": attempt.status,
+                    "started_at": _iso(attempt.started_at),
+                    "finished_at": _iso(attempt.finished_at),
+                    "tokens_in": int(attempt.tokens_in or 0),
+                    "tokens_out": int(attempt.tokens_out or 0),
+                    "error": attempt.error,
+                } if attempt else None,
+            })
         gate_rows = [
             {
                 "id": g.id, "node_id": g.node_id,
                 "node_key": next((n["node_key"] for n in node_rows if n["id"] == g.node_id), ""),
                 "status": g.status, "feedback": g.feedback, "decided_by": g.decided_by,
-                "decided_at": _iso(g.decided_at),
+                "created_at": _iso(g.created_at), "decided_at": _iso(g.decided_at),
             }
             for g in gates
         ]
@@ -156,6 +183,11 @@ def get_run(run_id: str) -> dict:
                 "total": tokens_in + tokens_out,
                 "remaining": max(0, remaining),
                 "budget": tokens_in + tokens_out + max(0, remaining),
+            },
+            "stats": {
+                "events": int(event_stats[0] or 0),
+                "event_types": int(event_stats[1] or 0),
+                "tool_calls": int(event_stats[2] or 0),
             },
         }
     # 单连接池：工件读取必须在上面的事务关闭之后，避免嵌套占用连接。

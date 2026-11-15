@@ -26,7 +26,7 @@
 | SSE 事件流 + Last-Event-ID 补发 | ✅ |
 | 工件链（idea/discussion/proposal/requirement/design/task/changelog） | ✅ 7 类 |
 | L0 / L1 记忆最小实现 | ✅ |
-| 前端（运行列表 / 运行详情 / 只读画布 / 日志 / 审批卡 / 工件编辑 / 供应商 / 角色模板） | ✅ 已构建 |
+| 前端（终末地控制台风格：运行列表 / 运行详情 / 人工门 / 工件编辑 / 供应商 / 角色模板） | ✅ 已构建 |
 | 离线 Mock 供应商（流式 + 工具调用） | ✅ `scripts/mock_provider.py` |
 | 单元测试 | ✅ 14 passed |
 
@@ -112,6 +112,21 @@ cd backend
 在「供应商与模型」页新增供应商（可选预设：DeepSeek / OpenAI / GLM / 豆包 / Kimi / 百炼 /
 SiliconFlow / OpenRouter / Anthropic / Gemini / 自建），填 Base URL 与 API Key，
 然后在「角色模板」里把 `dev` 等角色绑定到该模型。密钥用 Fernet 加密落盘，接口只回显末四位。
+
+### 2.6 界面
+
+前端采用「终末地控制台」视觉：纸白 `#F4F4F2`、墨 `#161616`、单一信号黄 `#FFFA00`（只做填充，
+表示当前位置/可操作/提醒），直角与 1px 发丝线，切角只给可点击元素；运行详情页由命令栏、
+阶段圆盘、执行图、运行账本与内联人工门裁决卡组成，运行列表/供应商/角色模板共用同一套 token。
+
+设计资产来自 [`hhikr/endfield-ui-skill`](https://github.com/hhikr/endfield-ui-skill)（`endfield.css`、
+`dial.js`、等距线稿），字体 Saira 以 SIL Open Font License 随仓库分发（`frontend/src/styles/fonts/`）。
+开发前端时，`AM_API_TARGET` 可覆盖 `/api` 代理目标（默认 `http://127.0.0.1:8099`）：
+
+```powershell
+$env:AM_API_TARGET="http://127.0.0.1:8099"
+npm run dev
+```
 
 ---
 

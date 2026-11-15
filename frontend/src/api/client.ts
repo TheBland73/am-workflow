@@ -74,6 +74,7 @@ export const api = {
   deleteTask: (runId: string, uid: string) =>
     request<void>(`/runs/${runId}/tasks/${uid}`, { method: "DELETE" }),
 
+  getNode: (nodeId: number) => request<import("./types").NodeDetail>(`/nodes/${nodeId}`),
   retryNode: (nodeId: number) =>
     request<Record<string, unknown>>(`/nodes/${nodeId}/retry`, { method: "POST" }),
 

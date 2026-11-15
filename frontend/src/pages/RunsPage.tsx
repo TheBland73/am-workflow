@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import {
-  Button, Empty, Form, Input, InputNumber, Modal, Progress, Table, Tag, message,
+  Button, Empty, Form, Input, InputNumber, Modal, Progress, Table, message,
 } from "antd";
 import { PlusOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -17,9 +17,20 @@ const STATUS: Record<RunStatus, { color: string; label: string }> = {
   stopped: { color: "default", label: "已停止" },
 };
 
+const PHASE_LABELS: Record<string, string> = {
+  idea: "想法",
+  discussion: "讨论",
+  proposal: "方案",
+  requirement: "需求",
+  design: "设计",
+  tasks: "任务分解",
+  execution: "执行",
+  delivery: "交付",
+};
+
 export function StatusTag({ status }: { status: RunStatus }) {
   const item = STATUS[status] ?? { color: "default", label: status };
-  return <Tag color={item.color}>{item.label}</Tag>;
+  return <span className={`status-pill is-${status}`}>{item.label}</span>;
 }
 
 export default function RunsPage() {
@@ -62,7 +73,8 @@ export default function RunsPage() {
       width: 120,
       render: (status: RunStatus) => <StatusTag status={status} />,
     },
-    { title: "当前阶段", dataIndex: "current_phase", width: 110 },
+    { title: "当前阶段", dataIndex: "current_phase", width: 110,
+      render: (phase: string) => PHASE_LABELS[phase] ?? phase ?? "—" },
     {
       title: "进度",
       width: 170,

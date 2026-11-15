@@ -15,6 +15,16 @@ export interface Run {
   nodes_done?: number;
 }
 
+export interface NodeAttemptInfo {
+  attempt_no: number;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  tokens_in: number;
+  tokens_out: number;
+  error: string | null;
+}
+
 export interface Node {
   id: number;
   node_key: string;
@@ -28,7 +38,31 @@ export interface Node {
   max_attempts: number;
   attempts: number;
   config: Record<string, unknown>;
+  attempt?: NodeAttemptInfo | null;
 }
+
+export interface NodeAttemptDetail {
+  id: number;
+  attempt_no: number;
+  model_id: number | null;
+  status: string;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+export interface NodeMessage {
+  role: string;
+  content: string;
+  tool_call_id?: string | null;
+}
+
+export type NodeDetail = Omit<Node, "attempts"> & {
+  attempts: NodeAttemptDetail[];
+  messages: NodeMessage[];
+};
 
 export interface Task {
   task_uid: string;
@@ -48,6 +82,7 @@ export interface Gate {
   status: string;
   feedback: string | null;
   decided_by: string | null;
+  created_at?: string | null;
   decided_at: string | null;
 }
 
@@ -76,6 +111,7 @@ export interface Snapshot {
   gates: Gate[];
   artifacts: ArtifactRecord[];
   usage: Usage;
+  stats: { events: number; event_types: number; tool_calls: number };
 }
 
 export interface StreamEvent {
