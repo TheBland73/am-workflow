@@ -1348,9 +1348,9 @@ a.ef-record:is(:hover, :focus-visible) > * {
   .ef-ticker ul[aria-hidden] {
     display: none;
   }
-  .ef *,
-  .ef *::before,
-  .ef *::after {
+  .ef *:not([class*='ant-']),
+  .ef *:not([class*='ant-'])::before,
+  .ef *:not([class*='ant-'])::after {
     transition: none !important;
     animation: none !important;
   }
