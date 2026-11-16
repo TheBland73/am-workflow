@@ -1,6 +1,7 @@
 import type {
   AgentTemplate, ArtifactRecord, Gate, ModelEntry, PlanDetail, PlanEvent, PlanListItem,
-  PlanTask, Preset, Provider, Run, Snapshot, StreamEvent, Task,
+  PlanPoint, PlanTask, Preset, Provider, RemoteModel, Run, RunMetrics, Snapshot, StreamEvent,
+  Task, TestResult,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -23,7 +24,15 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!resp.ok) {
     const detail = (data as { detail?: unknown })?.detail;
-    throw new ApiError(resp.status, typeof detail === "string" ? detail : text || resp.statusText);
+    const nested = detail && typeof detail === "object"
+      ? (detail as { message?: unknown; code?: unknown })
+      : null;
+    const message = typeof detail === "string"
+      ? detail
+      : typeof nested?.message === "string"
+        ? nested.message
+        : text || resp.statusText;
+    throw new ApiError(resp.status, message);
   }
   return data as T;
 }
@@ -38,6 +47,7 @@ export const api = {
       body: JSON.stringify({ idea, template_key: templateKey, budget_tokens: budgetTokens }),
     }),
   getRun: (runId: string) => request<Snapshot>(`/runs/${runId}`),
+  metrics: (runId: string) => request<RunMetrics>(`/runs/${runId}/metrics`),
   stopRun: (runId: string) => request<{ id: string; status: string }>(`/runs/${runId}/stop`),
 
   history: (runId: string, since = 0) =>
@@ -87,9 +97,16 @@ export const api = {
   deleteProvider: (id: number) =>
     request<void>(`/providers/${id}`, { method: "DELETE" }),
   testProvider: (id: number, modelId?: number) =>
-    request<{ ok: boolean; message: string }>(
+    request<TestResult>(
       `/providers/${id}/test${modelId ? `?model_id=${modelId}` : ""}`,
       { method: "POST" },
+    ),
+  remoteModels: (providerId: number) =>
+    request<{ items: RemoteModel[]; count: number }>(`/providers/${providerId}/models`),
+  importModels: (providerId: number, models: string[]) =>
+    request<{ created: Array<{ id: number; model_name: string }>; skipped: string[] }>(
+      `/providers/${providerId}/models/import`,
+      { method: "POST", body: JSON.stringify({ models }) },
     ),
 
   models: (providerId?: number) =>
@@ -126,9 +143,24 @@ export const api = {
     request<PlanTask>(`/plans/${planId}/tasks`, { method: "POST", body: JSON.stringify(body) }),
   deletePlanTask: (planId: string, uid: string) =>
     request<{ removed_from: string[] }>(`/plans/${planId}/tasks/${uid}`, { method: "DELETE" }),
-  commitPlan: (planId: string, mode: "save" | "run") =>
+  savePlanLayout: (planId: string, positions: Record<string, PlanPoint>) =>
+    request<{ plan_id: string; positions: Record<string, PlanPoint> }>(
+      `/plans/${planId}/layout`,
+      { method: "PATCH", body: JSON.stringify({ positions }) },
+    ),
+  addPlanDep: (planId: string, source: string, target: string) =>
+    request<{ task: PlanTask; source: string; target: string }>(`/plans/${planId}/deps`, {
+      method: "POST", body: JSON.stringify({ source, target }),
+    }),
+  removePlanDep: (planId: string, source: string, target: string) =>
+    request<{ task: PlanTask; source: string; target: string }>(
+      `/plans/${planId}/deps?source=${encodeURIComponent(source)}&target=${encodeURIComponent(target)}`,
+      { method: "DELETE" },
+    ),
+  commitPlan: (planId: string, mode: "save" | "run", budgetTokens?: number | null) =>
     request<{ plan: PlanDetail["plan"]; run_id?: string | null; run?: Run | null }>(
-      `/plans/${planId}/commit`, { method: "POST", body: JSON.stringify({ mode }) },
+      `/plans/${planId}/commit`,
+      { method: "POST", body: JSON.stringify({ mode, budget_tokens: budgetTokens ?? null }) },
     ),
   archivePlan: (planId: string) =>
     request<PlanDetail>(`/plans/${planId}/archive`, { method: "POST" }),
@@ -136,6 +168,8 @@ export const api = {
     request<{ items: Array<{ version: number; metrics: Record<string, number>; is_valid: boolean; validation: unknown; created_at: string | null }> }>(
       `/plans/${planId}/snapshots`,
     ),
+  restorePlanSnapshot: (planId: string, version: number) =>
+    request<PlanDetail>(`/plans/${planId}/restore/${version}`, { method: "POST" }),
 };
 
 /** 订阅 run 的 SSE；返回取消订阅函数。事件类型逐个注册（后端用的是命名事件）。 */
@@ -148,7 +182,7 @@ export function subscribeRun(
   const types = [
     "run_created", "run_finished", "run_error", "run_stopped", "run_recovered",
     "phase_entered", "node_started", "node_finished", "node_failed", "node_log",
-    "node_token", "node_tool_call", "node_tool_result", "node_retried", "nodes_reset",
+    "node_token", "node_tool_call", "node_tool_result", "node_retried", "node_retry_scheduled", "nodes_reset",
     "artifact_written", "task_created", "task_updated", "gate_requested", "gate_decided",
     "memory_written",
   ];

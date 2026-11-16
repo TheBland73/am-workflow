@@ -13,6 +13,11 @@ class ProviderIn(BaseModel):
     timeout_s: int = 60
     max_concurrency: int = 4
     enabled: bool = True
+    preset_key: str | None = None
+
+
+class ModelImportIn(BaseModel):
+    models: list[str] = Field(min_length=1, max_length=200)
 
 
 class ProviderPatch(BaseModel):
@@ -122,6 +127,19 @@ class PlanTaskCreate(BaseModel):
 class PlanCommit(BaseModel):
     mode: str = "save"  # save/run
     status: str = "pending"
+    # 可选：本次运行的 token 预算；不传则用系统默认。
+    budget_tokens: int | None = None
+
+
+class PlanLayout(BaseModel):
+    """画布坐标：{task_uid: {"x": float, "y": float}}。"""
+
+    positions: dict[str, dict[str, float]] = Field(default_factory=dict)
+
+
+class PlanDep(BaseModel):
+    source: str = Field(min_length=1, max_length=16)
+    target: str = Field(min_length=1, max_length=16)
 
 
 class TaskPatch(BaseModel):

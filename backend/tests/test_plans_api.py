@@ -66,7 +66,16 @@ def test_plan_create_validate_commit_and_idempotent() -> None:
         assert body["snapshot"]["metrics"]["task_count"] == 8
         assert body["snapshot"]["metrics"]["wave_count"] == 8
         assert body["snapshot"]["critical_path"][0] == "T1"
+        coverage = body["snapshot"]["coverage"]
+        assert coverage["total"] == 10
+        assert coverage["covered"] == 8
+        assert len(coverage["uncovered"]) == 2
+        warning_codes = {item["code"] for item in body["snapshot"]["validation"]["warnings"]}
+        assert "section_uncovered" in warning_codes
+        assert body["warnings"] == body["snapshot"]["validation"]["warnings"]
         assert client.get(f"/api/plans/{plan_id}").json()["plan"]["status"] == "valid"
+        persisted = client.get(f"/api/plans/{plan_id}").json()["snapshot"]["coverage"]
+        assert persisted["covered"] == 8
 
         committed = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "save"})
         assert committed.status_code == 200, committed.text
@@ -129,18 +138,33 @@ def test_plan_commit_run_creates_nodes(monkeypatch) -> None:
         validated = client.post(f"/api/plans/{plan_id}/validate")
         assert validated.status_code == 200, validated.text
 
-        committed = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "run"})
+        committed = client.post(
+            f"/api/plans/{plan_id}/commit", json={"mode": "run", "budget_tokens": 350_000}
+        )
         assert committed.status_code == 200, committed.text
         run_id = committed.json()["run_id"]
         assert run_id
         assert started == [run_id]
 
         detail = client.get(f"/api/runs/{run_id}").json()
+        assert detail["run"]["budget_tokens"] == 350_000
+        assert "编排工作台" in detail["run"]["idea"]
         node_keys = {node["node_key"] for node in detail["nodes"]}
         assert "dev_T1" in node_keys and "dev_T8" in node_keys and "verify" in node_keys
+        first = next(node for node in detail["nodes"] if node["node_key"] == "dev_T1")
+        assert first["config"]["role_key"] == "dev"
+        assert first["config"]["effort"] == "M"
+        assert first["config"]["priority"] == "P1"
+        assert first["config"]["description"]
         assert len(detail["tasks"]) == 8
         kinds = {artifact["kind"] for artifact in detail["artifacts"]}
         assert "design" in kinds
+
+        bad = client.post(
+            f"/api/plans/{plan_id}/commit", json={"mode": "save", "budget_tokens": 5_000}
+        )
+        assert bad.status_code == 400
+        assert bad.json()["detail"]["code"] == "budget"
 
         again = client.post(f"/api/plans/{plan_id}/commit", json={"mode": "run"})
         assert again.status_code == 200
@@ -156,3 +180,54 @@ def test_plan_rejects_short_design_and_missing_plan() -> None:
         assert bad.status_code == 400
         assert bad.json()["detail"]["code"] == "design_too_short"
         assert client.get("/api/plans/nope").status_code == 404
+
+
+def test_plan_canvas_layout_and_dependency_edges() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/plans", json={
+            "product_name": "客户反馈收集与归类",
+            "source_type": "text",
+            "design_text": DESIGN,
+        })
+        assert created.status_code == 201, created.text
+        plan_id = created.json()["plan"]["id"]
+        seed_tasks(plan_id)
+
+        saved = client.patch(f"/api/plans/{plan_id}/layout", json={
+            "positions": {"T1": {"x": 40, "y": 60}, "T2": {"x": 340.56, "y": 88.2}},
+        })
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["positions"]["T2"] == {"x": 340.6, "y": 88.2}
+        assert saved.json()["positions"]["T1"] == {"x": 40, "y": 60}
+        assert client.get(f"/api/plans/{plan_id}").json()["plan"]["layout"]["T2"]["x"] == 340.6
+
+        # T3 原本只依赖 T2，新增 T1 -> T3 的手工连线。
+        added = client.post(f"/api/plans/{plan_id}/deps", json={"source": "T1", "target": "T3"})
+        assert added.status_code == 201, added.text
+        assert "T1" in added.json()["task"]["deps"]
+
+        duplicate = client.post(f"/api/plans/{plan_id}/deps", json={"source": "T1", "target": "T3"})
+        assert duplicate.status_code == 409
+        assert duplicate.json()["detail"]["code"] == "dependency_exists"
+
+        self_dep = client.post(f"/api/plans/{plan_id}/deps", json={"source": "T4", "target": "T4"})
+        assert self_dep.status_code == 400
+        assert self_dep.json()["detail"]["code"] == "self_dependency"
+
+        # T3 前依赖新增后，T3 -> T1 会成环。
+        cycle = client.post(f"/api/plans/{plan_id}/deps", json={"source": "T3", "target": "T1"})
+        assert cycle.status_code == 400, cycle.text
+        assert cycle.json()["detail"]["code"] == "dependency_cycle"
+
+        removed = client.delete(f"/api/plans/{plan_id}/deps", params={"source": "T1", "target": "T3"})
+        assert removed.status_code == 200, removed.text
+        assert "T1" not in removed.json()["task"]["deps"]
+
+        missing = client.delete(f"/api/plans/{plan_id}/deps", params={"source": "T1", "target": "T3"})
+        assert missing.status_code == 404
+
+        archived = client.post(f"/api/plans/{plan_id}/archive")
+        assert archived.status_code == 200
+        locked = client.patch(f"/api/plans/{plan_id}/layout", json={"positions": {}})
+        assert locked.status_code == 400
+        assert locked.json()["detail"]["code"] == "plan_locked"

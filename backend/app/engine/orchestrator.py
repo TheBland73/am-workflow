@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from app.config import settings
 from app.db.base import session_scope
 from app.db.models import Gate, Node, NodeAttempt, Run, Workflow
 from app.engine.events import emit
@@ -86,11 +88,19 @@ class Orchestrator:
                     self._set_run(run_id, status="waiting_human")
                     return
 
+                now = _now()
                 ready = [
                     n for n in nodes
-                    if n["status"] in ("pending", "ready") and self._deps_done(n, nodes)
+                    if n["status"] in ("pending", "ready")
+                    and self._deps_done(n, nodes)
+                    and self._retry_ready(n, now)
                 ]
                 if not ready:
+                    # 有节点处于退避等待：睡到最早的重试点，而不是空转或误判死锁。
+                    wait = self._next_retry_wait(nodes, now)
+                    if wait is not None:
+                        await asyncio.sleep(wait)
+                        continue
                     if all(n["status"] in ("done", "skipped") for n in nodes):
                         await self._finish(run_id)
                     elif any(n["status"] == "failed" for n in nodes):
@@ -102,7 +112,8 @@ class Orchestrator:
                 self._set_run(run_id, status="running")
                 wave = min(n["wave"] if n["wave"] is not None else 0 for n in ready)
                 batch = [n for n in ready if (n["wave"] if n["wave"] is not None else 0) == wave]
-                await asyncio.gather(*(self._run_node(run_id, n) for n in batch))
+                slots = self._slots()
+                await asyncio.gather(*(self._run_node(run_id, n, slots) for n in batch))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # 编排器自身异常：标记失败，保留堆栈到事件
@@ -113,14 +124,38 @@ class Orchestrator:
             self._running.discard(run_id)
 
     # ---------- 单个节点 ----------
-    async def _run_node(self, run_id: str, node: dict) -> None:
+    async def _run_node(self, run_id: str, node: dict,
+                        slots: asyncio.Semaphore | None = None) -> None:
         if node["type"] == "HUMAN_GATE":
             await self._open_human_gate(run_id, node)
             return
+        # 闸门放在建 attempt 之前：排队中的节点不应显示 running，也不应吃掉超时预算。
+        async with (slots or self._slots()):
+            await self._run_attempt(run_id, node)
 
+    def _slots(self) -> asyncio.Semaphore:
+        """事件循环级的全局并发闸门（同一进程内多个 run 共享 AM_NODE_CONCURRENCY）。
+
+        挂在 loop 对象上而不是模块全局：既不跨 loop 复用（测试/多 loop 安全），
+        也能在设置变更后按新上限重建。
+        """
+        loop = asyncio.get_running_loop()
+        size = max(1, settings.node_concurrency)
+        try:
+            sem = getattr(loop, "_am_node_slots", None)
+            if sem is None or getattr(loop, "_am_node_slots_size", None) != size:
+                sem = asyncio.Semaphore(size)
+                setattr(loop, "_am_node_slots", sem)
+                setattr(loop, "_am_node_slots_size", size)
+            return sem
+        except AttributeError:
+            # uvloop 等不允许给 loop 挂属性的实现：退化为本次调用一个闸门，仍限制本 run 的并发。
+            return asyncio.Semaphore(size)
+
+    async def _run_attempt(self, run_id: str, node: dict) -> None:
         attempt_no = self._next_attempt_no(node["id"])
         attempt_id = self._create_attempt(node["id"], attempt_no)
-        self._update_node(node["id"], status="running")
+        self._update_node(node["id"], status="running", drop=["retry_at"])
         await self._enter_phase(run_id, node)
         await emit(run_id, "node_started", node["id"], {
             "node_key": node["node_key"], "type": node["type"],
@@ -134,15 +169,34 @@ class Orchestrator:
             feedback=(node["config"] or {}).get("feedback"),
             idea=self._idea(run_id),
         )
+        timeout = self._timeout_for(node)
+        heartbeat = asyncio.create_task(self._heartbeat(attempt_id))
         try:
-            result = await execute_node(ctx)
+            if timeout > 0:
+                result = await asyncio.wait_for(execute_node(ctx), timeout)
+            else:
+                result = await execute_node(ctx)
+        except asyncio.CancelledError:
+            # stop() / 进程退出：留下可诊断的 attempt 收据，节点回到可重入的 pending。
+            self._fail_attempt(attempt_id, "运行被取消，attempt 未回执")
+            self._update_node(node["id"], status="pending")
+            raise
+        except TimeoutError:
+            await self._handle_failure(
+                run_id, node, attempt_id, attempt_no,
+                f"节点执行超时（{timeout:g}s，可用节点 config.timeout_s 覆盖）", False,
+            )
+            return
         except Exception as exc:
             message, fatal = classify_failure(exc)
             await self._handle_failure(run_id, node, attempt_id, attempt_no, message, fatal)
             return
+        finally:
+            heartbeat.cancel()
 
         self._finish_attempt(attempt_id)
-        self._update_node(node["id"], status="done", clear_feedback=True)
+        self._update_node(node["id"], status="done", clear_feedback=True,
+                          drop=["retry_at", "retry_count"])
         await emit(run_id, "node_finished", node["id"], {
             "node_key": node["node_key"], "attempt": attempt_no, **result,
         })
@@ -160,20 +214,35 @@ class Orchestrator:
     async def _handle_failure(self, run_id: str, node: dict, attempt_id: int,
                               attempt_no: int, message: str, fatal: bool) -> None:
         self._fail_attempt(attempt_id, message)
+        retry = (not fatal) and attempt_no < node["max_attempts"]
         await emit(run_id, "node_failed", node["id"], {
             "node_key": node["node_key"], "attempt": attempt_no, "error": message,
+            "will_retry": retry,
         })
-        if not fatal and attempt_no < node["max_attempts"]:
-            self._update_node(node["id"], status="pending", feedback=message)
+        if retry:
+            delay = self._retry_delay(attempt_no)
+            extra: dict = {"retry_count": attempt_no}
+            if delay > 0:
+                extra["retry_at"] = (_now() + timedelta(seconds=delay)).isoformat()
+            self._update_node(node["id"], status="pending", feedback=message, extra=extra)
             await emit(run_id, "node_log", node["id"], {
                 "level": "warn",
-                "message": f"第 {attempt_no}/{node['max_attempts']} 次尝试失败，自动带反馈重试：{message[:300]}",
+                "message": (
+                    f"第 {attempt_no}/{node['max_attempts']} 次尝试失败，"
+                    f"{delay:.1f}s 后带反馈重试：{message[:300]}"
+                ),
             })
+            if delay > 0:
+                await emit(run_id, "node_retry_scheduled", node["id"], {
+                    "node_key": node["node_key"], "attempt": attempt_no,
+                    "delay_s": round(delay, 3), "next_attempt": attempt_no + 1,
+                })
             return
 
         from app.engine.gates import request_gate
 
         self._update_node(node["id"], status="waiting_human", feedback=message,
+                          drop=["retry_at"],
                           extra={"escalation": True, "escalation_reason": message})
         gate = request_gate(run_id, node["id"], feedback=message)
         self._set_run(run_id, status="waiting_human")
@@ -326,10 +395,72 @@ class Orchestrator:
 
     def _create_attempt(self, node_id: int, attempt_no: int) -> int:
         with session_scope() as s:
-            row = NodeAttempt(node_id=node_id, attempt_no=attempt_no, status="running")
+            row = NodeAttempt(node_id=node_id, attempt_no=attempt_no, status="running",
+                              heartbeat_at=_now())
             s.add(row)
             s.flush()
             return row.id
+
+    # ---------- 超时 / 退避 / 心跳 ----------
+    def _timeout_for(self, node: dict) -> float:
+        raw = (node.get("config") or {}).get("timeout_s")
+        try:
+            return float(raw) if raw is not None else float(settings.node_timeout_s)
+        except (TypeError, ValueError):
+            return float(settings.node_timeout_s)
+
+    def _retry_delay(self, attempt_no: int) -> float:
+        """指数退避 + equal jitter（Temporal/Airflow 的 retry policy 简化版）。"""
+        base = max(0.0, float(settings.retry_base_s))
+        if base <= 0:
+            return 0.0
+        cap = max(base, float(settings.retry_max_s))
+        ceiling = min(base * (2 ** max(0, attempt_no - 1)), cap)
+        return round(random.uniform(ceiling / 2, ceiling), 3)
+
+    def _retry_ready(self, node: dict, now: datetime) -> bool:
+        raw = (node.get("config") or {}).get("retry_at")
+        if not raw:
+            return True
+        due = self._parse_dt(raw)
+        return due is None or due <= now
+
+    def _next_retry_wait(self, nodes: list[dict], now: datetime) -> float | None:
+        due: list[datetime] = []
+        for n in nodes:
+            if n["status"] not in ("pending", "ready") or not self._deps_done(n, nodes):
+                continue
+            raw = (n.get("config") or {}).get("retry_at")
+            dt = self._parse_dt(raw)
+            if dt is not None and dt > now:
+                due.append(dt)
+        if not due:
+            return None
+        delta = (min(due) - now).total_seconds()
+        # 上限 5s：兼顾退避精度与停机/门决策的响应速度。
+        return max(0.05, min(delta, 5.0))
+
+    @staticmethod
+    def _parse_dt(raw) -> datetime | None:
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    async def _heartbeat(self, attempt_id: int) -> None:
+        interval = max(1.0, float(settings.heartbeat_s))
+        while True:
+            await asyncio.sleep(interval)
+            self._touch_attempt(attempt_id)
+
+    def _touch_attempt(self, attempt_id: int) -> None:
+        with session_scope() as s:
+            row = s.get(NodeAttempt, attempt_id)
+            if row and row.status == "running":
+                row.heartbeat_at = _now()
 
     def _finish_attempt(self, attempt_id: int) -> None:
         with session_scope() as s:
@@ -347,7 +478,8 @@ class Orchestrator:
                 row.finished_at = _now()
 
     def _update_node(self, node_id: int, *, status: str, feedback: str | None = None,
-                     clear_feedback: bool = False, extra: dict | None = None) -> None:
+                     clear_feedback: bool = False, extra: dict | None = None,
+                     drop: list[str] | None = None) -> None:
         with session_scope() as s:
             node = s.get(Node, node_id)
             if node is None:
@@ -360,6 +492,8 @@ class Orchestrator:
                 config.pop("feedback", None)
             if extra:
                 config.update(extra)
+            for key in drop or ():
+                config.pop(key, None)
             node.config_json = config
 
     def _set_run(self, run_id: str, *, status: str, error: str | None = None) -> None:

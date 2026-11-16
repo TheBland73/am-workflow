@@ -107,6 +107,7 @@ def _task_row(run_id: str, task_uid: str) -> dict | None:
             "task_uid": row.task_uid, "title": row.title, "deps": list(row.deps_json or []),
             "design_section": row.design_section, "test_cases": list(row.test_cases_json or []),
             "wave": row.wave, "status": row.status,
+            "role_key": (row.assignee_json or {}).get("role_key") or "dev",
         }
 
 
@@ -193,15 +194,27 @@ async def _run_doc_agent(ctx: NodeContext) -> dict:
 
 
 # ---------------- 开发 Agent ----------------
+# 编排工作台把任务按角色（dev/test/design/pm/review/ops）提交；执行仍走 dev 工具链，
+# 但用一句话把该角色的交付偏好讲清楚，避免「测试任务写实现、文档任务改代码」。
+ROLE_INTENT: dict[str, str] = {
+    "test": "本任务偏测试：补齐 test_*.py 用例与回归覆盖，不要把业务实现塞进测试文件。",
+    "design": "本任务偏设计：落地样式、组件结构与交互细节，保持与既有设计语言一致。",
+    "pm": "本任务偏文档与协作：产出 README/说明与可直接运行的脚本，不改业务实现。",
+    "review": "本任务偏评审：阅读现有实现，修改要小而明确，并在 finish 里列出问题清单。",
+    "ops": "本任务偏运维：产出部署/监控/健康检查配置与说明，避免引入新依赖。",
+}
+
+
 async def _run_dev(ctx: NodeContext) -> dict:
     task_uid = str((ctx.config or {}).get("task_uid"))
     task = _task_row(ctx.run_id, task_uid)
     if task is None:
         raise NodeFailure(f"任务不存在：{task_uid}", fatal=True)
+    role = str(task.get("role_key") or "dev")
     template = _agent_template("dev")
     if template is None:
         raise NodeFailure("角色模板不存在：dev", fatal=True)
-    model = pool.pick_role_model("dev")
+    model = pool.pick_role_model(role) or pool.pick_role_model("dev")
     if model is None:
         raise NodeFailure(
             "尚未配置可用模型：请先在「设置 → 供应商」添加供应商与模型并测试连接", fatal=True
@@ -211,11 +224,16 @@ async def _run_dev(ctx: NodeContext) -> dict:
     design = _artifact_body(ctx.run_id, "design")
     requirement = _artifact_body(ctx.run_id, "requirement")
     section = task["design_section"] or ""
+    description = str((ctx.config or {}).get("description") or "").strip()
+    intent = ROLE_INTENT.get(role, "")
     brief = (
         f"开发任务 {task_uid}：{task['title']}\n"
+        f"角色：{role}\n"
+        f"任务说明：{description or '（未提供，按标题与章节理解）'}\n"
         f"设计章节：{section or '（未指定）'}\n"
         f"验收用例：{', '.join(task['test_cases']) or '（未指定）'}\n\n"
         "要求：只实现该任务范围内的代码与单元测试；测试必须实际运行并通过。"
+        + (f"\n{intent}" if intent else "")
     )
     budget = ContextBudget(model.context_window, model.max_output_tokens)
     memory = memory_block(role_key="dev", run_id=ctx.run_id)

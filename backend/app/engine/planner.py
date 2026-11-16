@@ -93,6 +93,11 @@ def _find_cycle(deps_map: dict[str, list[str]]) -> list[str] | None:
     return None
 
 
+def find_cycle(deps_map: dict[str, list[str]]) -> list[str] | None:
+    """对外的环检测：返回环上的 uid 序列（首尾相同），无环返回 None。"""
+    return _find_cycle(deps_map)
+
+
 def _critical_path(
     deps_map: dict[str, list[str]], points: dict[str, int]
 ) -> tuple[list[str], int]:
@@ -119,6 +124,71 @@ def _critical_path(
         cursor = previous[cursor]
     path.reverse()
     return path, distance[end]
+
+
+def build_coverage(
+    tasks: list[dict[str, Any]], sections: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """设计章节 → 任务的覆盖报告：哪些章节被覆盖、哪些没有任务承接。"""
+    buckets: dict[str, dict[str, Any]] = {}
+    for section in sections:
+        buckets[section["key"]] = {
+            "title": section["title"],
+            "key": section["key"],
+            "level": section["level"],
+            "line": section["line"],
+            "tasks": [],
+        }
+    orphan: list[str] = []
+    for task in tasks:
+        matched = match_section(task.get("design_section"), sections)
+        if matched is None:
+            orphan.append(task["task_uid"])
+            continue
+        entry = buckets.get(matched["key"])
+        if entry is not None and task["task_uid"] not in entry["tasks"]:
+            entry["tasks"].append(task["task_uid"])
+    entries = sorted(buckets.values(), key=lambda item: item["line"])
+    total = len(entries)
+    covered = sum(1 for entry in entries if entry["tasks"])
+    return {
+        "total": total,
+        "covered": covered,
+        "ratio": round(covered / total, 3) if total else 0.0,
+        "sections": entries,
+        "uncovered": [entry["title"] for entry in entries if not entry["tasks"]],
+        "orphan_tasks": orphan,
+    }
+
+
+def _coverage_warnings(coverage: dict[str, Any]) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    for title in coverage["uncovered"][:12]:
+        warnings.append(
+            _error(
+                "section_uncovered",
+                f"设计章节没有被任何任务承接：{title}",
+                "补一条覆盖该章节的任务；若章节只是背景说明，可在设计规格里标注“不实现”。",
+                section=title,
+            )
+        )
+    if len(coverage["uncovered"]) > 12:
+        warnings.append(
+            _error(
+                "section_uncovered_more",
+                f"还有 {len(coverage['uncovered']) - 12} 个章节未被覆盖",
+                "先处理前 12 个章节，或收敛设计规格的范围。",
+            )
+        )
+    if coverage["orphan_tasks"]:
+        warnings.append(
+            _error(
+                "section_orphan_tasks",
+                "有任务引用的章节无法匹配：" + "、".join(coverage["orphan_tasks"][:6]),
+                "检查设计章节标题是否被改写。",
+            )
+        )
+    return warnings
 
 
 def _normalize_tasks(raw_tasks: list[Any]) -> list[dict[str, Any]]:
@@ -329,5 +399,8 @@ def validate_plan(raw_tasks: list[Any], design_text: str) -> dict[str, Any]:
             "errors": [_error("graph_invalid", str(exc), "检查依赖关系。")],
             "snapshot": None,
         }
-    snapshot["validation"] = {"ok": True, "errors": []}
-    return {"ok": True, "errors": [], "snapshot": snapshot, "tasks": tasks}
+    coverage = build_coverage(tasks, sections)
+    snapshot["coverage"] = coverage
+    warnings = _coverage_warnings(coverage)
+    snapshot["validation"] = {"ok": True, "errors": [], "warnings": warnings}
+    return {"ok": True, "errors": [], "warnings": warnings, "snapshot": snapshot, "tasks": tasks}

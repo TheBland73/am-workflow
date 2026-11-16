@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Button, Input, Popconfirm, Select, message } from "antd";
 import { DeleteOutlined, PlusOutlined, SaveOutlined } from "@ant-design/icons";
 import { api } from "../api/client";
@@ -68,10 +68,24 @@ export default function PlanInspector({
   const [draft, setDraft] = useState<Draft | null>(selected ? toDraft(selected) : null);
   const [saving, setSaving] = useState(false);
   const [messageApi, holder] = message.useMessage();
+  // 每个任务留一份未保存草稿：切走再切回来不丢，保存后清掉。
+  const draftsRef = useRef(new Map<string, Draft>());
 
   useEffect(() => {
-    setDraft(selected ? toDraft(selected) : null);
-  }, [selected?.task_uid, selected?.order_index]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!selected) {
+      setDraft(null);
+      return;
+    }
+    setDraft(draftsRef.current.get(selected.task_uid) ?? toDraft(selected));
+  }, [selected?.task_uid]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function edit(next: Draft) {
+    setDraft(next);
+    if (selected) draftsRef.current.set(selected.task_uid, next);
+  }
+
+  const dirty = Boolean(selected && draft
+    && JSON.stringify(draft) !== JSON.stringify(toDraft(selected)));
 
   const sectionOptions = useMemo(() => {
     const titles = plan.sections.map((section) => ({
@@ -108,6 +122,8 @@ export default function PlanInspector({
         priority: draft.priority,
       });
       messageApi.success("任务已保存，正在重新校验");
+      draftsRef.current.delete(selected.task_uid);
+      setDraft(toDraft(updated));
       onSaved(updated);
     } catch (error) {
       messageApi.error((error as Error).message);
@@ -142,6 +158,7 @@ export default function PlanInspector({
     setSaving(true);
     try {
       const result = await api.deletePlanTask(plan.id, selected.task_uid);
+      draftsRef.current.delete(selected.task_uid);
       messageApi.success(result.removed_from.length
         ? `已删除，并从 ${result.removed_from.join("、")} 的依赖中移除`
         : "任务已删除");
@@ -175,6 +192,7 @@ export default function PlanInspector({
       <div className="plan-panel-head">
         <b>任务详情 / INSPECT</b>
         <span className="plan-kicker">{selected.task_uid}</span>
+        {dirty ? <span className="plan-dirty">未保存</span> : null}
       </div>
 
       {selectedErrors.length > 0 ? (
@@ -193,7 +211,7 @@ export default function PlanInspector({
         <Input
           value={draft.title}
           maxLength={40}
-          onChange={(event) => setDraft({ ...draft, title: event.target.value })}
+          onChange={(event) => edit({ ...draft, title: event.target.value })}
         />
       </label>
 
@@ -202,7 +220,7 @@ export default function PlanInspector({
         <Input.TextArea
           rows={4}
           value={draft.description}
-          onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+          onChange={(event) => edit({ ...draft, description: event.target.value })}
         />
       </label>
 
@@ -212,7 +230,7 @@ export default function PlanInspector({
           <Select
             value={draft.role_key}
             options={ROLES}
-            onChange={(value) => setDraft({ ...draft, role_key: value })}
+            onChange={(value) => edit({ ...draft, role_key: value })}
           />
         </label>
         <label className="plan-field">
@@ -220,7 +238,7 @@ export default function PlanInspector({
           <Select
             value={draft.effort}
             options={EFFORTS}
-            onChange={(value) => setDraft({ ...draft, effort: value })}
+            onChange={(value) => edit({ ...draft, effort: value })}
           />
         </label>
       </div>
@@ -231,7 +249,7 @@ export default function PlanInspector({
           <Select
             value={draft.priority}
             options={PRIORITIES}
-            onChange={(value) => setDraft({ ...draft, priority: value })}
+            onChange={(value) => edit({ ...draft, priority: value })}
           />
         </label>
         <label className="plan-field">
@@ -240,7 +258,7 @@ export default function PlanInspector({
             showSearch
             value={draft.design_section || undefined}
             options={sectionOptions}
-            onChange={(value) => setDraft({ ...draft, design_section: value })}
+            onChange={(value) => edit({ ...draft, design_section: value })}
             placeholder="选择章节"
           />
         </label>
@@ -253,7 +271,7 @@ export default function PlanInspector({
           allowClear
           value={draft.deps}
           options={depsOptions}
-          onChange={(value) => setDraft({ ...draft, deps: value })}
+          onChange={(value) => edit({ ...draft, deps: value })}
           placeholder="无依赖"
         />
       </label>
@@ -263,7 +281,7 @@ export default function PlanInspector({
         <Input.TextArea
           rows={4}
           value={draft.acceptance}
-          onChange={(event) => setDraft({ ...draft, acceptance: event.target.value })}
+          onChange={(event) => edit({ ...draft, acceptance: event.target.value })}
         />
       </label>
 
@@ -271,6 +289,17 @@ export default function PlanInspector({
         <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={save}>
           保存并校验
         </Button>
+        {dirty ? (
+          <Button
+            onClick={() => {
+              if (!selected) return;
+              draftsRef.current.delete(selected.task_uid);
+              setDraft(toDraft(selected));
+            }}
+          >
+            放弃修改
+          </Button>
+        ) : null}
         <Button icon={<PlusOutlined />} onClick={create}>新增</Button>
         <Popconfirm
           title="删除这个任务？"

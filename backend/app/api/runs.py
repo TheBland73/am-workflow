@@ -1,8 +1,9 @@
-"""Run 生命周期、快照与 SSE（设计规格 §5.4、§5.5）。"""
+"""Run 生命周期、快照、指标与 SSE（设计规格 §5.4、§5.5）。"""
 from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -12,7 +13,9 @@ from app.api.schemas import RunIn
 from app.artifacts.store import list_artifacts, write_artifact
 from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Artifact, Event, Gate, Node, NodeAttempt, Run, Task, Workflow, new_run_id
+from app.db.models import (
+    Artifact, Event, Gate, ModelEntry, Node, NodeAttempt, Run, Task, Workflow, new_run_id,
+)
 from app.engine.events import bus, emit, load_events, sse_format
 from app.engine.orchestrator import orchestrator
 from app.engine.templates import instantiate_nodes, phase_names
@@ -193,6 +196,131 @@ def get_run(run_id: str) -> dict:
     # 单连接池：工件读取必须在上面的事务关闭之后，避免嵌套占用连接。
     snapshot["artifacts"] = list_artifacts(run_id)
     return snapshot
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    """SQLite 读回的 DateTime 可能丢 tzinfo，统一按 UTC 处理后再做差。"""
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def _span_ms(start: datetime | None, end: datetime | None) -> int:
+    a, b = _aware(start), _aware(end)
+    if a is None or b is None:
+        return 0
+    return max(0, int((b - a).total_seconds() * 1000))
+
+
+@router.get("/runs/{run_id}/metrics")
+def run_metrics(run_id: str) -> dict:
+    """运行指标：耗时、重试、token/成本、门等待。供看板与回归对比使用。"""
+    now = datetime.now(timezone.utc)
+    with session_scope() as s:
+        run = s.get(Run, run_id)
+        if run is None:
+            raise HTTPException(404, "run 不存在")
+        nodes = (
+            s.query(Node).filter(Node.run_id == run_id)
+            .order_by(Node.order_index.asc(), Node.id.asc()).all()
+        )
+        node_ids = [n.id for n in nodes]
+        attempts = (
+            s.query(NodeAttempt)
+            .filter(NodeAttempt.node_id.in_(node_ids))
+            .order_by(NodeAttempt.node_id.asc(), NodeAttempt.attempt_no.asc())
+            .all()
+        ) if node_ids else []
+        gates = s.query(Gate).filter(Gate.run_id == run_id).all()
+        events = int(s.query(func.count(Event.id)).filter(Event.run_id == run_id).scalar() or 0)
+        prices = {
+            row.id: (float(row.price_in or 0), float(row.price_out or 0))
+            for row in s.query(ModelEntry).all()
+        }
+        run_created, run_finished, run_status = run.created_at, run.finished_at, run.status
+
+    by_node: dict[int, list[NodeAttempt]] = {}
+    for attempt in attempts:
+        by_node.setdefault(attempt.node_id, []).append(attempt)
+
+    per_node: list[dict] = []
+    durations: list[int] = []
+    retries = 0
+    tokens_in = tokens_out = 0
+    cost = 0.0
+    status_counts = {"total": len(nodes), "done": 0, "failed": 0, "running": 0,
+                     "pending": 0, "waiting_human": 0, "skipped": 0}
+    for n in nodes:
+        rows = by_node.get(n.id, [])
+        node_ms = 0
+        n_in = n_out = 0
+        for a in rows:
+            if a.status == "running":
+                dur = _span_ms(a.started_at, now)
+            else:
+                dur = _span_ms(a.started_at, a.finished_at)
+            node_ms += dur
+            durations.append(dur)
+            a_in, a_out = int(a.tokens_in or 0), int(a.tokens_out or 0)
+            n_in += a_in
+            n_out += a_out
+            price = prices.get(a.model_id) if a.model_id else None
+            if price:
+                cost += a_in / 1_000_000 * price[0] + a_out / 1_000_000 * price[1]
+        retries += max(0, len(rows) - 1)
+        tokens_in += n_in
+        tokens_out += n_out
+        status_counts[n.status] = status_counts.get(n.status, 0) + 1
+        last = rows[-1] if rows else None
+        per_node.append({
+            "node_key": n.node_key, "type": n.type, "name": n.name, "phase": n.phase,
+            "status": n.status, "attempts": len(rows), "retries": max(0, len(rows) - 1),
+            "exec_ms": node_ms, "tokens_in": n_in, "tokens_out": n_out,
+            "last_error": (last.error[:500] if last and last.error else None),
+        })
+
+    durations.sort()
+    stale_before = now - timedelta(seconds=float(settings.attempt_stale_s))
+    stale_attempts = sum(
+        1 for a in attempts
+        if a.status == "running"
+        and (_aware(a.heartbeat_at) or _aware(a.started_at) or now) < stale_before
+    )
+    decided = [g for g in gates if g.decided_at is not None]
+    decision_ms = [_span_ms(g.created_at, g.decided_at) for g in decided]
+    open_wait_ms = [_span_ms(g.created_at, now) for g in gates if g.status == "open"]
+    gate_counts = {"total": len(gates), "open": 0, "approved": 0, "rejected": 0}
+    for g in gates:
+        gate_counts[g.status] = gate_counts.get(g.status, 0) + 1
+
+    return {
+        "run_id": run_id,
+        "status": run_status,
+        "wall_ms": _span_ms(run_created, run_finished or now),
+        "nodes": status_counts,
+        "execution": {
+            "attempts": len(attempts),
+            "retries": retries,
+            "busy_ms": sum(durations),
+            "avg_attempt_ms": int(sum(durations) / len(durations)) if durations else 0,
+            "p95_attempt_ms": durations[min(len(durations) - 1, int(len(durations) * 0.95))]
+            if durations else 0,
+            "max_attempt_ms": durations[-1] if durations else 0,
+            "stale_attempts": stale_attempts,
+        },
+        "usage": {
+            "tokens_in": tokens_in, "tokens_out": tokens_out,
+            "total": tokens_in + tokens_out,
+            "estimated_cost": round(cost, 6),
+        },
+        "gates": {
+            **gate_counts,
+            "avg_decision_ms": int(sum(decision_ms) / len(decision_ms)) if decision_ms else 0,
+            "open_wait_ms": sum(open_wait_ms),
+        },
+        "events": events,
+        "per_node": per_node,
+    }
 
 
 @router.post("/runs/{run_id}/events")

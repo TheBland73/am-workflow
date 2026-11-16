@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -241,22 +242,95 @@ def _parse_message(data: dict) -> Message:
     return Message(role="assistant", content=msg.get("content") or "", tool_calls=calls)
 
 
-async def test_connection(base_url: str, api_key: str | None, headers: dict | None,
-                          timeout_s: int = 30) -> dict:
-    """GET /models；若供应商不支持则退回 1 token 的 /chat/completions。"""
+def _model_list_urls(base_url: str) -> list[str]:
+    """候选列表地址：优先 {base}/models；base 未带 /v1 时再试 {base}/v1/models。"""
+    base = (base_url or "").rstrip("/")
+    if not base:
+        return []
+    urls = [f"{base}/models"]
+    if not base.endswith("/v1"):
+        urls.append(f"{base}/v1/models")
+    return urls
+
+
+async def list_models(base_url: str, api_key: str | None, headers: dict | None,
+                      timeout_s: int = 30) -> list[dict]:
+    """GET /models，返回 [{"id","owned_by","created"}]；供应商不支持时抛 ProviderError。"""
     adapter = OpenAIChatAdapter(base_url=base_url, api_key=api_key, headers=headers,
                                 timeout_s=timeout_s)
+    candidates = _model_list_urls(base_url)
+    if not candidates:
+        raise ProviderError("供应商未配置 Base URL，无法拉取模型列表")
+    resp = None
     async with adapter._client() as client:
+        for url in candidates:
+            try:
+                resp = await client.get(url, headers=adapter._headers())
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"无法连接供应商：{exc}") from exc
+            if resp.status_code in (404, 405):
+                continue
+            break
+    if resp is None or resp.status_code in (404, 405):
+        tried = "、".join(candidates)
+        raise ProviderError(f"该供应商未提供 /models 接口（已尝试 {tried}），请手动填写模型名")
+    if resp.status_code >= 400:
+        err = _friendly_error(resp.status_code, resp.content)
+        raise ProviderError(f"{err}（{resp.url}）", resp.status_code)
+    try:
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        raise ProviderError("模型列表不是合法 JSON") from exc
+    rows = data.get("data") or data.get("models") or data.get("result") or []
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("models") or []
+    items: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = row.get("id")
+        if not model_id:
+            continue
+        items.append({
+            "id": str(model_id),
+            "owned_by": str(row.get("owned_by") or ""),
+            "created": int(row.get("created") or 0),
+        })
+    return items[:500]
+
+
+async def test_connection(base_url: str, api_key: str | None, headers: dict | None,
+                          timeout_s: int = 30, model_name: str | None = None) -> dict:
+    """连接自检：带 model_name 时真发一次 8 token 对话；否则 GET /models。"""
+    adapter = OpenAIChatAdapter(base_url=base_url, api_key=api_key, headers=headers,
+                                timeout_s=timeout_s)
+    started = time.perf_counter()
+    if model_name:
         try:
-            resp = await client.get(adapter._url("/models"), headers=adapter._headers())
-            if resp.status_code < 400:
-                data = resp.json()
-                models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
-                return {"ok": True, "message": "连接成功", "models": models[:200]}
-            if resp.status_code not in (404, 405):
-                raise _friendly_error(resp.status_code, resp.content)
-        except ProviderError:
-            raise
+            reply = await adapter.chat(
+                [Message(role="user", content="ping")], None,
+                GenParams(model=model_name, max_tokens=32, temperature=0),
+            )
         except httpx.HTTPError as exc:
             raise ProviderError(f"无法连接供应商：{exc}") from exc
-    return {"ok": True, "message": "连接成功（未提供模型列表接口）", "models": []}
+        elapsed = int((time.perf_counter() - started) * 1000)
+        text = (reply.content or "").strip().replace("\n", " ")[:80]
+        if text:
+            message = f"{model_name} 对话正常（{elapsed} ms）：{text}"
+        else:
+            message = (f"{model_name} 连通（{elapsed} ms），但未返回正文："
+                       "思考型模型可能把 32 token 上限耗在推理上，正式调用不受影响")
+        return {"ok": True, "message": message,
+                "latency_ms": elapsed, "reply": text, "models": []}
+    try:
+        models = await list_models(base_url, api_key, headers, timeout_s)
+    except ProviderError as exc:
+        if "未提供 /models" in str(exc):
+            elapsed = int((time.perf_counter() - started) * 1000)
+            return {"ok": True,
+                    "message": f"连接成功（未提供模型列表接口，请手动填写模型名，{elapsed} ms）",
+                    "latency_ms": elapsed, "models": []}
+        raise
+    elapsed = int((time.perf_counter() - started) * 1000)
+    return {"ok": True, "message": f"连接成功，发现 {len(models)} 个模型（{elapsed} ms）",
+            "latency_ms": elapsed, "models": models}

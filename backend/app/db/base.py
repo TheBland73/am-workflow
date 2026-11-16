@@ -70,3 +70,36 @@ def init_db() -> None:
 
     settings.ensure_dirs()
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()
+
+
+def _ensure_columns() -> None:
+    """轻量 schema 演进（SQLite 无 Alembic）：启动时幂等补齐增量列。
+
+    只处理「加列」这一类向后兼容变更；已有数据行新列为 NULL，由业务代码兜底。
+    """
+    if not settings.db_url.startswith("sqlite"):
+        return
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    additions: dict[str, dict[str, str]] = {
+        "node_attempts": {"heartbeat_at": "DATETIME"},
+        "plans": {"layout_json": "JSON"},
+        "plan_snapshots": {"coverage_json": "JSON"},
+    }
+    # 先在事务之外把已有列读出来：SQLite 连接池 size=1，事务内再 inspect 会自锁。
+    existing_by_table = {
+        table: {col["name"] for col in inspector.get_columns(table)}
+        for table in additions
+        if table in tables
+    }
+    with engine.begin() as conn:
+        for table, columns in additions.items():
+            existing = existing_by_table.get(table)
+            if existing is None:
+                continue
+            for name, ddl in columns.items():
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))

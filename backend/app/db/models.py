@@ -141,6 +141,8 @@ class NodeAttempt(Base):
     status: Mapped[str] = mapped_column(String(30), default="running")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 心跳：执行期由编排器周期刷新，用于崩溃/僵尸 attempt 判定与耗时诊断。
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -236,6 +238,8 @@ class Plan(Base):
     raw_output: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     run_id: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # 画布坐标：{task_uid: {"x": float, "y": float}}，由前端拖拽后回写。
+    layout_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
@@ -277,6 +281,7 @@ class PlanSnapshot(Base):
     waves_json: Mapped[dict] = mapped_column(JSON, default=dict)
     critical_path_json: Mapped[list] = mapped_column(JSON, default=list)
     metrics_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    coverage_json: Mapped[dict] = mapped_column(JSON, default=dict)
     validation_json: Mapped[dict] = mapped_column(JSON, default=dict)
     is_valid: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

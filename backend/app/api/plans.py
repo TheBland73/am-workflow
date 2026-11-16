@@ -8,7 +8,14 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 
-from app.api.schemas import PlanCommit, PlanCreate, PlanTaskCreate, PlanTaskPatch
+from app.api.schemas import (
+    PlanCommit,
+    PlanCreate,
+    PlanDep,
+    PlanLayout,
+    PlanTaskCreate,
+    PlanTaskPatch,
+)
 from app.artifacts.store import latest_artifact, parse_front_matter, read_artifact, write_artifact
 from app.config import settings
 from app.db.base import session_scope
@@ -28,7 +35,7 @@ from app.engine.graph import compute_waves
 from app.engine.orchestrator import orchestrator
 from app.engine.plan_bus import plan_bus, sse_format
 from app.engine.plan_generation import generate_plan
-from app.engine.planner import extract_sections, validate_plan
+from app.engine.planner import extract_sections, find_cycle, validate_plan
 
 router = APIRouter(tags=["plans"])
 
@@ -71,6 +78,7 @@ def _snapshot_dict(snapshot: PlanSnapshot | None, include_tasks: bool = False) -
         "waves": snapshot.waves_json or {},
         "critical_path": list(snapshot.critical_path_json or []),
         "dag": snapshot.dag_json or {},
+        "coverage": snapshot.coverage_json or {},
         "validation": snapshot.validation_json or {},
         "is_valid": snapshot.is_valid,
         "created_at": _iso(snapshot.created_at),
@@ -124,6 +132,7 @@ def _load_plan(plan_id: str) -> dict:
                 "model_name": model_name,
                 "sections": list(plan.sections_json or []),
                 "budget_tokens": settings.default_budget_tokens,
+                "layout": dict(plan.layout_json or {}),
             },
             "tasks": [_task_dict(task) for task in tasks],
             "snapshot": _snapshot_dict(snapshot),
@@ -317,7 +326,12 @@ def validate_plan_endpoint(plan_id: str) -> dict:
                 waves_json=snapshot_data["waves"],
                 critical_path_json=snapshot_data["critical_path"],
                 metrics_json=snapshot_data["metrics"],
-                validation_json={"ok": True, "errors": []},
+                coverage_json=snapshot_data.get("coverage") or {},
+                validation_json={
+                    "ok": True,
+                    "errors": [],
+                    "warnings": result.get("warnings") or [],
+                },
                 is_valid=True,
             )
             plan.status = "valid"
@@ -331,7 +345,8 @@ def validate_plan_endpoint(plan_id: str) -> dict:
                 waves_json={},
                 critical_path_json=[],
                 metrics_json={},
-                validation_json={"ok": False, "errors": result["errors"]},
+                coverage_json={},
+                validation_json={"ok": False, "errors": result["errors"], "warnings": []},
                 is_valid=False,
             )
             plan.status = "invalid"
@@ -342,6 +357,7 @@ def validate_plan_endpoint(plan_id: str) -> dict:
     return {
         "status": "valid" if snapshot_data else "invalid",
         "errors": result["errors"],
+        "warnings": result.get("warnings") or [],
         "snapshot": snapshot_out,
         "metrics": snapshot_out["metrics"] if snapshot_out else {},
     }
@@ -444,6 +460,95 @@ def delete_plan_task(plan_id: str, task_uid: str) -> dict:
     return {"deleted": task_uid, "removed_from": affected}
 
 
+@router.patch("/plans/{plan_id}/layout")
+def save_plan_layout(plan_id: str, payload: PlanLayout) -> dict:
+    """持久化画布坐标（拖拽节点后回写）。"""
+    cleaned: dict[str, dict[str, float]] = {}
+    for uid, pos in payload.positions.items():
+        if not isinstance(pos, dict):
+            continue
+        try:
+            x = float(pos.get("x", 0))
+            y = float(pos.get("y", 0))
+        except (TypeError, ValueError):
+            continue
+        cleaned[str(uid)] = {"x": round(x, 1), "y": round(y, 1)}
+    with session_scope() as s:
+        plan = s.get(Plan, plan_id)
+        if plan is None:
+            raise _error(404, "plan_not_found", "计划不存在")
+        if plan.status == "archived":
+            raise _error(400, "plan_locked", "已归档的计划不能调整画布")
+        plan.layout_json = cleaned
+        plan.updated_at = utcnow()
+    return {"plan_id": plan_id, "positions": cleaned}
+
+
+@router.post("/plans/{plan_id}/deps", status_code=201)
+def add_plan_dep(plan_id: str, payload: PlanDep) -> dict:
+    """新增一条依赖：source 是 target 的前置任务。"""
+    source = payload.source.strip().upper()
+    target = payload.target.strip().upper()
+    if source == target:
+        raise _error(400, "self_dependency", "任务不能依赖自己")
+    with session_scope() as s:
+        plan = s.get(Plan, plan_id)
+        if plan is None:
+            raise _error(404, "plan_not_found", "计划不存在")
+        if plan.status in {"committed", "archived"}:
+            raise _error(400, "plan_locked", "已提交或已归档的计划不能编辑依赖")
+        tasks = s.query(PlanTask).filter(PlanTask.plan_id == plan_id).all()
+        by_uid = {task.task_uid: task for task in tasks}
+        if source not in by_uid or target not in by_uid:
+            raise _error(404, "task_not_found", "依赖两端的任务必须都存在")
+        deps_map = {uid: list(task.deps_json or []) for uid, task in by_uid.items()}
+        if source in deps_map[target]:
+            raise _error(409, "dependency_exists", f"{target} 已经依赖 {source}")
+        deps_map[target] = [*deps_map[target], source]
+        cycle = find_cycle(deps_map)
+        if cycle:
+            raise _error(
+                400,
+                "dependency_cycle",
+                "新增依赖会形成环",
+                " → ".join(cycle),
+                cycle=cycle,
+            )
+        by_uid[target].deps_json = deps_map[target]
+        plan.status = "editing"
+        plan.updated_at = utcnow()
+        s.flush()
+        return {"task": _task_dict(by_uid[target]), "source": source, "target": target}
+
+
+@router.delete("/plans/{plan_id}/deps")
+def delete_plan_dep(plan_id: str, source: str, target: str) -> dict:
+    """删除一条依赖：从 target 的 deps 中移除 source。"""
+    source = source.strip().upper()
+    target = target.strip().upper()
+    with session_scope() as s:
+        plan = s.get(Plan, plan_id)
+        if plan is None:
+            raise _error(404, "plan_not_found", "计划不存在")
+        if plan.status in {"committed", "archived"}:
+            raise _error(400, "plan_locked", "已提交或已归档的计划不能编辑依赖")
+        task = (
+            s.query(PlanTask)
+            .filter(PlanTask.plan_id == plan_id, PlanTask.task_uid == target)
+            .one_or_none()
+        )
+        if task is None:
+            raise _error(404, "task_not_found", "任务不存在")
+        deps = list(task.deps_json or [])
+        if source not in deps:
+            raise _error(404, "dependency_missing", f"{target} 并不依赖 {source}")
+        task.deps_json = [dep for dep in deps if dep != source]
+        plan.status = "editing"
+        plan.updated_at = utcnow()
+        s.flush()
+        return {"task": _task_dict(task), "source": source, "target": target}
+
+
 @router.get("/plans/{plan_id}/snapshots")
 def list_snapshots(plan_id: str) -> dict:
     with session_scope() as s:
@@ -523,6 +628,14 @@ def archive_plan(plan_id: str) -> dict:
 async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
     if payload.mode not in {"save", "run"}:
         raise _error(400, "mode", "提交模式必须是 save 或 run")
+    if payload.budget_tokens is not None and not (10_000 <= payload.budget_tokens <= 20_000_000):
+        raise _error(
+            400,
+            "budget",
+            "预算需在 10,000 到 20,000,000 tokens 之间",
+            "留空则使用系统默认预算。",
+        )
+    budget_tokens = int(payload.budget_tokens or settings.default_budget_tokens)
     run_id: str | None = None
     created_run = False
     design_text = ""
@@ -562,8 +675,8 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                     workflow_id=workflow.id,
                     status="created",
                     current_phase="execution",
-                    idea_text=f"编排工作台提交：{plan.product_name}（{len(rows)} 个任务）",
-                    budget_tokens=settings.default_budget_tokens,
+                    idea_text=f"编排工作台 {plan_id}：{plan.product_name}（{len(rows)} 个任务 / {len(set(waves.values()))} 波）",
+                    budget_tokens=budget_tokens,
                 )
                 s.add(run)
                 s.flush()
@@ -599,6 +712,10 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                                 "task_uid": row.task_uid,
                                 "task_title": row.title,
                                 "design_section": row.design_section,
+                                "role_key": row.role_key,
+                                "description": row.description,
+                                "effort": row.effort,
+                                "priority": row.priority,
                             },
                             max_attempts=3,
                             order_index=index,

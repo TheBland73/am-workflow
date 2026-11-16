@@ -55,6 +55,42 @@ def mock_tasks(design: str, product: str) -> list[dict]:
     return json.loads(_pm_plan(messages))["tasks"]
 
 
+def test_coverage_reports_uncovered_sections() -> None:
+    design = read_fixture("chat-product.md")
+    sections = [item["title"] for item in extract_sections(design)]
+    tasks = [
+        make_task(f"T{index + 1}", [f"T{index}"] if index else [], sections[index % 2])
+        for index in range(8)
+    ]
+    result = validate_plan(tasks, design)
+    assert result["ok"], result["errors"]
+    coverage = result["snapshot"]["coverage"]
+    assert coverage["total"] == len(sections)
+    assert coverage["covered"] == 2
+    assert coverage["ratio"] == round(2 / len(sections), 3)
+    asserted = [entry for entry in coverage["sections"] if entry["tasks"]]
+    assert {entry["title"] for entry in asserted} == set(sections[:2])
+    assert len(coverage["uncovered"]) == len(sections) - 2
+    codes = {warning["code"] for warning in result["warnings"]}
+    assert "section_uncovered" in codes
+    assert result["snapshot"]["validation"]["warnings"] == result["warnings"]
+
+
+def test_coverage_full_has_no_warnings() -> None:
+    design = read_fixture("chat-product.md")
+    sections = [item["title"] for item in extract_sections(design)]
+    tasks = [
+        make_task(f"T{index + 1}", [f"T{index}"] if index else [], sections[index])
+        for index in range(len(sections))
+    ]
+    result = validate_plan(tasks, design)
+    assert result["ok"], result["errors"]
+    coverage = result["snapshot"]["coverage"]
+    assert coverage["covered"] == coverage["total"]
+    assert coverage["uncovered"] == []
+    assert result["warnings"] == []
+
+
 def test_sections_and_match() -> None:
     sections = extract_sections(read_fixture("chat-product.md"))
     assert len(sections) == 10
@@ -149,3 +185,21 @@ def test_fixture_products_produce_different_plans() -> None:
 def test_extract_json_tolerates_fences_and_noise(payload: str) -> None:
     data = _extract_json(payload)
     assert data["tasks"][0]["uid"] == "T1"
+
+
+def test_design_brief_keeps_head_and_tail_for_long_docs() -> None:
+    from app.engine.plan_generation import _design_brief
+
+    doc = "# 长文档\n\n" + "\n\n".join(
+        f"## {index} 章节 {index}\n\n" + (f"第 {index} 章正文。" * 100) for index in range(1, 31)
+    )
+    assert len(doc) > 16000
+    brief = _design_brief(doc)
+    assert "章节索引" in brief
+    assert "中间省略" in brief
+    assert "章节 30" in brief
+    assert "第 1 章正文" in brief
+    assert doc[-40:].strip() in brief
+    # 不应超过提示预算太多（允许索引与标注的固定开销）。
+    assert len(brief) < 20000
+

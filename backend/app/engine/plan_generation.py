@@ -52,13 +52,34 @@ def _extract_json(text: str) -> dict:
     return data
 
 
-def _design_brief(design_text: str) -> str:
+def _design_brief(design_text: str, limit: int = 16000) -> str:
+    """给 PM 的设计要点：章节索引 + 正文。
+
+    长文档不做硬截断：保留开头与结尾，并在中间标注省略字数。编排工作台里最常见的
+    失败是「后半章没有任务」——只截头部会让 PM 完全看不到结尾章节。
+    """
     sections = extract_sections(design_text)
     index = "\n".join(
-        f"- {item['title']}" for item in sections[:40]
+        f"{number}. {item['title']}" for number, item in enumerate(sections[:60], start=1)
     ) or "（未识别到章节标题）"
-    body = design_text[:9000]
-    return f"## 设计章节索引\n{index}\n\n## 设计规格正文（截断）\n{body}"
+    total = len(design_text)
+    if total <= limit:
+        body = design_text
+        note = f"设计规格正文（全文 {total} 字）"
+    else:
+        head = int(limit * 0.62)
+        tail = limit - head
+        omitted = total - limit
+        body = (
+            design_text[:head]
+            + f"\n\n[……中间省略约 {omitted} 字，下方保留结尾章节……]\n\n"
+            + design_text[-tail:]
+        )
+        note = f"设计规格正文（全文 {total} 字，保留开头 {head} 字与结尾 {tail} 字）"
+    return (
+        f"## 设计章节索引（共 {len(sections)} 个章节，全部需要有任务承接）\n{index}"
+        f"\n\n## {note}\n{body}"
+    )
 
 
 async def generate_plan(plan_id: str) -> None:
@@ -92,7 +113,7 @@ async def generate_plan(plan_id: str) -> None:
         async with sem:
             async for event in adapter.stream(
                 messages, None, GenParams(model=model.model_name, temperature=0.2,
-                                           max_tokens=min(model.max_output_tokens, 4096))
+                                           max_tokens=min(model.max_output_tokens, 6000))
             ):
                 with session_scope() as s:
                     plan = s.get(Plan, plan_id)
@@ -100,7 +121,9 @@ async def generate_plan(plan_id: str) -> None:
                         return
                 if event.kind == "text_delta" and event.text:
                     text += event.text
-                    await plan_bus.publish(plan_id, "plan_token", {"text": event.text})
+                    await plan_bus.publish(
+                        plan_id, "plan_token", {"text": event.text, "token": event.text}
+                    )
                 elif event.kind == "done" and event.message and event.message.content:
                     text = event.message.content
         data = _extract_json(text)
@@ -118,7 +141,7 @@ async def generate_plan(plan_id: str) -> None:
                 result = await adapter.chat(
                     repair, None,
                     GenParams(model=model.model_name, temperature=0.0,
-                              max_tokens=min(model.max_output_tokens, 4096)),
+                              max_tokens=min(model.max_output_tokens, 6000)),
                 )
             text = result.content or ""
             data = _extract_json(text)
@@ -170,7 +193,13 @@ async def generate_plan(plan_id: str) -> None:
                     dag_json=snapshot["dag"], waves_json=snapshot["waves"],
                     critical_path_json=snapshot["critical_path"],
                     metrics_json=snapshot["metrics"],
-                    validation_json={"ok": True, "errors": []}, is_valid=True,
+                    coverage_json=snapshot.get("coverage") or {},
+                    validation_json={
+                        "ok": True,
+                        "errors": [],
+                        "warnings": result.get("warnings") or [],
+                    },
+                    is_valid=True,
                 )
             )
             plan.status = "valid"
@@ -180,7 +209,8 @@ async def generate_plan(plan_id: str) -> None:
                 PlanSnapshot(
                     plan_id=plan_id, version=version, tasks_json=tasks,
                     dag_json={}, waves_json={}, critical_path_json=[], metrics_json={},
-                    validation_json={"ok": False, "errors": result["errors"]},
+                    coverage_json={},
+                    validation_json={"ok": False, "errors": result["errors"], "warnings": []},
                     is_valid=False,
                 )
             )

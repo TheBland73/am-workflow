@@ -12,12 +12,15 @@ class BudgetExceeded(RuntimeError):
     pass
 
 
-def add_attempt_usage(attempt_id: int, usage: Usage) -> None:
+def add_attempt_usage(attempt_id: int, usage: Usage, *, model_id: int | None = None) -> None:
+    """累加 attempt 的 token，并记录实际使用的模型（用于成本归集）。"""
     with session_scope() as s:
         attempt = s.get(NodeAttempt, attempt_id)
         if attempt:
             attempt.tokens_in += usage.input_tokens
             attempt.tokens_out += usage.output_tokens
+            if model_id is not None:
+                attempt.model_id = model_id
 
 
 def consume_run_budget(run_id: str, usage: Usage) -> int:

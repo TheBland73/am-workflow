@@ -1,0 +1,47 @@
+产品：随手账本（ledger-cli），一个只依赖 Python 3 标准库的命令行记账工具。
+
+【目标用户】
+想在终端里快速记录日常开销、按分类查看总额的个人用户。
+
+【交付物】
+1. ledger.py：核心类 + argparse CLI。
+2. test_ledger.py：unittest 测试。
+3. README.md：安装、用法与示例。
+
+【必须遵守的接口契约，实现与测试都以此为准】
+- class Ledger(path: str = "ledger.json")
+  - add(amount: float, category: str, note: str = "") -> dict
+    追加一条记录并落盘，返回该记录；amount <= 0 或 category 为空时抛 ValueError。
+  - entries() -> list[dict]
+    按写入顺序返回全部记录。
+  - summary() -> dict
+    返回 {"total": float, "count": int, "by_category": dict[str, float]}；
+    空账本返回 total=0.0、count=0、by_category={}。
+- 记录字段：amount(float)、category(str)、note(str)、created_at(ISO8601 字符串)。
+- 存储：UTF-8 JSON 数组；写入先写同目录临时文件再 os.replace 原子替换；
+  读取时文件不存在视为空账本。
+- CLI 函数签名：main(argv: list[str] | None = None) -> int
+  python ledger.py add 12.5 餐饮 --note 午饭
+  python ledger.py list
+  python ledger.py summary
+  add 的金额非法（非数字或 <= 0）时向 stderr 打印错误并返回退出码 2；
+  list / summary 正常退出码 0。
+  summary 输出总金额、笔数，以及按分类的金额（分类按名称排序）。
+
+【测试要求】
+test_ledger.py 使用 unittest + tempfile.TemporaryDirectory，至少 6 个用例：
+新增并读取、金额累加与分类汇总、空账本、非法金额、持久化往返（重新实例化后数据仍在）、
+CLI 参数解析（直接调用 main([...])）。
+测试不得依赖网络，不得写入仓库根目录。
+
+【建议任务拆分】
+1. 任务 A：实现 ledger.py（Ledger 类、JSON 原子持久化、argparse CLI）。
+2. 任务 B：编写 test_ledger.py（严格按接口契约，可与任务 A 并行）。
+3. 任务 C：编写 README.md（用法与示例，依赖 A、B）。
+
+【边界】
+只做 CLI，不做 Web / 数据库 / 第三方依赖；金额用 float 即可；不做多币种与账户体系。
+
+【验收标准】
+python -m unittest discover -s . -p "test_*.py" 全绿（至少 6 个测试），
+且上面 3 条 CLI 命令可以现场演示。

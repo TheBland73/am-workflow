@@ -6,6 +6,7 @@ session_scope()，每次读取都在一个 session 内取完所需行再退出�
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 
 from app.db.base import session_scope
@@ -133,14 +134,31 @@ class ModelPool:
                 self._semaphores[provider.id] = sem
         return sem
 
+    # ---------- 模型发现 ----------
+    async def list_models(self, provider_id: int) -> list[dict]:
+        provider = self.load_provider(provider_id)
+        if provider.protocol == "openai_chat":
+            from app.models.providers.openai_chat import list_models
+
+            return await list_models(provider.base_url, provider.api_key,
+                                     provider.extra_headers, provider.timeout_s)
+        raise ProviderError("该协议暂不支持自动拉取模型列表，请手动填写模型名")
+
     # ---------- 测试连接 ----------
     async def test_connection(self, provider_id: int, model_id: int | None = None) -> dict:
         provider = self.load_provider(provider_id)
         if provider.protocol == "openai_chat":
             from app.models.providers.openai_chat import test_connection
 
+            model_name = None
+            if model_id is not None:
+                try:
+                    model_name = self.load_model(model_id).model_name
+                except ProviderError:
+                    model_name = None
             return await test_connection(provider.base_url, provider.api_key,
-                                         provider.extra_headers, provider.timeout_s)
+                                         provider.extra_headers, provider.timeout_s,
+                                         model_name=model_name)
         if model_id is None:
             with session_scope() as s:
                 row = (
@@ -153,11 +171,16 @@ class ModelPool:
             raise ProviderError("请先为该供应商添加至少一个模型，再测试连接")
         model = self.load_model(model_id)
         adapter = self.adapter_for(model)
+        started = time.perf_counter()
         reply = await adapter.chat(
             [Message(role="user", content="ping")], None,
             GenParams(model=model.model_name, max_tokens=8, temperature=0),
         )
-        return {"ok": True, "message": f"连接成功：{reply.content[:80] or '(空回复)'}", "models": []}
+        elapsed = int((time.perf_counter() - started) * 1000)
+        text = (reply.content or "").strip().replace("\n", " ")[:80]
+        detail = f"：{text}" if text else ""
+        return {"ok": True, "message": f"{model.model_name} 对话正常（{elapsed} ms）{detail}",
+                "latency_ms": elapsed, "reply": text, "models": []}
 
 
 pool = ModelPool()

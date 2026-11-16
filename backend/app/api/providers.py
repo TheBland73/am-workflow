@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import func
 
-from app.api.schemas import ProviderIn, ProviderPatch
+from app.api.schemas import ModelImportIn, ProviderIn, ProviderPatch
 from app.db.base import session_scope
 from app.db.models import ModelEntry, ProviderConfig
 from app.models.crypto import decrypt_key, encrypt_key, mask_key
@@ -32,6 +32,15 @@ def _serialize(row: ProviderConfig, models_count: int = 0) -> dict:
     }
 
 
+def _preset_specs(provider: ProviderConfig) -> dict[str, dict]:
+    """按 base_url 找到预设，返回 {model_name: 模型元数据}；找不到返回空字典。"""
+    base = (provider.base_url or "").rstrip("/")
+    for preset in PRESETS:
+        if (preset.get("base_url") or "").rstrip("/") == base and base:
+            return {m["model_name"]: m for m in preset.get("models") or []}
+    return {}
+
+
 @router.get("/presets")
 def list_presets() -> dict:
     return {"presets": PRESETS}
@@ -52,6 +61,35 @@ def list_providers() -> dict:
         return {"items": [_serialize(r, counts.get(r.id, 0)) for r in rows]}
 
 
+def _seed_preset_models(s, provider: ProviderConfig, preset_key: str | None) -> int:
+    """按预设补建模型；只补不覆盖，已存在的同名模型跳过。"""
+    if not preset_key:
+        return 0
+    preset = next((p for p in PRESETS if p.get("key") == preset_key), None)
+    if preset is None:
+        return 0
+    existing = {
+        name for (name,) in
+        s.query(ModelEntry.model_name).filter(ModelEntry.provider_id == provider.id).all()
+    }
+    created = 0
+    for spec in preset.get("models") or []:
+        name = spec.get("model_name")
+        if not name or name in existing:
+            continue
+        s.add(ModelEntry(
+            provider_id=provider.id, model_name=name,
+            display_name=spec.get("display_name") or name,
+            context_window=int(spec.get("context_window") or 32768),
+            max_output_tokens=int(spec.get("max_output_tokens") or 4096),
+            cap_tools=bool(spec.get("cap_tools", True)),
+            cap_json=bool(spec.get("cap_json", True)),
+            cap_vision=bool(spec.get("cap_vision", False)),
+        ))
+        created += 1
+    return created
+
+
 @router.post("/providers", status_code=201)
 def create_provider(payload: ProviderIn) -> dict:
     with session_scope() as s:
@@ -65,7 +103,8 @@ def create_provider(payload: ProviderIn) -> dict:
         )
         s.add(row)
         s.flush()
-        return _serialize(row)
+        created = _seed_preset_models(s, row, payload.preset_key)
+        return {**_serialize(row, created), "models_created": created}
 
 
 @router.patch("/providers/{provider_id}")
@@ -90,6 +129,56 @@ def delete_provider(provider_id: int) -> None:
         if row is None:
             raise HTTPException(404, "供应商不存在")
         s.delete(row)
+
+
+@router.get("/providers/{provider_id}/models")
+async def list_remote_models(provider_id: int) -> dict:
+    """向供应商拉取可选模型列表（openai_chat 走 GET /models）。"""
+    try:
+        items = await pool.list_models(provider_id)
+        return {"items": items, "count": len(items)}
+    except ProviderError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(400, f"拉取模型列表失败：{exc}") from exc
+
+
+@router.post("/providers/{provider_id}/models/import", status_code=201)
+def import_models(provider_id: int, payload: ModelImportIn) -> dict:
+    """把选中的远程模型写入本地模型表；预设里有元数据的带上上下文/能力。"""
+    with session_scope() as s:
+        provider = s.get(ProviderConfig, provider_id)
+        if provider is None:
+            raise HTTPException(404, "供应商不存在")
+        specs = _preset_specs(provider)
+        existing = {
+            name for (name,) in
+            s.query(ModelEntry.model_name).filter(ModelEntry.provider_id == provider_id).all()
+        }
+        created: list[dict] = []
+        skipped: list[str] = []
+        for name in dict.fromkeys(payload.models):
+            name = name.strip()
+            if not name:
+                continue
+            if name in existing:
+                skipped.append(name)
+                continue
+            spec = specs.get(name, {})
+            row = ModelEntry(
+                provider_id=provider_id, model_name=name,
+                display_name=spec.get("display_name") or name,
+                context_window=int(spec.get("context_window") or 32768),
+                max_output_tokens=int(spec.get("max_output_tokens") or 4096),
+                cap_tools=bool(spec.get("cap_tools", True)),
+                cap_json=bool(spec.get("cap_json", True)),
+                cap_vision=bool(spec.get("cap_vision", False)),
+            )
+            s.add(row)
+            s.flush()
+            created.append({"id": row.id, "model_name": row.model_name})
+            existing.add(name)
+        return {"created": created, "skipped": skipped}
 
 
 @router.post("/providers/{provider_id}/test")

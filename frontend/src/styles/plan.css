@@ -162,8 +162,15 @@
   padding: 7px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.18);
   font-family: var(--ef-mono, "Cascadia Mono", monospace);
-  font-size: 9px;
-  letter-spacing: 0.14em;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+}
+
+.plan-stream-head em {
+  margin-right: 10px;
+  font-style: normal;
+  letter-spacing: 0.04em;
+  color: rgba(255, 255, 255, 0.66);
 }
 
 .plan-stream-head .ant-progress {
@@ -181,12 +188,12 @@
 
 .plan-stream pre {
   margin: 0;
-  max-height: 128px;
+  max-height: 190px;
   overflow: auto;
   padding: 10px 12px;
   font-family: var(--ef-mono, "Cascadia Mono", monospace);
-  font-size: 10px;
-  line-height: 1.55;
+  font-size: 12px;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -751,6 +758,18 @@
   display: flex;
   margin: 12px 0;
 }
+
+.plan-commit-budget {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--ef-ink-2);
+}
+.plan-commit-budget > span { flex: none; font-weight: 600; color: var(--ef-ink); }
+.plan-commit-budget > em { font-style: normal; font-size: 11px; color: #8a887e; }
+.plan-commit-budget .ant-input-number { width: 168px; }
 
 .plan-commit-facts {
   display: flex;
@@ -1560,3 +1579,386 @@
   color: var(--ef-ink);
   border-color: rgba(22,22,22,.2);
 }
+
+/* ============ 可交互编排画布（React Flow） ============ */
+.plan-flow-wrap {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  min-height: 540px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, .55), rgba(255, 255, 255, 0) 160px),
+    var(--ef-paper, #f4f4f2);
+  border-top: 1px solid var(--ef-rule);
+}
+.plan-flow-wrap .react-flow { --xy-edge-stroke-default: #c6c4bb; }
+.plan-flow-wrap .react-flow__pane { cursor: grab; }
+.plan-flow-wrap .react-flow__pane.dragging { cursor: grabbing; }
+.plan-flow-wrap .react-flow__node { font-family: var(--ef-font-ui, "Saira", sans-serif); }
+
+/* 波次泳道：背后一层极浅的底板 + 顶部标尺 */
+.flow-lane {
+  width: 100%;
+  height: 100%;
+  border: 1px dashed rgba(22, 22, 22, .14);
+  background:
+    repeating-linear-gradient(0deg, rgba(22, 22, 22, .026) 0 1px, transparent 1px 14px),
+    rgba(255, 255, 255, .34);
+  pointer-events: none;
+}
+.flow-lane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  border-bottom: 1px dashed rgba(22, 22, 22, .16);
+  background: rgba(244, 244, 242, .7);
+}
+.flow-lane-head b {
+  font: 700 10px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .16em;
+  color: var(--ef-ink);
+}
+.flow-lane-head span {
+  font: 600 9px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .12em;
+  color: #8a887e;
+}
+
+/* 任务卡：左侧角色色条 + 发丝线框，选中时信号黄投影 */
+.flow-task {
+  position: relative;
+  width: 232px;
+  min-height: 112px;
+  padding: 11px 13px 10px 17px;
+  background: var(--ef-panel, #fff);
+  border: 1px solid var(--ef-rule, #d9d9d6);
+  box-shadow: 0 1px 0 rgba(22, 22, 22, .04);
+  cursor: grab;
+  transition: border-color .16s var(--ef-ease, ease), box-shadow .16s var(--ef-ease, ease), transform .16s var(--ef-ease, ease);
+}
+.flow-task:hover { border-color: rgba(22, 22, 22, .55); box-shadow: 2px 2px 0 rgba(22, 22, 22, .08); }
+.flow-task:active { cursor: grabbing; }
+.flow-task.is-selected {
+  border-color: var(--ef-ink, #161616);
+  box-shadow: 4px 4px 0 var(--ef-signal, #fffa00);
+}
+.flow-task.is-critical { border-color: rgba(22, 22, 22, .78); }
+.flow-task.is-error { border-style: dashed; border-color: var(--ef-danger, #b3261e); }
+.flow-task-rail {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 4px;
+  background: var(--role, #161616);
+}
+.flow-task.is-critical .flow-task-rail { box-shadow: inset 0 0 0 1px var(--ef-signal); }
+.flow-task-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(22, 22, 22, .08);
+}
+.flow-task-head b {
+  font: 700 11px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .14em;
+  color: var(--ef-ink);
+}
+.flow-task-head span {
+  font: 600 9px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .1em;
+  color: #8a887e;
+}
+.flow-task-title {
+  margin-top: 9px;
+  min-height: 36px;
+  font: 600 13px/1.4 var(--ef-font-text, sans-serif);
+  color: var(--ef-ink);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.flow-task-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+  font: 600 9.5px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .08em;
+  color: #74746e;
+}
+.flow-role {
+  padding: 2px 5px;
+  font-weight: 700;
+  color: var(--role, #161616);
+  background: color-mix(in srgb, var(--role, #161616) 12%, transparent);
+}
+.flow-flag {
+  position: absolute;
+  top: -9px;
+  right: 9px;
+  padding: 3px 5px;
+  background: var(--ef-signal, #fffa00);
+  color: var(--ef-on-signal, #161616);
+  font: 800 8px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .14em;
+}
+.flow-flag.is-error { background: var(--ef-danger, #b3261e); color: #fff; }
+
+.flow-handle {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--ef-ink, #161616);
+  border-radius: 0;
+  background: var(--ef-panel, #fff);
+  opacity: .55;
+  transition: opacity .15s ease, transform .15s ease;
+}
+.flow-task:hover .flow-handle,
+.flow-task.is-selected .flow-handle { opacity: 1; transform: scale(1.15); }
+.flow-handle:hover { background: var(--ef-signal, #fffa00); }
+
+/* 连线：默认细线，跨角色虚线，关键路径加粗墨线，错误红色点线 */
+.plan-flow-wrap .react-flow__edge-path {
+  transition: stroke .15s ease, stroke-width .15s ease;
+}
+.plan-flow-wrap .react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--ef-ink, #161616) !important;
+  stroke-width: 2.6 !important;
+  stroke-dasharray: none !important;
+}
+.flow-edge.is-critical .react-flow__edge-path { filter: drop-shadow(0 0 3px rgba(255, 250, 0, .55)); }
+
+/* 工具条已移到 stage tools；这里只留图例旁的画布操作提示 */
+.plan-canvas-hint {
+  margin-right: auto;
+  font: 500 11px/1.5 var(--ef-font-text, sans-serif);
+  letter-spacing: .01em;
+  color: #7a7a72;
+}
+
+.plan-flow-wrap .react-flow__controls {
+  box-shadow: 0 0 0 1px var(--ef-rule);
+  border-radius: 0;
+  overflow: hidden;
+}
+.plan-flow-wrap .react-flow__controls-button {
+  width: 26px;
+  height: 26px;
+  background: var(--ef-panel, #fff);
+  border-bottom: 1px solid var(--ef-rule);
+  fill: var(--ef-ink, #161616);
+}
+.plan-flow-wrap .react-flow__controls-button:hover { background: var(--ef-signal, #fffa00); }
+.plan-flow-wrap .react-flow__minimap {
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-paper, #f4f4f2);
+}
+
+.plan-key.is-handoff { background: transparent; border-top: 2px dashed #8a887e; }
+.plan-graph-legend .plan-key { display: inline-block; width: 16px; }
+
+/* ---------- 设计覆盖率 ---------- */
+.plan-station-metrics span.is-warn b,
+.plan-station-metrics span.is-warn em { color: #b45309; }
+.plan-station-metrics span.is-ok b,
+.plan-station-metrics span.is-ok em { color: #157a3b; }
+.plan-coverage {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 14px 11px;
+  border-bottom: 1px solid var(--ef-rule);
+  background: linear-gradient(180deg, rgba(255, 255, 255, .78), rgba(255, 255, 255, .4));
+}
+.plan-coverage-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--ef-muted, #6b6a63);
+}
+.plan-coverage-head b {
+  font: 700 9px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--ef-ink, #161616);
+}
+.plan-coverage-head strong { color: var(--ef-ink, #161616); font-weight: 700; }
+.plan-coverage-head em {
+  margin-left: auto;
+  font-style: normal;
+  color: #b45309;
+  letter-spacing: .04em;
+}
+.plan-coverage-head em.is-ok { color: #157a3b; }
+.plan-coverage-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.plan-coverage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 8px;
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-panel, #fff);
+  font: 500 11px/1.5 var(--ef-font-ui, sans-serif);
+  color: var(--ef-ink, #161616);
+  cursor: pointer;
+  transition: border-color .12s ease, background .12s ease;
+}
+.plan-coverage-chip b {
+  font: 700 10px/1 var(--ef-font-mono, monospace);
+  color: var(--ef-muted, #6b6a63);
+}
+.plan-coverage-chip.is-open {
+  border-style: dashed;
+  border-color: rgba(180, 83, 9, .55);
+  color: #8a5a12;
+  background: repeating-linear-gradient(-45deg, rgba(255, 250, 0, .16) 0 6px, transparent 6px 12px);
+}
+.plan-coverage-chip.is-open b { color: #b45309; }
+.plan-coverage-chip:hover { border-color: var(--ef-ink, #161616); }
+.plan-coverage-chip.is-focus {
+  background: var(--ef-signal, #fffa00);
+  border-color: var(--ef-ink, #161616);
+  box-shadow: 3px 3px 0 rgba(22, 22, 22, .12);
+}
+.plan-coverage-chip.is-focus b { color: var(--ef-ink, #161616); }
+.plan-coverage-chip > span {
+  max-width: 168px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 聚焦/血缘之外的节点与连线退到背景 */
+.flow-task.is-dim { opacity: .3; filter: grayscale(.65); }
+.flow-task.is-dim:hover { opacity: .92; filter: none; }
+.plan-flow-wrap .react-flow__edge.is-dim .react-flow__edge-path { opacity: .16; }
+
+/* ============ 可读性与画布基线（编排工作台迭代 R1） ============ */
+/* React Flow 需要容器有确定高度：绝对定位铺满带 clamp 高度的画布壳。 */
+.plan-flow-wrap {
+  height: clamp(600px, calc(100vh - 300px), 880px);
+  min-height: 600px;
+}
+/* React Flow 在根节点写了内联 position:relative/height:100%，需 !important 才能接管布局。 */
+.plan-flow-wrap .react-flow {
+  position: absolute !important;
+  inset: 0 !important;
+}
+
+.plan-station { grid-template-columns: 286px minmax(0, 1fr); }
+@media (max-width: 1360px) {
+  .plan-station { grid-template-columns: 236px minmax(0, 1fr); }
+}
+.plan-station-metrics small { font-size: 11px; letter-spacing: .1em; }
+.plan-station-metrics em { font-size: 11px; }
+.plan-tabs button { font-size: 12px; padding: 8px 13px 9px; }
+.plan-tabs button span { font-size: 11px; opacity: .7; }
+
+.plan-nav-title b { font-size: 12px; }
+.plan-nav-title span { font-size: 12px; }
+.plan-nav-count { font-size: 10px; }
+.plan-nav-count b { font-size: 13px; }
+.plan-phase-head b { font-size: 11px; }
+.plan-phase-head span { font-size: 11px; }
+.plan-nav-index { font-size: 10px; }
+.plan-nav-text b { font-size: 12.5px; line-height: 1.4; }
+.plan-nav-text small { font-size: 10.5px; }
+.plan-nav-foot { font-size: 10px; }
+
+.plan-stage-mode { font-size: 10.5px !important; }
+.plan-graph-legend { font-size: 11px; }
+.plan-graph-legend .plan-key { width: 22px; height: 2px; }
+
+.flow-task { width: 260px; min-height: 156px; padding: 12px 14px 11px 18px; }
+.flow-task-rail { width: 6px; }
+.flow-task-head b { font-size: 12px; }
+.flow-task-head span { font-size: 11px; }
+.flow-task-title { font-size: 15px; line-height: 1.4; min-height: 42px; }
+.flow-task-desc {
+  margin-top: 6px;
+  font: 400 12.5px/1.45 var(--ef-font-text, sans-serif);
+  color: #5e5d55;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.flow-task-foot { font-size: 11px; gap: 8px; margin-top: 10px; }
+.flow-role { font-size: 10.5px; padding: 3px 6px; }
+.flow-sec {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8a887e;
+}
+.flow-pri { margin-left: auto; color: var(--ef-ink, #161616); }
+.flow-flag { font-size: 10px; padding: 4px 6px; }
+.flow-lane-head { padding-left: 18px; }
+.flow-lane-head b { font-size: 12px; }
+.flow-lane-head span { font-size: 11px; }
+
+.flow-lane {
+  border: 1px solid rgba(22, 22, 22, .1);
+  background: linear-gradient(180deg, rgba(246, 246, 241, .92), rgba(252, 252, 249, .5));
+}
+.flow-lane-head { background: rgba(238, 238, 232, .9); }
+
+.plan-graph-legend { flex-wrap: wrap; row-gap: 6px; padding: 9px 14px; }
+.plan-key { width: 18px; height: 2px; background: #b8b5a9; }
+.plan-key.is-normal { background: #b8b5a9; }
+.plan-legend-roles {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 10px;
+  border-left: 1px solid var(--ef-rule);
+}
+.plan-legend-roles em {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-style: normal;
+  color: #5f5e57;
+}
+.plan-legend-roles em i { width: 9px; height: 9px; display: inline-block; }
+
+.flow-task.is-dim { opacity: .5; filter: none; }
+.flow-task.is-dim:hover { opacity: 1; }
+
+/* 缩放控件不要压住图例 */
+.plan-flow-wrap .react-flow__controls { bottom: 14px; left: 14px; }
+.plan-flow-wrap .react-flow__minimap { background: rgba(255, 255, 255, .9); }
+
+/* 编辑态：未保存标记 / 重命名弹窗 / 快照历史 */
+.plan-dirty {
+  margin-left: 8px;
+  padding: 3px 7px;
+  font: 700 10px/1 var(--ef-font-ui, sans-serif);
+  letter-spacing: .08em;
+  color: #8a5a12;
+  background: repeating-linear-gradient(-45deg, rgba(255, 250, 0, .3) 0 5px, transparent 5px 10px);
+  border: 1px solid rgba(180, 83, 9, .45);
+}
+.flow-rename { display: flex; flex-direction: column; gap: 8px; }
+.flow-rename span { font-size: 11.5px; color: #74746e; line-height: 1.5; }
+.plan-muted { margin: 4px 0 10px; font-size: 12px; color: #8a887e; }
+.plan-history { display: flex; flex-direction: column; max-height: 360px; overflow: auto; }
+.plan-history-row {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr) 48px 132px 62px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 2px;
+  border-bottom: 1px dashed var(--ef-rule);
+  font-size: 11.5px;
+}
+.plan-history-row b { font-family: var(--ef-mono, monospace); font-size: 12px; }
+.plan-history-row span { color: #5f5e57; }
+.plan-history-row em { font-style: normal; color: #8a887e; font-family: var(--ef-mono, monospace); }
+.plan-history-row em.is-ok { color: #157a3b; }
+.plan-history-row em.is-bad { color: #b3261e; }

@@ -100,7 +100,7 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
                                             run_id=run_id, node_id=node_id)
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
-        add_attempt_usage(attempt_id, usage)
+        add_attempt_usage(attempt_id, usage, model_id=model.id)
         consume_run_budget(run_id, usage)
         if usage.total:
             await emit(run_id, "node_log", node_id,
@@ -160,7 +160,7 @@ async def _run_json_protocol(*, run_id: str, node_id: int, attempt_id: int, mode
         )
         total.input_tokens += step_usage.input_tokens
         total.output_tokens += step_usage.output_tokens
-        add_attempt_usage(attempt_id, step_usage)
+        add_attempt_usage(attempt_id, step_usage, model_id=model.id)
         consume_run_budget(run_id, step_usage)
         _save_message(node_id, attempt_id, "assistant", reply.content)
         messages.append(reply)

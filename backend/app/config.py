@@ -32,10 +32,18 @@ class Settings:
             "AM_CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173"
         ).split(",")
         self.node_concurrency = int(os.environ.get("AM_NODE_CONCURRENCY", "4"))
+        # 单节点执行超时（秒，0 = 不限制）；节点可在 config_json.timeout_s 覆盖。
+        self.node_timeout_s = float(os.environ.get("AM_NODE_TIMEOUT_S", "900"))
+        # 失败重试退避：base * 2^(attempt-1)，封顶 max，叠加 equal jitter。
+        self.retry_base_s = float(os.environ.get("AM_RETRY_BASE_S", "3"))
+        self.retry_max_s = float(os.environ.get("AM_RETRY_MAX_S", "60"))
+        # attempt 心跳与陈旧判定（多 worker / 崩溃检测的预留能力）。
+        self.heartbeat_s = float(os.environ.get("AM_HEARTBEAT_S", "15"))
+        self.attempt_stale_s = float(os.environ.get("AM_ATTEMPT_STALE_S", "120"))
         self.default_budget_tokens = int(os.environ.get("AM_RUN_BUDGET_TOKENS", "1200000"))
         self.stream_tokens = os.environ.get("AM_STREAM_TOKENS", "1") != "0"
         self.memory_extract = os.environ.get("AM_MEMORY_EXTRACT", "1") != "0"
-        self.max_rework_rounds = 3
+        self.max_rework_rounds = int(os.environ.get("AM_MAX_REWORK_ROUNDS", "3"))
         self.secret_key_file = self.data_dir / "secret.key"
         self.secret_key_env = os.environ.get("AM_SECRET_KEY")
         # 离线演示用本地 OpenAI 兼容 mock（不是产品内置供应商）

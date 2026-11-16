@@ -64,6 +64,7 @@ function eventText(event: StreamEvent) {
     case "node_finished": return `${key} 完成`;
     case "node_failed": return `${key} 失败：${String(payload.message ?? "")}`;
     case "node_retried": return `${key} 已重试`;
+    case "node_retry_scheduled": return `${key} 将在 ${String(payload.delay_s ?? "")}s 后重试（第 ${String(payload.next_attempt ?? "")} 次）`;
     case "nodes_reset": return `重置 ${Array.isArray(payload.nodes) ? payload.nodes.length : 0} 个节点`;
     case "gate_requested": return `等待审批：${key}`;
     case "gate_decided": return `审批 ${String(payload.action ?? "")}：${key}`;
@@ -118,6 +119,16 @@ export default function RunPage() {
     },
   });
 
+  const metricsQuery = useQuery({
+    queryKey: ["metrics", runId],
+    queryFn: () => api.metrics(runId),
+    enabled: Boolean(runId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "finished" || status === "failed" || status === "stopped" ? false : 8000;
+    },
+  });
+
   useEffect(() => {
     if (!runId) return;
     setEvents([]);
@@ -130,12 +141,14 @@ export default function RunPage() {
       setEvents((previous) => [...previous.slice(-399), event]);
       if (event.type !== "node_token") {
         client.invalidateQueries({ queryKey: ["snapshot", runId] });
+        client.invalidateQueries({ queryKey: ["metrics", runId] });
       }
     }, 0);
     return unsubscribe;
   }, [client, runId]);
 
   const snapshot: Snapshot | undefined = snapshotQuery.data;
+  const metrics = metricsQuery.data;
   const phases = snapshot?.workflow.phases ?? [];
   const nodes = snapshot?.nodes ?? [];
   const openGate = snapshot?.gates.find((gate) => gate.status === "open") ?? null;
@@ -285,6 +298,13 @@ export default function RunPage() {
           <ul className="ef-ledger">
             <li><span>当前阶段</span><b>{snapshot.phase_names[run.current_phase ?? ""] ?? "—"}</b></li>
             <li><span>已用 Token</span><b>{usage?.total.toLocaleString() ?? "—"}</b></li>
+            {metrics && (
+              <>
+                <li><span>重试 / 尝试</span><b>{metrics.execution.retries} / {metrics.execution.attempts}</b></li>
+                <li><span>单节点 P95</span><b>{(metrics.execution.p95_attempt_ms / 1000).toFixed(1)}s</b></li>
+                <li><span>人工门等待</span><b>{(metrics.gates.open_wait_ms / 1000).toFixed(0)}s</b></li>
+              </>
+            )}
           </ul>
         </div>
 

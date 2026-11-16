@@ -102,6 +102,52 @@ export interface Usage {
   budget: number;
 }
 
+export interface NodeMetric {
+  node_key: string;
+  type: string;
+  name: string;
+  phase: string;
+  status: string;
+  attempts: number;
+  retries: number;
+  exec_ms: number;
+  tokens_in: number;
+  tokens_out: number;
+  last_error: string | null;
+}
+
+export interface RunMetrics {
+  run_id: string;
+  status: string;
+  wall_ms: number;
+  nodes: Record<string, number>;
+  execution: {
+    attempts: number;
+    retries: number;
+    busy_ms: number;
+    avg_attempt_ms: number;
+    p95_attempt_ms: number;
+    max_attempt_ms: number;
+    stale_attempts: number;
+  };
+  usage: {
+    tokens_in: number;
+    tokens_out: number;
+    total: number;
+    estimated_cost: number;
+  };
+  gates: {
+    total: number;
+    open: number;
+    approved: number;
+    rejected: number;
+    avg_decision_ms: number;
+    open_wait_ms: number;
+  };
+  events: number;
+  per_node: NodeMetric[];
+}
+
 export interface Snapshot {
   run: Run;
   workflow: { key: string; name: string; phases: string[] };
@@ -134,6 +180,21 @@ export interface Provider {
   max_concurrency: number;
   enabled: boolean;
   models_count: number;
+  models_created?: number;
+}
+
+export interface RemoteModel {
+  id: string;
+  owned_by: string;
+  created: number;
+}
+
+export interface TestResult {
+  ok: boolean;
+  message: string;
+  latency_ms?: number;
+  reply?: string;
+  models?: RemoteModel[];
 }
 
 export interface ModelEntry {
@@ -230,6 +291,24 @@ export interface PlanValidationError {
 export interface PlanValidation {
   ok: boolean;
   errors: PlanValidationError[];
+  warnings?: PlanValidationError[];
+}
+
+export interface PlanCoverageSection {
+  title: string;
+  key: string;
+  level: number;
+  line: number;
+  tasks: string[];
+}
+
+export interface PlanCoverage {
+  total: number;
+  covered: number;
+  ratio: number;
+  sections: PlanCoverageSection[];
+  uncovered: string[];
+  orphan_tasks: string[];
 }
 
 export interface PlanDagEdge {
@@ -243,9 +322,15 @@ export interface PlanSnapshot {
   waves: Record<string, string[]>;
   critical_path: string[];
   dag: { nodes?: string[]; edges?: PlanDagEdge[] };
+  coverage?: PlanCoverage;
   validation: PlanValidation;
   is_valid: boolean;
   created_at: string | null;
+}
+
+export interface PlanPoint {
+  x: number;
+  y: number;
 }
 
 export interface PlanHeader {
@@ -264,6 +349,7 @@ export interface PlanHeader {
   raw_output?: string | null;
   sections: PlanSection[];
   budget_tokens?: number;
+  layout?: Record<string, PlanPoint>;
 }
 
 export interface PlanDetail {

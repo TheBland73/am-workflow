@@ -6,20 +6,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from datetime import datetime, timezone
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from app.db.base import session_scope
 from app.db.models import Event
 
-_locks: dict[str, asyncio.Lock] = {}
+_locks: dict[str, threading.Lock] = {}
+# 进程内 seq 游标：避免每个事件都做一次 max(seq) 查询（事件密集型 run 的主要 DB 热点）。
+# 进程重启 / 唯一约束冲突时回落到 DB 重新取最大值，因此多进程写同一 run 也不会撞号。
+_seq_cache: dict[str, int] = {}
 
 
-def _run_lock(run_id: str) -> asyncio.Lock:
+def _run_lock(run_id: str) -> threading.Lock:
     lock = _locks.get(run_id)
     if lock is None:
-        lock = asyncio.Lock()
+        lock = threading.Lock()
         _locks[run_id] = lock
     return lock
 
@@ -53,27 +58,57 @@ class EventBus:
 bus = EventBus()
 
 
-async def emit(run_id: str, type_: str, node_id: int | None = None,
-               payload: dict | None = None) -> dict:
-    """追加事件并广播。seq 在进程内按 run 串行分配（唯一约束兜底）。"""
-    async with _run_lock(run_id):
+def reset_seq_cache(run_id: str | None = None) -> None:
+    """丢弃内存 seq 游标（测试/恢复场景）；下一次 emit 自动从 DB 重新取。"""
+    if run_id is None:
+        _seq_cache.clear()
+    else:
+        _seq_cache.pop(run_id, None)
+
+
+def _next_seq(run_id: str, *, reload: bool = False) -> int:
+    if reload:
+        _seq_cache.pop(run_id, None)
+    current = _seq_cache.get(run_id)
+    if current is None:
         with session_scope() as s:
-            current = (
+            current = int(
                 s.query(func.max(Event.seq)).filter(Event.run_id == run_id).scalar() or 0
             )
-            seq = current + 1
-            ts = datetime.now(timezone.utc)
-            row = Event(run_id=run_id, seq=seq, ts=ts, type=type_, node_id=node_id,
-                        payload_json=payload or {})
-            s.add(row)
-            s.flush()
-            event = {
-                "seq": seq,
-                "type": type_,
-                "node_id": node_id,
-                "ts": ts.isoformat(),
-                "payload": payload or {},
-            }
+    seq = current + 1
+    _seq_cache[run_id] = seq
+    return seq
+
+
+async def emit(run_id: str, type_: str, node_id: int | None = None,
+               payload: dict | None = None) -> dict:
+    """追加事件并广播。seq 在进程内按 run 串行分配（唯一约束兜底）。
+
+    临界区全是同步 DB 操作（无 await），因此用 threading.Lock 而不是 asyncio.Lock：
+    既能在单事件循环内串行，也不会把锁绑定到某个 loop（测试/多 loop 环境更稳）。
+    """
+    with _run_lock(run_id):
+        ts = datetime.now(timezone.utc)
+        for attempt in range(2):
+            seq = _next_seq(run_id, reload=attempt > 0)
+            try:
+                with session_scope() as s:
+                    row = Event(run_id=run_id, seq=seq, ts=ts, type=type_, node_id=node_id,
+                                payload_json=payload or {})
+                    s.add(row)
+                    s.flush()
+                break
+            except IntegrityError:
+                # 另一进程抢先写入了同号：丢弃缓存、重取最大 seq 后重试一次。
+                if attempt == 1:
+                    raise
+        event = {
+            "seq": seq,
+            "type": type_,
+            "node_id": node_id,
+            "ts": ts.isoformat(),
+            "payload": payload or {},
+        }
     bus.publish(run_id, event)
     return event
 
