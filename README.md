@@ -12,8 +12,10 @@
 - `docs/设计规格说明书.md`：实现基线（§4 数据模型、§5 API、§7 W1 范围）
 - `docs/research/前沿技术调研与技术选型.md`：选型论据
 - `docs/模型接入配置设计.md`：Provider / Model / Binding 与上下文预算
+- `docs/迭代优化-可靠执行.md`：并发闸门 / 超时 / 退避 / 心跳 / 指标（对标 Temporal、Airflow、Prefect）
 - `docs/迭代优化-可交互编排画布.md`：React Flow 画布、坐标/依赖落库、设计覆盖率
 - `docs/编排工作台-迭代记录.md`：R1–R5 体验迭代（正确性 / 视觉语义 / 可编辑 / 提交运行 / 生成链路）
+- `docs/tasks/real-model-ledger-test.md`：真实模型测试案例（「随手账本」需求规格与 5 门检查点）
 
 ---
 
@@ -22,15 +24,15 @@
 | 项 | 状态 |
 | --- | --- |
 | 后端 API（FastAPI + SQLAlchemy + SQLite WAL） | ✅ 可运行 |
-| 编排引擎（拓扑分波、并行、重试、门禁、恢复） | ✅ |
+| 编排引擎（依赖就绪并发、重试、门禁、恢复） | ✅ |
 | 可靠执行（全局并发闸门 / 节点超时 / 指数退避 / attempt 心跳 / 取消收据 / 运行指标） | ✅ 迭代一期 |
-| 固定 SDLC 模板（8 阶段 / 16+2 节点） | ✅ |
+| 固定 SDLC 模板（8 阶段 / 16 节点，展开后追加 `dev_*` 与 `verify`） | ✅ |
 | 人工门（通过 / 驳回+反馈+回退 / 编辑后通过） | ✅ 5 个门 |
 | SSE 事件流 + Last-Event-ID 补发 | ✅ |
 | 工件链（idea/discussion/proposal/requirement/design/task/changelog） | ✅ 7 类 |
 | L0 / L1 记忆最小实现 | ✅ |
 | 前端（终末地控制台风格：运行列表 / 运行详情 / 人工门 / 工件编辑 / 供应商 / 角色模板） | ✅ 已构建 |
-| 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 可交互画布 → 编辑 → 提交） | ✅ ORCH-01 |
+| 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 可交互画布 → 编辑/撤销 → 按角色提交运行） | ✅ ORCH-01 |
 | 离线 Mock 供应商（流式 + 工具调用） | ✅ `scripts/mock_provider.py` |
 | 单元测试 | ✅ 44 passed |
 
@@ -156,16 +158,20 @@ npm run dev
 3. 图 / 表共享选中；右栏可改标题、描述、角色、effort、priority、章节、依赖与验收，400ms 防抖自动重新校验；
    成环、缺依赖、章节不可追溯都会给出错误码、位置与修复提示；
    图视图是可拖拽的 React Flow 画布：拖节点自动保存坐标，右侧手柄拖到目标左侧即新增依赖，
-   点击连线确认后删除依赖；泳道按波次分层，关键路径、跨角色交接、校验错误三种连线有不同线型；
-   选中节点会高亮它的祖先/后代链路，其余节点退到背景；
+   点击连线确认后删除依赖；泳道按波次分列，普通依赖、关键路径、跨角色交接、校验错误四种连线有不同线型；
+   选中节点会高亮它的祖先/后代链路，其余节点退到背景（只是视觉聚焦，仍参与依赖执行与提交运行）；
+   页面默认选中第一个任务，点击其他卡片即切换聚焦，再点章节 chip 可取消章节过滤；
    画布顶部「设计覆盖」列出每个章节承接的任务数，点章节只看这条链路，未覆盖章节用黄黑斜纹标出；
    双击卡片可直接改名；右栏草稿按任务记忆，切换节点不丢未保存内容；
-   画布工具条的「全览 / 重置布局 / 历史」分别用于适配全图、恢复自动布局、查看并回滚校验快照；
+   页头「全览 / 重置布局 / 历史」分别用于适配全图、恢复自动布局、查看并回滚校验快照；
+   `Ctrl+Z`（macOS 为 `Cmd+Z`）撤销最近一次图编辑：移动节点、双击改名、依赖增删、
+   任务详情保存、新建任务，最多 30 步；输入框内保留浏览器自带的文字撤销，
+   计划提交或归档后撤销锁定。删除任务暂不可撤销（重建会丢 `task_uid` 与入边依赖）；
 4. 有效后可提交：
    - **仅保存**：计划置 `committed`，不创建 Run；
    - **创建运行**：可填运行预算（10,000–20,000,000 tokens），写入 `Task` 后按任务生成 `dev_*` 节点与一个 `verify` 节点，
      节点 config 携带 `role_key/description/effort/priority`，执行时按角色选模型与追加提示词，注入 design 工件并立即开始执行；
-5. 生成过程在页面顶部显示 `PM STREAM`（实时 token/字数/进度）；生成结束后可在「设计来源」查看原始输出。
+5. 生成过程在「设计覆盖」面板显示 `PM STREAM`（实时 token/字数/进度）；生成结束后可在「设计来源」查看原始输出。
    设计规格超过 16,000 字时保留开头与结尾章节，中段标注省略，避免长文档后半段没有任务；
 6. 已提交计划只读，状态条提供运行链接。
 
@@ -208,12 +214,16 @@ am-workflow/
 │   │   ├── artifacts/store.py 工件版本、front-matter、文件落盘
 │   │   ├── memory/store.py    L0/L1/L2 记忆
 │   │   └── agents/templates/roles.py  9 个角色的提示词与工具集（含 pm）
-│   ├── scripts/               mock_provider / e2e_demo / drive_run / check_sse / smoke_plan
-│   ├── tests/                 core / gates / api / planner / plans_api / durability / fixtures
+│   ├── scripts/               mock_provider / e2e_demo / drive_run / check_sse / smoke_plan / setup_real_model
+│   ├── tests/                 core / gates / api / planner / plans_api / durability / model_discovery / fixtures
 │   └── requirements.txt
 ├── frontend/                  Vite + React 18 + TS + AntD 5 + @xyflow/react + zustand
 ├── templates/sdlc_workflow.json  固定 SDLC 模板（8 阶段 5 门）
-├── docs/                      设计文档与迭代记录（调研 / 设计规格 / 模型接入 / 可靠执行）
+├── docs/                      设计文档与迭代记录
+│   ├── 设计规格说明书.md / 模型接入配置设计.md
+│   ├── 迭代优化-可靠执行.md / 迭代优化-可交互编排画布.md / 编排工作台-迭代记录.md
+│   ├── research/前沿技术调研与技术选型.md
+│   └── tasks/                 需求规格与测试案例（ledger-idea、real-model-ledger-test、orchestration-workbench）
 ├── runs/                      运行产物（工件、工作区），git 忽略
 └── data/                      SQLite 与密钥，git 忽略
 ```
@@ -224,7 +234,9 @@ am-workflow/
 
 ### 4.1 编排循环
 
-- 节点依赖来自模板 `deps`；`compute_waves` 拓扑分层，同波并发（`asyncio.gather`），波间串行，汇合即屏障。
+- 节点依赖来自模板 `deps`；调度循环每轮取「依赖全部完成」的节点并发执行（`asyncio.gather`），
+  受全局并发闸门限流；**没有波次屏障**——`compute_waves` 的拓扑分层只用于画布列与并行度估算，
+  某个任务完成即可解锁下游，不必等同波其他任务。
 - `orchestrator.start(run_id)` 幂等：同一 run 已在跑时只记一次唤醒，不重复起循环。
 - **并发**：进程级 `asyncio.Semaphore(AM_NODE_CONCURRENCY)`（挂在 event loop 上，跨 run 共享）；
   闸门在创建 attempt 前获取，排队节点保持 `pending`。
@@ -238,6 +250,9 @@ am-workflow/
   `GET /runs/{id}/metrics` 会按 `AM_ATTEMPT_STALE_S` 统计 `stale_attempts`。
 - **取消**：`stop` 时进行中 attempt 记 failed（“未回执”）、节点回 `pending`，不留下幽灵 running。
 - 无任何可执行节点且未全部完成时判定死锁，run 置 failed 并记录原因。
+- **运行指标**：`GET /runs/{id}/metrics` 即时聚合 wall_ms、节点状态计数、attempt 次数/重试/忙碌时长/P95、
+  token 用量与估算成本、人工门决策耗时与等待、逐节点明细；运行详情页 STATE 面板直接展示重试/尝试、
+  单节点 P95 与门等待，用于定位慢节点与卡点。
 
 ### 4.2 人工门
 
@@ -305,8 +320,10 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
   追加 `verify` 节点，落盘 design 工件后启动现有编排器。提交幂等，重复提交返回同一 Run；
   运行预算可填（10,000–20,000,000），节点 config 携带角色/说明/effort/priority，执行时按角色选模型与追加提示词。
 - **可交互画布**：坐标存 `plans.layout_json`（`PATCH /plans/{id}/layout`），依赖边可增删
-  （`POST/DELETE /plans/{id}/deps`，服务端做环检测并返回路径）；画布只在任务集合/波次变化时重新取景，
-  编辑器里的校验刷新不会打断视野；双击卡片改名，草稿按任务记忆，快照可回滚。
+  （`POST/DELETE /plans/{id}/deps`，服务端做环检测并返回路径）；默认按 0.68 缩放展示，
+  **不自动 fitView**，避免整图缩到看不清，需要全貌时点「全览」；编辑器里的校验刷新不会打断视野。
+  双击卡片改名，草稿按任务记忆，快照可回滚；`Ctrl+Z` 是前端撤销栈（最多 30 步、按计划隔离，
+  覆盖移动/改名/依赖增删/详情保存/新建，提交后锁定）。选中节点只是视觉聚焦，其余卡片变暗但仍参与执行。
   详见 `docs/迭代优化-可交互编排画布.md` 与 `docs/编排工作台-迭代记录.md`。
 - **设计覆盖率**：校验时按 `design_section` 与章节索引求覆盖，写进 `snapshot.coverage`
   （total/covered/ratio/每章任务/uncovered/orphan_tasks）与 `plan_snapshots.coverage_json`；
@@ -325,13 +342,13 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 | 模型 | `GET/POST /models`；`PATCH/DELETE /models/{id}` |
 | 角色模板 | `GET /agent-templates`；`PATCH /agent-templates/{id}` |
 | 运行 | `POST /runs`；`GET /runs`；`GET /runs/{id}`；`POST /runs/{id}/stop`；`GET /runs/{id}/metrics` |
-| 事件 | `GET /runs/{id}/events`（SSE）；`GET /runs/{id}/events/history` |
+| 事件 | `GET /runs/{id}/events`（SSE）；`GET /runs/{id}/events/history`；`GET /events/{id}` |
 | 工件 | `GET /runs/{id}/artifacts`；`GET/PATCH /runs/{id}/artifacts/{kind}` |
-| 门 | `GET /gates`；`POST /gates/{id}/approve`；`POST /gates/{id}/reject` |
+| 门 | `GET /gates`；`GET /gates/{id}`；`POST /gates/{id}/approve`；`POST /gates/{id}/reject` |
 | 任务 | `GET/POST /runs/{id}/tasks`；`PATCH/DELETE /runs/{id}/tasks/{uid}` |
 | 节点 | `GET /nodes/{id}`；`POST /nodes/{id}/retry` |
 | 记忆 | `GET /memories`；`PATCH /memories/{id}` |
-| 编排 | `POST/GET /plans`；`GET /plans/{id}`；`POST /plans/{id}/generate`；`GET /plans/{id}/events`（SSE）；`POST /plans/{id}/validate`；`POST /plans/{id}/commit`；`POST /plans/{id}/cancel`；`POST /plans/{id}/archive`；`PATCH /plans/{id}/layout`；`POST/DELETE /plans/{id}/deps`；`GET /plans/{id}/snapshots`；`POST /plans/{id}/restore/{version}`；任务增删改 `/plans/{id}/tasks` |
+| 编排 | `POST/GET /plans`；`GET /plans/{id}`；`POST /plans/{id}/generate`；`GET /plans/{id}/events`（SSE）；`POST /plans/{id}/validate`；`POST /plans/{id}/commit`；`POST /plans/{id}/cancel`；`POST /plans/{id}/archive`；`PATCH /plans/{id}/layout`；`POST/DELETE /plans/{id}/deps`；`GET /plans/{id}/snapshots`；`POST /plans/{id}/restore/{version}`；`POST /plans/{id}/tasks`；`PATCH/DELETE /plans/{id}/tasks/{uid}` |
 
 ---
 
@@ -349,7 +366,12 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 | `AM_RETRY_MAX_S` | 60 | 指数退避延迟上限（秒） |
 | `AM_HEARTBEAT_S` | 15 | 执行中 attempt 的心跳间隔（秒） |
 | `AM_ATTEMPT_STALE_S` | 120 | attempt 心跳陈旧判定阈值（秒） |
-| `AM_MAX_REWORK_ROUNDS` | 3 | 失败自动重做上限，超过转人工 |
+| `AM_MAX_REWORK_ROUNDS` | 3 | 预留；当前失败重做上限由节点 `max_attempts` 决定（模板默认 3），本变量尚未接入 |
+| `AM_RUN_BUDGET_TOKENS` | 1200000 | 新建运行的默认 token 预算（计划提交时可覆盖） |
+| `AM_STREAM_TOKENS` | 1 | 设为 `0` 关闭 token 级流式事件（`node_token`） |
+| `AM_MEMORY_EXTRACT` | 1 | 预留；记忆抽取开关尚未接入执行链路 |
+| `AM_CORS_ORIGINS` | `http://127.0.0.1:5173,http://localhost:5173` | 开发模式允许的前端来源 |
+| `AM_DEMO_BASE_URL` | `http://127.0.0.1:8100/v1` | 预留；`e2e_demo.py` 当前仍写死同一地址 |
 | `VITE_API_BASE` | `/api` | 前端 API 前缀（开发代理已配置） |
 
 SQLite 约束：`pool_size=1`、`check_same_thread=False`、`busy_timeout=5000`、WAL + `synchronous=NORMAL`；
@@ -380,12 +402,18 @@ seq 缓存、取消收据与 metrics 端点，和 `tests/test_model_discovery.py
 - 重试是「整节点重来」，没有 attempt 级 checkpoint/幂等键；崩溃恢复会丢弃未回执的 attempt。
 - Anthropic / Gemini 适配器暂为伪流式；M1 补真流式与工具调用。
 - 未做：向量检索、记忆面板、执行看板、Twin 数字分身、多 run 调度面板、容器化执行、MCP 工具接入。
-- 前端单包体积 ~1.4MB（AntD + xyflow），未做路由级代码分割。
+- 前端单包体积 ~1.35MB（AntD + xyflow），未做路由级代码分割。
 - 任务清单暂不支持独立 `TASKGRAPH validate` 节点（解析时已校验唯一性与依赖合法性）。
-- 编排工作台 v1：一个 plan 只对应一个 run；任务数上限 8–40；提交 run 后所有任务由 `dev` 执行器执行
-  （计划里的 `test/design/ops` 目前只是标签）；生成失败自动修复一次，仍失败保留原文与错误。
+- 编排工作台 v1：一个 plan 只对应一个 run；任务数上限 8–40；提交 run 后按节点 `role_key` 选择执行器
+  （dev/test/design/pm/review/ops 会注入不同角色意图），但所有角色仍共用项目根的 `dev` 执行器与提示词模板；
+  生成失败自动修复一次，仍失败保留原文与错误；单次生成输出上限 6000 tokens（也受模型 `max_output_tokens` 约束）。
+- 并行任务（同一波或跨波被同时解锁的）共享 `runs/<run_id>/workspace`，没有文件级隔离/锁：多个 agent 并行改同一文件时后写覆盖先写。
+  当前建议把任务按文件拆开；worktree/分支隔离与合并节点在 M2。
+- `Ctrl+Z` 是画布的前端撤销栈：随页面刷新、切换计划清空，只在当前浏览器生效；删除任务不可撤销；
+  计划提交/归档后撤销锁定。
 - 画布坐标不进 `plan_snapshots`：恢复历史版本只恢复任务与依赖，不恢复节点位置；连线操作尚未适配触屏。
-- 1440 宽度下工作台为 300/1fr/360 三栏，执行图需要横向滚动；1080 宽度单栏可看全 6 个波次。
+- 1440 宽度下工作台为「任务栏 286px + 画布 1fr」两栏，任务详情是宽 360 的右侧抽屉（不占画布列）；
+  默认 0.68 缩放下 5 个波次约 990px，可落在 1000px 左右的画布内，更多波次需要横向滚动或点「全览」。
 - Windows 下命令执行把 `python` 前缀替换为当前解释器；Linux 行为一致但未在 CI 验证。
 
 ---
@@ -395,5 +423,5 @@ seq 缓存、取消收据与 metrics 端点，和 `tests/test_model_discovery.py
 1. 文档 §3.3 引用的 `./research/...` 与实际同级目录不符，实际为同级三份 Markdown。
 2. §7.1 写「4 个人工门」，但 §7.3 demo 十步包含验收门；本实现落地 **5 个门**：
    方案确认 / 需求审查 / 设计审查 / 任务图确认 / 验收确认。
-3. bug：W1 要求「2 个任务并行」，实现为任务图展开后同波并发，验收时两个 dev 节点确实并行执行
-   （事件时间戳交错），但受 Mock 响应速度影响，单次演示中肉眼不易分辨。
+3. bug：W1 要求「2 个任务并行」，实现为任务图展开后依赖就绪即并发，验收时两个无依赖的 dev 节点
+   确实并行执行（事件时间戳交错），但受 Mock 响应速度影响，单次演示中肉眼不易分辨。
