@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Button, Empty, Modal, Progress, Radio, Segmented, Table, Tag, Tooltip, message,
+  Button, Empty, Modal, Progress, Radio, Table, Tag, Tooltip, message,
 } from "antd";
 import {
   AimOutlined, CheckOutlined, DeleteOutlined, HistoryOutlined, ReloadOutlined,
@@ -15,6 +15,7 @@ import type {
 import PlanGraph from "../canvas/PlanGraph";
 import PlanInspector from "../panels/PlanInspector";
 import PlanSourcePanel from "../panels/PlanSourcePanel";
+import PlanTaskNav from "../panels/PlanTaskNav";
 
 const STATUS_LABEL: Record<PlanStatus, string> = {
   draft: "草稿",
@@ -78,11 +79,10 @@ export default function PlanPage() {
   const client = useQueryClient();
   const [messageApi, holder] = message.useMessage();
   const [selectedUid, setSelectedUid] = useState<string | null>(null);
-  const [view, setView] = useState<"graph" | "table">("graph");
+  const [view, setView] = useState<"graph" | "table" | "source">("graph");
   const [genText, setGenText] = useState("");
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMode, setCommitMode] = useState<"save" | "run">("run");
-  const [sourceOpen, setSourceOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const validateTimer = useRef<number | null>(null);
 
@@ -125,7 +125,16 @@ export default function PlanPage() {
   const selected = tasks.find((task) => task.task_uid === selectedUid) ?? null;
   const metrics = snapshot?.metrics ?? {};
 
+  useEffect(() => {
+    if (!selectedUid && tasks.length > 0) setSelectedUid(tasks[0].task_uid);
+  }, [selectedUid, tasks]);
+
   const waveMap = useMemo(() => snapshot?.waves ?? {}, [snapshot]);
+
+  function selectTask(uid: string | null) {
+    setSelectedUid(uid);
+    if (uid) setInspectorOpen(true);
+  }
 
   const generate = useMutation({
     mutationFn: () => api.generatePlan(planId),
@@ -263,13 +272,43 @@ export default function PlanPage() {
         {plan.error ? <span className="plan-status-error">ERROR · {plan.error}</span> : null}
       </div>
 
-      <div className="plan-metrics">
-        <div><span>任务 / TASKS</span><b>{metrics.task_count ?? tasks.length}</b></div>
-        <div><span>波次 / WAVES</span><b>{metrics.wave_count ?? "—"}</b></div>
-        <div><span>最大并行 / PARALLEL</span><b>{metrics.max_parallel ?? "—"}</b></div>
-        <div><span>关键路径 / CRITICAL</span><b>{metrics.critical_path_tasks ?? "—"}</b></div>
-        <div><span>关键点数 / POINTS</span><b>{metrics.critical_path_points ?? "—"}</b></div>
-        <div><span>总点数 / TOTAL</span><b>{metrics.total_points ?? "—"}</b></div>
+      <div className="plan-station-top">
+        <div className="plan-station-metrics">
+          <span><small>TASKS</small><b>{metrics.task_count ?? tasks.length}</b></span>
+          <span><small>WAVES</small><b>{metrics.wave_count ?? "—"}</b></span>
+          <span><small>PARALLEL</small><b>{metrics.max_parallel ?? "—"}</b></span>
+          <span><small>CRITICAL</small><b>{metrics.critical_path_tasks ?? "—"}<em>/{metrics.critical_path_points ?? "—"}pt</em></b></span>
+          <span><small>TOTAL</small><b>{metrics.total_points ?? "—"}<em>pt</em></b></span>
+        </div>
+        <div className="plan-tabs" role="tablist" aria-label="编排视图">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "graph"}
+            className={view === "graph" ? "is-active" : ""}
+            onClick={() => setView("graph")}
+          >
+            执行图 <span>GRAPH</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "table"}
+            className={view === "table" ? "is-active" : ""}
+            onClick={() => setView("table")}
+          >
+            任务表 <span>TABLE</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={view === "source"}
+            className={view === "source" ? "is-active" : ""}
+            onClick={() => setView("source")}
+          >
+            设计来源 <span>SOURCE</span>
+          </button>
+        </div>
       </div>
 
       {generating || genText ? (
@@ -293,7 +332,7 @@ export default function PlanPage() {
               <button
                 key={`${error.code}-${error.task_uid}-${error.message}`}
                 type="button"
-                onClick={() => error.task_uid && setSelectedUid(error.task_uid)}
+                onClick={() => error.task_uid && selectTask(error.task_uid)}
               >
                 <b>{error.task_uid || "PLAN"}</b>
                 <span>{error.message}</span>
@@ -304,75 +343,93 @@ export default function PlanPage() {
         </div>
       ) : null}
 
-      <div className={`plan-workbench${empty ? " is-empty" : ""}`}>
-        <div className={`plan-source-wrap${sourceOpen ? " is-open" : ""}`}>
-          <PlanSourcePanel plan={plan} />
-        </div>
+      <div className={`plan-station${empty ? " is-empty" : ""}`}>
+        <PlanTaskNav
+          tasks={tasks}
+          snapshot={snapshot}
+          selected={selectedUid}
+          onSelect={selectTask}
+          onInspect={() => setInspectorOpen(true)}
+        />
 
-        <section className="plan-stage">
+        <section className="plan-stage plan-stage-station">
           <div className="plan-stage-head">
             <div>
-              <b>编排 / ORCHESTRATION</b>
+              <b>编排工作台 / WORKSTATION</b>
               <span>
-                {snapshot ? `快照 v${snapshot.version}` : "尚未生成"}
-                {snapshot ? ` · ${Object.keys(waveMap).length} 波次` : ""}
+                {snapshot ? `快照 v${snapshot.version} · ${Object.keys(waveMap).length} 波次` : "尚未生成"}
               </span>
             </div>
             <div className="plan-stage-tools">
-              <Button size="small" className="plan-mobile-only" onClick={() => setSourceOpen(true)}>
-                来源
+              <Button size="small" className="plan-detail-btn" onClick={() => setInspectorOpen(true)}>
+                任务详情
               </Button>
-              <Button size="small" className="plan-mobile-only" onClick={() => setInspectorOpen(true)}>
-                详情
-              </Button>
-              <Segmented
-                size="small"
-                value={view}
-                onChange={(value) => setView(value as "graph" | "table")}
-                options={[
-                  { label: "图 / GRAPH", value: "graph" },
-                  { label: "表 / TABLE", value: "table" },
-                ]}
-              />
+              <span className="plan-stage-mode">
+                {view === "graph" ? "DEPENDENCY GRAPH" : view === "table" ? "TASK REGISTER" : "DESIGN SOURCE"}
+              </span>
             </div>
           </div>
 
-          {empty ? (
-            <div className="plan-empty">
-              <b>空 · 等待生成</b>
-              <span>PM 会依据章节索引提出 8–40 个任务；程序负责校验、分波与关键路径。</span>
-            </div>
-          ) : view === "graph" ? (
-            <PlanGraph
-              tasks={tasks}
-              snapshot={snapshot}
-              selected={selectedUid}
-              onSelect={setSelectedUid}
-            />
-          ) : (
-            <div className="plan-table">
-              <Table
-                rowKey="task_uid"
-                size="small"
-                columns={COLUMNS}
-                dataSource={tasks}
-                pagination={false}
-                rowClassName={(task) => [
-                  selectedUid === task.task_uid ? "is-selected" : "",
-                  errors.some((error) => error.task_uid === task.task_uid) ? "is-error" : "",
-                ].join(" ").trim()}
-                onRow={(task) => ({ onClick: () => setSelectedUid(task.task_uid) })}
-              />
-            </div>
-          )}
-          {view === "graph" && !empty ? (
-            <span className="plan-scroll-hint">
-              {Object.keys(waveMap).length} WAVES · 横向滚动 →
-            </span>
-          ) : null}
+          <div className="plan-stage-body">
+            {empty ? (
+              <div className="plan-empty">
+                <b>空 · 等待生成</b>
+                <span>PM 会依据章节索引提出 8–40 个任务；程序负责校验、分波与关键路径。</span>
+              </div>
+            ) : view === "graph" ? (
+              snapshot?.validation && !snapshot.validation.ok && !Object.keys(waveMap).length ? (
+                <div className="plan-graph-blocked">
+                  <b>依赖关系无效 · 波次无法计算</b>
+                  <span>先修复上方校验错误；重新校验通过后会自动绘制依赖图。仍可切到「任务表」逐条编辑。</span>
+                </div>
+              ) : (
+                <>
+                  <PlanGraph
+                    tasks={tasks}
+                    snapshot={snapshot}
+                    selected={selectedUid}
+                    onSelect={selectTask}
+                  />
+                  <div className="plan-graph-legend">
+                    <span><i className="plan-key is-critical" />关键路径</span>
+                    <span><i className="plan-key is-error" />校验错误</span>
+                    <span><i className="plan-key is-selected" />当前选中</span>
+                    <span className="plan-graph-foot">{Object.keys(waveMap).length} WAVES · 点击节点编辑</span>
+                  </div>
+                </>
+              )
+            ) : view === "table" ? (
+              <div className="plan-table">
+                <Table
+                  rowKey="task_uid"
+                  size="small"
+                  columns={COLUMNS}
+                  dataSource={tasks}
+                  pagination={false}
+                  rowClassName={(task) => [
+                    selectedUid === task.task_uid ? "is-selected" : "",
+                    errors.some((error) => error.task_uid === task.task_uid) ? "is-error" : "",
+                  ].join(" ").trim()}
+                  onRow={(task) => ({ onClick: () => selectTask(task.task_uid) })}
+                />
+              </div>
+            ) : (
+              <div className="plan-source-inline">
+                <PlanSourcePanel plan={plan} />
+              </div>
+            )}
+          </div>
         </section>
 
         <div className={`plan-inspector-wrap${inspectorOpen ? " is-open" : ""}`}>
+          <button
+            type="button"
+            className="plan-drawer-close"
+            aria-label="关闭任务详情"
+            onClick={() => setInspectorOpen(false)}
+          >
+            ×
+          </button>
           <PlanInspector
             plan={plan}
             tasks={tasks}
@@ -398,8 +455,8 @@ export default function PlanPage() {
       </div>
 
       <div
-        className={`plan-drawer-backdrop${sourceOpen || inspectorOpen ? " is-open" : ""}`}
-        onClick={() => { setSourceOpen(false); setInspectorOpen(false); }}
+        className={`plan-drawer-backdrop${inspectorOpen ? " is-open" : ""}`}
+        onClick={() => setInspectorOpen(false)}
       />
 
       <Modal

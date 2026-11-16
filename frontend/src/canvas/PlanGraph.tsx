@@ -107,8 +107,8 @@ export default function PlanGraph({ tasks, snapshot, selected, onSelect }: Props
         className="plan-graph"
         ref={graphRef}
         style={{
-          gridTemplateColumns: `repeat(${waves.length}, minmax(150px, 1fr))`,
-          minWidth: waves.length * 158,
+          gridTemplateColumns: `repeat(${waves.length}, minmax(126px, 1fr))`,
+          minWidth: waves.length * 130,
         }}
       >
         {waves.map(({ wave, items }) => (
