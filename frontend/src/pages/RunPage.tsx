@@ -274,6 +274,7 @@ export default function RunPage() {
       </header>
 
       <section className="board">
+        <div className="board-col board-left">
         <div className="l1 ef-panel">
           <h2><span className="ef-eyebrow">STATE</span>运行状态</h2>
           <div className="ef-figs">
@@ -318,6 +319,7 @@ export default function RunPage() {
             <li><span>输出</span><b>{usage?.tokens_out.toLocaleString() ?? "—"}</b></li>
           </ul>
         </div>
+        </div>
 
         <div className="hub">
           <span className="ef-eyebrow">PHASE DIAL</span>
@@ -337,6 +339,7 @@ export default function RunPage() {
           </div>
         </div>
 
+        <div className="board-col board-right">
         <div className="r1 ef-panel">
           <h2><span className="ef-eyebrow">NODES</span>节点</h2>
           <ul className="ef-ledger">
@@ -372,6 +375,7 @@ export default function RunPage() {
           <button type="button" className="linkish" onClick={() => setLogOpen(true)}>
             查看全部事件 / LOG
           </button>
+        </div>
         </div>
       </section>
 

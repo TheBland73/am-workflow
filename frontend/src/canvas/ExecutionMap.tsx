@@ -87,7 +87,7 @@ export default function ExecutionMap({
   }, [held, nodes, workflow.phases]);
 
   const maxRows = Math.max(...columns.map((column) => column.nodes.length), 1);
-  const mapHeight = Math.max(160, maxRows * 34 + 8);
+  const mapHeight = Math.max(128, maxRows * 30 + 6);
 
   const measure = useCallback(() => {
     const wrap = wrapRef.current;
