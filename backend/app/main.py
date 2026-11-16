@@ -45,6 +45,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def cache_headers(request, call_next):
+    """Hashed assets are immutable; index.html must revalidate so a deploy is
+    picked up on the next load instead of serving a stale app shell."""
+    response = await call_next(request)
+    if request.url.path.startswith("/assets/"):
+        response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+    return response
+
 API_PREFIX = "/api"
 for module in (providers, model_entries, agent_templates, runs, artifacts, gates,
                tasks, nodes, memories, plans):
@@ -64,6 +74,7 @@ if dist.exists():
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
     root = dist.resolve()
+    no_cache = {"Cache-Control": "no-cache, must-revalidate"}
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa(full_path: str):
@@ -72,7 +83,7 @@ if dist.exists():
         if full_path:
             candidate = (root / full_path).resolve()
             if root in candidate.parents and candidate.is_file():
-                return FileResponse(candidate)
+                return FileResponse(candidate, headers=no_cache if candidate.suffix == ".html" else None)
             if "." in full_path.rsplit("/", 1)[-1]:
                 raise HTTPException(404, "Not Found")
-        return FileResponse(root / "index.html")
+        return FileResponse(root / "index.html", headers=no_cache)
