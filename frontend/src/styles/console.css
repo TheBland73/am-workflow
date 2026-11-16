@@ -1965,3 +1965,78 @@ body {
   .board .ef-dial, .hub .ef-dial { width: min(100%, 15rem); }
 }
 
+
+/* ---- separation pass: surfaces carry grouping; ink stays for action ---- */
+.run-page .board { gap: 0 36px; margin-top: 22px; }
+.run-page .board > .board-col { gap: 18px; }
+.run-page .board > .board-col > .ef-panel {
+  background: #fff;
+  border: 1px solid var(--am-calm-rule);
+  padding: 16px 18px;
+}
+.run-page .board .ef-panel > h2 { font-size: 0.86rem; margin-bottom: 9px; }
+.run-page .board .ef-eyebrow { color: #5a5a54; }
+
+.run-page .hub {
+  background: #fff;
+  border: 1px solid var(--am-calm-rule);
+  padding: 14px 10px 10px;
+}
+
+.run-page .map-panel {
+  background: #fff;
+  border: 1px solid var(--am-calm-rule);
+  padding: 18px 20px 16px;
+  margin-top: 24px;
+}
+.run-page .map-panel > h2 { font-size: 1rem; margin-bottom: 13px; }
+.run-page .map-col:not(:first-child) {
+  border-left: 1px solid rgba(22, 22, 22, 0.05);
+  padding-left: 12px;
+}
+
+.run-page .lower {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 24px;
+  margin-top: 24px;
+}
+.run-page .lower .ef-panel {
+  background: #fff;
+  border: 1px solid var(--am-calm-rule);
+  padding: 16px 18px;
+}
+.run-page .gatecard {
+  background: #fff;
+  border: 1px solid var(--am-calm-rule);
+  border-top: 2px solid var(--am-calm-ink);
+  padding: 18px;
+}
+
+.run-page .chain {
+  background: #fff;
+  border: 1px solid var(--am-calm-rule);
+  padding: 12px 18px;
+  margin-top: 20px;
+}
+/* tighten card bottoms; keep columns independent */
+.run-page .lower { align-items: start; }
+.run-page .map-panel { padding-bottom: 10px; }
+@media (max-width: 1180px) {
+  .run-page .map-grid {
+    grid-template-columns: repeat(8, minmax(0, 1fr)) !important;
+    column-gap: 10px;
+  }
+  .run-page .map-col:not(:first-child) { padding-left: 6px; }
+  .run-page .map-edges { display: none; }
+  .run-page .map-gatebar b { display: none; }
+  .run-page .map-node { font-size: 0.56rem; padding-inline: 6px; }
+  .run-page .map-phase { font-size: 0.5rem; }
+}
+@media (max-width: 1180px) {
+  .run-page .map-phases {
+    grid-template-columns: repeat(8, minmax(0, 1fr)) !important;
+    column-gap: 10px;
+  }
+  .run-page .map-phases > * { padding-left: 6px; }
+}
