@@ -112,7 +112,10 @@ export default function RunPage() {
     queryKey: ["snapshot", runId],
     queryFn: () => api.getRun(runId),
     enabled: Boolean(runId),
-    refetchInterval: 8000,
+    refetchInterval: (query) => {
+      const status = query.state.data?.run.status;
+      return status === "finished" || status === "failed" || status === "stopped" ? false : 8000;
+    },
   });
 
   useEffect(() => {

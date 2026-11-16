@@ -154,7 +154,14 @@ export function subscribeRun(
   ];
   const handler = (raw: MessageEvent) => {
     try {
-      onEvent(JSON.parse(raw.data) as StreamEvent);
+      const event = JSON.parse(raw.data) as StreamEvent;
+      onEvent(event);
+      // The server closes a run stream after a terminal event. Without this,
+      // EventSource reconnects to a closed stream forever and replays the whole
+      // run history every few seconds.
+      if (event.type === "run_finished" || event.type === "run_error" || event.type === "run_stopped") {
+        source.close();
+      }
     } catch {
       // 忽略非法帧
     }

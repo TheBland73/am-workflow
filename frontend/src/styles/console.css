@@ -1518,19 +1518,3 @@ body {
   .r2 { order: 6; }
   .r3 { order: 7; }
 }
-
-/* Reduced-motion environments (Windows "show animations" off, accessibility
-   settings, headless browsers): never leave AntD overlays stranded at their
-   opening frame. Their enter animation starts at opacity 0, so freezing every
-   animation under .ef makes a modal that is focusable but invisible. */
-@media (prefers-reduced-motion: reduce) {
-  .ant-modal,
-  .ant-modal-mask,
-  .ant-modal-wrap,
-  .ant-drawer-content-wrapper,
-  .ant-drawer-mask {
-    animation: none !important;
-    opacity: 1 !important;
-    transform: none !important;
-  }
-}
