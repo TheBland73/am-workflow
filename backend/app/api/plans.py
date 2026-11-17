@@ -35,7 +35,7 @@ from app.engine.graph import compute_waves
 from app.engine.orchestrator import orchestrator
 from app.engine.plan_bus import plan_bus, sse_format
 from app.engine.plan_generation import generate_plan
-from app.engine.planner import extract_sections, find_cycle, validate_plan
+from app.engine.planner import extract_sections, find_cycle, match_section, validate_plan
 
 router = APIRouter(tags=["plans"])
 
@@ -206,6 +206,255 @@ def list_plans(status: str | None = None, limit: int = 50) -> dict:
                 }
             )
         return {"items": items}
+
+
+EFFORT_POINTS = {"S": 1, "M": 2, "L": 3, "XL": 5}
+
+
+def _section_index(sections: list[dict], section: dict | None) -> int | None:
+    if section is None:
+        return None
+    for index, item in enumerate(sections):
+        if item is section:
+            return index
+        if item.get("key") == section.get("key") and item.get("line") == section.get("line"):
+            return index
+    return None
+
+
+def _plan_phases(plan: Plan, tasks: list[PlanTask], snapshot: PlanSnapshot | None) -> dict:
+    """按设计章节聚合任务，给工作台的阶段栏与流程监控用。"""
+    sections = list(plan.sections_json or [])
+    critical = set(snapshot.critical_path_json or []) if snapshot else set()
+    raw_edges = list((snapshot.dag_json or {}).get("edges") or []) if snapshot else []
+    buckets: dict[int, dict] = {}
+    unassigned: list[str] = []
+    orphan_slot = len(sections) + 10_000
+    for task in tasks:
+        matched = match_section(task.design_section, sections)
+        position = _section_index(sections, matched)
+        if position is None:
+            unassigned.append(task.task_uid)
+            bucket = buckets.setdefault(
+                orphan_slot,
+                {
+                    "index": 0,
+                    "title": "未归入章节",
+                    "key": "__orphan__",
+                    "line": 0,
+                    "tasks": [],
+                    "roles": {},
+                    "points": 0,
+                },
+            )
+        else:
+            bucket = buckets.setdefault(
+                position,
+                {
+                    "index": 0,
+                    "title": sections[position]["title"],
+                    "key": sections[position]["key"],
+                    "line": sections[position].get("line", 0),
+                    "tasks": [],
+                    "roles": {},
+                    "points": 0,
+                },
+            )
+        points = EFFORT_POINTS.get((task.effort or "M").upper(), 2)
+        bucket["points"] += points
+        bucket["roles"][task.role_key] = bucket["roles"].get(task.role_key, 0) + 1
+        bucket["tasks"].append(
+            {
+                "uid": task.task_uid,
+                "title": task.title,
+                "role": task.role_key,
+                "effort": task.effort,
+                "priority": task.priority,
+                "critical": task.task_uid in critical,
+                "deps": list(task.deps_json or []),
+            }
+        )
+    phases = [buckets[position] for position in sorted(buckets)]
+    for index, phase in enumerate(phases, start=1):
+        phase["index"] = index
+        phase["task_count"] = len(phase["tasks"])
+        phase["cross_links"] = 0
+    task_phase = {task["uid"]: phase["index"] for phase in phases for task in phase["tasks"]}
+    role_by_uid = {task.task_uid: task.role_key for task in tasks}
+    edges = []
+    for edge in raw_edges:
+        source, target = edge.get("from"), edge.get("to")
+        if not source or not target:
+            continue
+        kind = (
+            "critical"
+            if source in critical and target in critical
+            else "handoff"
+            if role_by_uid.get(source) != role_by_uid.get(target)
+            else "normal"
+        )
+        cross = task_phase.get(source) != task_phase.get(target)
+        edges.append({"from": source, "to": target, "kind": kind, "cross": cross})
+        if cross:
+            for uid in (source, target):
+                index = task_phase.get(uid)
+                if index is not None:
+                    phases[index - 1]["cross_links"] += 1
+    coverage = (snapshot.coverage_json or {}) if snapshot else {}
+    covered = (
+        int(coverage["covered"])
+        if "covered" in coverage
+        else len([phase for phase in phases if phase["key"] != "__orphan__"])
+    )
+    total_sections = int(coverage["total"]) if "total" in coverage else len(sections)
+    return {
+        "plan_id": plan.id,
+        "product_name": plan.product_name,
+        "status": plan.status,
+        "total_tasks": len(tasks),
+        "phase_count": len(phases),
+        "total_sections": total_sections,
+        "covered_sections": covered,
+        "coverage_ratio": round(covered / total_sections, 3) if total_sections else 0.0,
+        "uncovered": list(coverage.get("uncovered") or []),
+        "orphan_tasks": unassigned,
+        "critical_path": sorted(critical),
+        "edges": edges,
+        "phases": phases,
+    }
+
+
+def _activity_lines(value) -> list[str]:
+    """把校验/警告整理成可读字符串。
+
+    旧快照里 errors 可能是 {"code","message","hint","details"} 对象、对象数组或
+    纯字符串数组；前端只接受字符串，否则 React 会因渲染对象直接崩溃。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, dict):
+        items = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return []
+
+    lines: list[str] = []
+    for item in items:
+        if isinstance(item, str):
+            line = item.strip()
+        elif isinstance(item, dict):
+            message = str(item.get("message") or item.get("msg") or item.get("code") or "").strip()
+            hint = str(item.get("hint") or "").strip()
+            uid = str((item.get("details") or {}).get("uid") or "").strip()
+            line = f"[{uid}] {message}".strip() if uid else message
+            if hint:
+                line = f"{line}（{hint}）"
+        else:
+            line = str(item)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _plan_activity(plan: Plan, snapshots: list[PlanSnapshot]) -> dict:
+    """把创建 / 生成 / 校验 / 提交 / 归档整理成一条时间线。"""
+    items: list[dict] = []
+
+    def add(at, kind, title, detail, **extra):
+        if at is None:
+            return
+        items.append({"at": at, "kind": kind, "title": title, "detail": detail, **extra})
+
+    add(
+        plan.created_at,
+        "created",
+        "创建计划",
+        plan.product_name,
+        errors=[],
+        warnings=[],
+    )
+    for snapshot in snapshots:
+        validation = snapshot.validation_json or {}
+        metrics = snapshot.metrics_json or {}
+        coverage = snapshot.coverage_json or {}
+        errors = _activity_lines(validation.get("errors"))
+        warnings = _activity_lines(validation.get("warnings"))
+        kind = "generate" if snapshot.version == 1 and plan.raw_output else "validate"
+        detail = f"{metrics.get('task_count', 0)} 任务 · {metrics.get('wave_count', 0)} 波"
+        if coverage:
+            detail += f" · 覆盖 {coverage.get('covered', 0)}/{coverage.get('total', 0)} 章节"
+        add(
+            snapshot.created_at,
+            kind,
+            "生成任务" if kind == "generate" else f"校验 v{snapshot.version}",
+            detail,
+            version=snapshot.version,
+            ok=bool(validation.get("ok")),
+            errors=errors[:6],
+            warnings=warnings[:6],
+            stats={
+                "tasks": int(metrics.get("task_count") or 0),
+                "sections": int(coverage.get("total") or 0),
+                "covered": int(coverage.get("covered") or 0),
+                "points": int(metrics.get("total_points") or 0),
+            },
+        )
+    if plan.run_id or plan.status in {"committed", "archived"}:
+        add(
+            plan.updated_at,
+            "commit",
+            "提交计划",
+            "创建运行并锁定计划" if plan.run_id else "仅保存，未创建运行",
+            run_id=plan.run_id,
+            errors=[],
+            warnings=[],
+        )
+    if plan.status == "archived":
+        add(plan.updated_at, "archive", "归档计划", "计划已归档，只读", errors=[], warnings=[])
+    items.sort(key=lambda item: item["at"], reverse=True)
+    for item in items:
+        item["at"] = _iso(item["at"])
+    return {"plan_id": plan.id, "items": items}
+
+
+@router.get("/plans/{plan_id}/phases")
+def get_plan_phases(plan_id: str) -> dict:
+    with session_scope() as s:
+        plan = s.get(Plan, plan_id)
+        if plan is None:
+            raise _error(404, "plan_not_found", "计划不存在")
+        tasks = (
+            s.query(PlanTask)
+            .filter(PlanTask.plan_id == plan_id)
+            .order_by(PlanTask.order_index.asc(), PlanTask.id.asc())
+            .all()
+        )
+        snapshot = (
+            s.query(PlanSnapshot)
+            .filter(PlanSnapshot.plan_id == plan_id)
+            .order_by(PlanSnapshot.version.desc())
+            .first()
+        )
+        return _plan_phases(plan, tasks, snapshot)
+
+
+@router.get("/plans/{plan_id}/activity")
+def get_plan_activity(plan_id: str, limit: int = 50) -> dict:
+    with session_scope() as s:
+        plan = s.get(Plan, plan_id)
+        if plan is None:
+            raise _error(404, "plan_not_found", "计划不存在")
+        snapshots = (
+            s.query(PlanSnapshot)
+            .filter(PlanSnapshot.plan_id == plan_id)
+            .order_by(PlanSnapshot.version.desc())
+            .limit(max(1, min(limit, 200)))
+            .all()
+        )
+        return _plan_activity(plan, snapshots)
 
 
 @router.get("/plans/{plan_id}")
@@ -670,12 +919,32 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                 )
                 deps_map = {row.task_uid: list(row.deps_json or []) for row in rows}
                 waves = compute_waves(deps_map)
+                sections = list(plan.sections_json or [])
+                phase_of: dict[str, int | None] = {}
+                for row in rows:
+                    phase_of[row.task_uid] = _section_index(
+                        sections, match_section(row.design_section, sections)
+                    )
+                phase_order = {
+                    position: index
+                    for index, position in enumerate(
+                        sorted({value for value in phase_of.values() if value is not None}), start=1
+                    )
+                }
+                phase_labels = {
+                    position: sections[position]["title"] for position in phase_order
+                }
+
+                def phase_label(uid: str) -> str:
+                    position = phase_of.get(uid)
+                    return phase_labels.get(position, "未归类") if position is not None else "未归类"
+
                 run = Run(
                     id=run_id,
                     workflow_id=workflow.id,
                     status="created",
                     current_phase="execution",
-                    idea_text=f"编排工作台 {plan_id}：{plan.product_name}（{len(rows)} 个任务 / {len(set(waves.values()))} 波）",
+                    idea_text=f"编排工作台 {plan_id}：{plan.product_name}（{len(rows)} 个任务 / {len(phase_order)} 个阶段）",
                     budget_tokens=budget_tokens,
                 )
                 s.add(run)
@@ -689,7 +958,10 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                             deps_json=list(row.deps_json or []),
                             design_section=row.design_section,
                             test_cases_json=list(row.acceptance_json or []),
-                            assignee_json={"role_key": row.role_key},
+                            assignee_json={
+                                "role_key": row.role_key,
+                                "phase": phase_label(row.task_uid),
+                            },
                             wave=waves.get(row.task_uid, 1),
                             status="pending",
                         )
@@ -712,6 +984,12 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                                 "task_uid": row.task_uid,
                                 "task_title": row.title,
                                 "design_section": row.design_section,
+                                "phase": phase_label(row.task_uid),
+                                "phase_index": (
+                                    phase_order[phase_of[row.task_uid]]
+                                    if phase_of.get(row.task_uid) is not None
+                                    else 0
+                                ),
                                 "role_key": row.role_key,
                                 "description": row.description,
                                 "effort": row.effort,
@@ -722,6 +1000,8 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                             wave=waves.get(row.task_uid, 1),
                         )
                     )
+                base_wave = max(waves.values(), default=1)
+                accept_deps: list[str] = list(dev_keys)
                 if dev_keys:
                     s.add(
                         Node(
@@ -737,7 +1017,59 @@ async def commit_plan(plan_id: str, payload: PlanCommit) -> dict:
                             },
                             max_attempts=2,
                             order_index=len(rows),
-                            wave=max(waves.values(), default=1) + 1,
+                            wave=base_wave + 1,
+                        )
+                    )
+                    accept_deps = ["verify"]
+
+                # 评审节点：读 workspace + 验收标准，产出 review 工件；阻塞项由编排器回退任务。
+                review_key: str | None = None
+                if dev_keys and payload.review:
+                    review_key = "review"
+                    s.add(
+                        Node(
+                            run_id=run_id,
+                            node_key="review",
+                            type="REVIEW",
+                            name="代码评审",
+                            phase="execution",
+                            status="pending",
+                            deps_json=["verify"],
+                            config_json={
+                                "task_uids": [row.task_uid for row in rows],
+                                "max_rounds": 2,
+                                "round": 1,
+                                "artifact": "review",
+                                "kind": "plan_review",
+                                "timeout_s": 600,
+                            },
+                            max_attempts=2,
+                            order_index=len(rows) + 1,
+                            wave=base_wave + 2,
+                        )
+                    )
+                    accept_deps = ["review"]
+
+                # 验收门：计划 Run 不再「verify 通过即结束」，保留最后一次人工确认。
+                if dev_keys and payload.accept_gate:
+                    s.add(
+                        Node(
+                            run_id=run_id,
+                            node_key="gate_accept",
+                            type="HUMAN_GATE",
+                            name="验收确认",
+                            phase="execution",
+                            status="pending",
+                            deps_json=accept_deps,
+                            config_json={
+                                "title": "验收确认",
+                                "description": "确认评审报告、验证结果与交付物后再结束运行。",
+                                "artifact": review_key or "design",
+                                "kind": "accept",
+                            },
+                            max_attempts=1,
+                            order_index=len(rows) + 2,
+                            wave=base_wave + 3,
                         )
                     )
                 plan.status = "committed"

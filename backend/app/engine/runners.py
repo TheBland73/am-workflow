@@ -1,7 +1,10 @@
 """节点运行时：按节点类型执行（设计规格 §5.2、§5.6、§5.7）。"""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 from app.artifacts.store import (
     latest_artifact,
@@ -13,7 +16,7 @@ from app.artifacts.store import (
 )
 from app.db.base import session_scope
 from app.db.models import AgentTemplate, Node, Run, Task
-from app.engine.agent_loop import AgentExceeded, run_agent
+from app.engine.agent_loop import AgentExceeded, _extract_json, run_agent
 from app.engine.context import build_system, build_user, dev_workspace_rules, doc_output_rules
 from app.engine.events import emit
 from app.engine.graph import GraphError, compute_waves
@@ -132,6 +135,8 @@ async def execute_node(ctx: NodeContext) -> dict:
         return await _run_doc_agent(ctx)
     if ctx.type == "VERIFY":
         return await _run_verify(ctx)
+    if ctx.type == "REVIEW":
+        return await _run_review(ctx)
     if ctx.type == "TASKGRAPH":
         return await _run_taskgraph(ctx)
     if ctx.type in ("DECISION",):
@@ -276,6 +281,202 @@ async def _run_verify(ctx: NodeContext) -> dict:
         raise NodeFailure(f"验证命令失败：\n{outcome.output[-2000:]}")
     return {"summary": f"验证通过：{command}", "command": command,
             "output": outcome.output[-1500:]}
+
+
+# ---------------- 代码评审 ----------------
+_TEXT_SUFFIXES = {
+    ".py", ".md", ".txt", ".json", ".toml", ".yaml", ".yml", ".ini", ".cfg",
+    ".ts", ".tsx", ".js", ".jsx", ".css", ".html", ".sql", ".sh", ".ps1",
+}
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".pytest_cache"}
+
+
+def _workspace_digest(workspace: Path, *, max_files: int = 16,
+                      per_file: int = 5000, total: int = 26000) -> tuple[str, list[str]]:
+    """返回（文件清单 + 内容摘要，文件名列表）。跳过二进制/缓存/构建产物。"""
+    entries: list[tuple[str, Path]] = []
+    for path in sorted(workspace.rglob("*")):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(workspace).as_posix()
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > 300_000:
+            continue
+        if path.suffix.lower() not in _TEXT_SUFFIXES:
+            continue
+        entries.append((rel, path))
+    names = [rel for rel, _ in entries]
+    if not entries:
+        return "（workspace 为空）", names
+    # 代码优先、然后文档，避免把预算全花在 README 上。
+    entries.sort(key=lambda item: (0 if item[0].endswith(".py") else 1, item[0]))
+    chunks: list[str] = []
+    used = 0
+    for rel, path in entries[:max_files]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        text = text[:per_file]
+        remaining = total - used
+        if remaining <= 0:
+            break
+        text = text[:remaining]
+        used += len(text)
+        chunks.append(f"### {rel}\n```\n{text}\n```")
+    inventory = "\n".join(f"- {rel}" for rel in names[:120]) or "（空）"
+    return inventory + "\n\n" + "\n\n".join(chunks), names
+
+
+_REVIEW_SYSTEM = (
+    "你是资深代码评审（reviewer）。你不修改代码，只评审。\n"
+    "根据任务验收标准与实际文件内容，判断交付是否可接受。\n"
+    "必须只输出一个 JSON 对象，不要 Markdown 围栏、说明文字或额外字段：\n"
+    '{"verdict":"pass" 或 "block","summary":"一句话结论",'
+    '"issues":[{"severity":"blocker"|"major"|"minor","task_uid":"T1",'
+    '"file":"相对路径","message":"问题是什么","suggestion":"怎么改"}]}\n'
+    "规则：\n"
+    "1. 只有真正确认的阻塞问题才标 blocker；可改进但能接受标 minor。\n"
+    "2. blocker/major 必须对应到任务 uid（task_uid），并给出文件路径。\n"
+    "3. 文件不存在或没看到实现时，用 severity=blocker 说明缺失项。\n"
+    "4. 不要编造未在清单中出现的文件。"
+)
+
+
+async def _run_review(ctx: NodeContext) -> dict:
+    model = pool.pick_role_model("review") or pool.pick_role_model("dev")
+    if model is None:
+        raise NodeFailure(
+            "尚未配置可用模型：请先在「设置 → 供应商」添加供应商与模型并测试连接", fatal=True
+        )
+
+    workspace = workspace_dir(ctx.run_id)
+    digest, names = _workspace_digest(workspace)
+    with session_scope() as s:
+        tasks = (
+            s.query(Task)
+            .filter(Task.run_id == ctx.run_id)
+            .order_by(Task.wave.asc(), Task.id.asc())
+            .all()
+        )
+        task_rows = [
+            {
+                "uid": t.task_uid, "title": t.title,
+                "acceptance": list(t.test_cases_json or []),
+                "role": (t.assignee_json or {}).get("role_key") or "dev",
+                "status": t.status,
+            }
+            for t in tasks
+        ]
+    task_lines = "\n".join(
+        f"- {row['uid']} [{row['status']}] {row['title']}｜验收："
+        f"{'；'.join(row['acceptance']) or '（未填写）'}"
+        for row in task_rows
+    ) or "（没有任务）"
+    round_no = int((ctx.config or {}).get("round") or 1)
+    max_rounds = max(1, int((ctx.config or {}).get("max_rounds") or 2))
+    feedback = (ctx.feedback or "").strip()
+    user_prompt = (
+        f"运行目标：{ctx.idea}\n"
+        f"评审轮次：{round_no}/{max_rounds}\n\n"
+        f"任务与验收标准：\n{task_lines}\n\n"
+        f"验证命令结果：verify 已通过（测试命令执行成功）。\n\n"
+        f"workspace 文件：\n{digest}\n"
+        + (f"\n上一轮人工反馈：{feedback}\n" if feedback else "")
+        + "\n请按系统要求输出评审 JSON。"
+    )
+    result = await run_agent(
+        run_id=ctx.run_id, node_id=ctx.node_id, attempt_id=ctx.attempt_id, model=model,
+        system_prompt=_REVIEW_SYSTEM, user_prompt=user_prompt, toolbox=None,
+        max_steps=1, temperature=0.2,
+    )
+    data = _extract_json(result.content)
+    if data is None:
+        raise NodeFailure("评审模型没有返回合法 JSON，请重试或检查模型输出能力")
+
+    valid_uids = {row["uid"] for row in task_rows}
+    issues: list[dict] = []
+    for item in list(data.get("issues") or [])[:30]:
+        if not isinstance(item, dict):
+            continue
+        severity = str(item.get("severity") or "minor").lower()
+        if severity not in {"blocker", "major", "minor"}:
+            severity = "minor"
+        uid = str(item.get("task_uid") or "").strip().upper()
+        issues.append({
+            "severity": severity,
+            "task_uid": uid if uid in valid_uids else "",
+            "file": str(item.get("file") or "")[:240],
+            "message": str(item.get("message") or "")[:800],
+            "suggestion": str(item.get("suggestion") or "")[:800],
+        })
+    blocking = [
+        item for item in issues
+        if item["severity"] in {"blocker", "major"} and item["task_uid"]
+    ]
+    verdict = "block" if str(data.get("verdict") or "").lower() != "pass" or blocking else "pass"
+    targets: list[str] = []
+    for item in blocking:
+        if item["task_uid"] not in targets:
+            targets.append(item["task_uid"])
+    summary = str(data.get("summary") or ("评审发现阻塞问题" if verdict == "block" else "评审通过"))[:1500]
+
+    lines = [
+        "# 代码评审报告",
+        f"- 结论：{'阻塞' if verdict == 'block' else '通过'}",
+        f"- 轮次：{round_no}/{max_rounds}",
+        f"- 问题：{len(issues)}（阻塞 {len(blocking)}）",
+        "",
+        "## 摘要",
+        summary,
+        "",
+    ]
+    if issues:
+        lines.append("## 问题清单")
+        for item in issues:
+            lines.append(
+                f"### [{item['severity'].upper()}] "
+                f"{item['task_uid'] or '运行级'} · {item['file'] or '（未标注文件）'}"
+            )
+            lines.append(item["message"] or "（未提供描述）")
+            if item["suggestion"]:
+                lines.append(f"建议：{item['suggestion']}")
+            lines.append("")
+    body = "\n".join(lines).strip()
+    record = write_artifact(
+        ctx.run_id, "review", body, created_by="review",
+        inputs=[row["uid"] for row in task_rows], status="approved" if verdict == "pass" else "draft",
+    )
+    reviewed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    report = {
+        "verdict": verdict, "summary": summary, "issues": issues,
+        "blocking": len(blocking), "targets": targets, "round": round_no,
+        "max_rounds": max_rounds, "reviewed_at": reviewed_at,
+        "model": model.display_name, "files": names[:120], "artifact_version": record["version"],
+    }
+    with session_scope() as s:
+        node = s.get(Node, ctx.node_id)
+        if node is not None:
+            config = dict(node.config_json or {})
+            history = list(config.get("review_history") or [])
+            history.append({
+                "round": round_no, "verdict": verdict, "issues": len(issues),
+                "blocking": len(blocking), "at": reviewed_at, "summary": summary[:300],
+            })
+            config["review"] = report
+            config["review_history"] = history[-8:]
+            node.config_json = config
+    return {
+        "summary": f"评审{'阻塞' if verdict == 'block' else '通过'}："
+                   f"{len(issues)} 个问题 / {len(blocking)} 个阻塞",
+        "verdict": verdict, "issues": len(issues), "blocking": len(blocking),
+        "targets": targets, "artifact": record, "round": round_no,
+    }
 
 
 # ---------------- 任务图 ----------------

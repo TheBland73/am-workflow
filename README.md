@@ -14,7 +14,8 @@
 - `docs/模型接入配置设计.md`：Provider / Model / Binding 与上下文预算
 - `docs/迭代优化-可靠执行.md`：并发闸门 / 超时 / 退避 / 心跳 / 指标（对标 Temporal、Airflow、Prefect）
 - `docs/迭代优化-可交互编排画布.md`：React Flow 画布、坐标/依赖落库、设计覆盖率
-- `docs/编排工作台-迭代记录.md`：R1–R5 体验迭代（正确性 / 视觉语义 / 可编辑 / 提交运行 / 生成链路）
+- `docs/编排工作台-迭代记录.md`：R1–R6 体验迭代（正确性 / 视觉语义 / 可编辑 / 提交运行 / 生成链路 / 阶段视图）
+- `docs/评审与验收门.md`：代码评审 Agent、阻塞自动回退、验收门、评审面板与指标
 - `docs/tasks/real-model-ledger-test.md`：真实模型测试案例（「随手账本」需求规格与 5 门检查点）
 
 ---
@@ -29,12 +30,13 @@
 | 固定 SDLC 模板（8 阶段 / 16 节点，展开后追加 `dev_*` 与 `verify`） | ✅ |
 | 人工门（通过 / 驳回+反馈+回退 / 编辑后通过） | ✅ 5 个门 |
 | SSE 事件流 + Last-Event-ID 补发 | ✅ |
-| 工件链（idea/discussion/proposal/requirement/design/task/changelog） | ✅ 7 类 |
+| 工件链（idea/discussion/proposal/requirement/design/task/review/changelog） | ✅ 8 类 |
 | L0 / L1 记忆最小实现 | ✅ |
 | 前端（终末地控制台风格：运行列表 / 运行详情 / 人工门 / 工件编辑 / 供应商 / 角色模板） | ✅ 已构建 |
-| 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 可交互画布 → 编辑/撤销 → 按角色提交运行） | ✅ ORCH-01 |
+| 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 阶段导航 + 四视图 → 编辑/撤销 → 按角色提交运行） | ✅ ORCH-01 |
+| 代码评审与验收门（REVIEW 节点 / 阻塞自动回退 / 验收人工门 / 评审面板与指标） | ✅ 迭代二期 |
 | 离线 Mock 供应商（流式 + 工具调用） | ✅ `scripts/mock_provider.py` |
-| 单元测试 | ✅ 44 passed |
+| 单元测试 | ✅ 50 passed |
 
 > 本轮「可靠执行」迭代的对标项目、改动清单与验收方式见
 > [docs/迭代优化-可靠执行.md](docs/迭代优化-可靠执行.md)。
@@ -155,22 +157,28 @@ npm run dev
 
 1. 新建计划：粘贴 Markdown、上传 `.md`，或从某次运行的 `design` 工件导入；
 2. 点「生成任务」：PM Agent 只负责提议任务；依赖校验、波次、并行组、关键路径全部由服务端确定性计算；
-3. 图 / 表共享选中；右栏可改标题、描述、角色、effort、priority、章节、依赖与验收，400ms 防抖自动重新校验；
-   成环、缺依赖、章节不可追溯都会给出错误码、位置与修复提示；
-   图视图是可拖拽的 React Flow 画布：拖节点自动保存坐标，右侧手柄拖到目标左侧即新增依赖，
-   点击连线确认后删除依赖；泳道按波次分列，普通依赖、关键路径、跨角色交接、校验错误四种连线有不同线型；
-   选中节点会高亮它的祖先/后代链路，其余节点退到背景（只是视觉聚焦，仍参与依赖执行与提交运行）；
-   页面默认选中第一个任务，点击其他卡片即切换聚焦，再点章节 chip 可取消章节过滤；
-   画布顶部「设计覆盖」列出每个章节承接的任务数，点章节只看这条链路，未覆盖章节用黄黑斜纹标出；
-   双击卡片可直接改名；右栏草稿按任务记忆，切换节点不丢未保存内容；
-   页头「全览 / 重置布局 / 历史」分别用于适配全图、恢复自动布局、查看并回滚校验快照；
-   `Ctrl+Z`（macOS 为 `Cmd+Z`）撤销最近一次图编辑：移动节点、双击改名、依赖增删、
-   任务详情保存、新建任务，最多 30 步；输入框内保留浏览器自带的文字撤销，
-   计划提交或归档后撤销锁定。删除任务暂不可撤销（重建会丢 `task_uid` 与入边依赖）；
+3. 计划页左侧是按设计章节聚合的「阶段」导航（PROGRESS、章节/任务/阶段计数、未承接章节），右侧四个视图：
+   - **任务详情**：内嵌编辑表单，可改标题、描述、角色、effort、priority、章节、依赖与验收，400ms 防抖自动重新校验；
+     成环、缺依赖、章节不可追溯都会给出错误码、位置与修复提示；草稿按任务记忆，切换节点不丢未保存内容；
+   - **流程监控**：Start → Phase 01..N → Verify → End 的只读阶段链，标注 CRITICAL 阶段与角色/点数，点阶段定位首个任务；
+   - **活动**：创建 / 生成 / 校验 / 提交 / 归档时间线，带版本、通过标记、错误摘要与运行链接；
+   - **执行图**：可拖拽的画布。拖节点自动保存坐标，右侧手柄拖到目标左侧即新增依赖，点击连线确认后删除依赖；
+     泳道按波次分列，普通依赖、关键路径、跨角色交接、校验错误四种连线有不同线型；
+     选中节点会高亮它的祖先/后代链路，其余节点退到背景（只是视觉聚焦，仍参与依赖执行与提交运行）；
+     页面默认选中第一个任务，点击其他卡片即切换聚焦，再点章节 chip 可取消章节过滤；
+     顶部「设计覆盖」列出每个章节承接的任务数，点章节只看这条链路，未覆盖章节用黄黑斜纹标出；
+     双击卡片可直接改名；页头「全览 / 重置布局 / 历史」分别用于适配全图、恢复自动布局、查看并回滚校验快照；
+     `Ctrl+Z`（macOS 为 `Cmd+Z`）撤销最近一次图编辑：移动节点、双击改名、依赖增删、
+     任务详情保存、新建任务，最多 30 步；输入框内保留浏览器自带的文字撤销，
+     计划提交或归档后撤销锁定。删除任务暂不可撤销（重建会丢 `task_uid` 与入边依赖）；
+   - 已提交或归档的计划，任务详情只读，状态条提供运行链接。
 4. 有效后可提交：
    - **仅保存**：计划置 `committed`，不创建 Run；
-   - **创建运行**：可填运行预算（10,000–20,000,000 tokens），写入 `Task` 后按任务生成 `dev_*` 节点与一个 `verify` 节点，
+   - **创建运行**：可填运行预算（10,000–20,000,000 tokens），并选择是否追加「代码评审 Agent」与「验收人工门」（默认都开）。
+     写入 `Task` 后按任务生成 `dev_*` 节点、一个 `verify` 节点、可选的 `review` 评审节点与 `gate_accept` 验收门；
      节点 config 携带 `role_key/description/effort/priority`，执行时按角色选模型与追加提示词，注入 design 工件并立即开始执行；
+     评审发现 blocker/major 问题时自动把对应任务与 verify 退回重跑，默认最多返工 2 轮，用尽后升级人工门；
+   - 验收门通过后运行才结束；门通过会把 `review` 工件置为 `approved`，可直接在运行页阅读评审报告。
 5. 生成过程在「设计覆盖」面板显示 `PM STREAM`（实时 token/字数/进度）；生成结束后可在「设计来源」查看原始输出。
    设计规格超过 16,000 字时保留开头与结尾章节，中段标注省略，避免长文档后半段没有任务；
 6. 已提交计划只读，状态条提供运行链接。
@@ -275,7 +283,7 @@ am-workflow/
 
 ### 4.4 工件链
 
-- 9 类工件，W1 产出 7 类；每类最多一个 active 版本，人工编辑/重做自动 `superseded`。
+- 9 类工件，W1 产出 8 类；每类最多一个 active 版本，人工编辑/重做自动 `superseded`。
 - 文件落盘 `runs/<run_id>/artifacts/<kind>.vN.md`，并维护 `<kind>.md` 指向当前版本。
 - 每份工件带 YAML front-matter：`id/kind/status/version/inputs/created`。
 - 需求强制 EARS（`WHEN … THE SYSTEM SHALL …`）+ 验收标准 Given/When/Then；
@@ -317,10 +325,16 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 - **快照可追溯**：每次校验写一条 `plan_snapshots`，同一计划只保留一个 `is_valid`；编辑保留上一版，
   支持按版本恢复。PM 原始输出、设计原文、模型 ID 一并保存。
 - **提交两种模式**：`save` 只锁定计划；`run` 复用任务依赖写入 `Task`，按任务生成 `dev_*` AGENT 节点、
-  追加 `verify` 节点，落盘 design 工件后启动现有编排器。提交幂等，重复提交返回同一 Run；
-  运行预算可填（10,000–20,000,000），节点 config 携带角色/说明/effort/priority，执行时按角色选模型与追加提示词。
+  追加 `verify` 节点，再按开关追加 `review`（REVIEW）与 `gate_accept`（HUMAN_GATE），落盘 design 工件后启动现有编排器。
+  提交幂等，重复提交返回同一 Run；运行预算可填（10,000–20,000,000），节点 config 携带角色/说明/effort/priority，
+  执行时按角色选模型与追加提示词。
+- **阶段与四视图**：`GET /plans/{id}/phases` 按 `design_section` 聚合阶段（只收有任务的章节，
+  index 连续编号），返回每阶段的任务/角色/点数/跨阶段交接与关键标记；`GET /plans/{id}/activity`
+  聚合创建/生成/校验/提交/归档时间线。页面左侧是阶段导航（PROGRESS、未承接章节），
+  右侧「任务详情 / 流程监控 / 活动 / 执行图」四个视图：详情内嵌编辑表单，监控是
+  Start → Phase → Verify → End 的只读链，活动是时间线，执行图是可编辑画布。
 - **可交互画布**：坐标存 `plans.layout_json`（`PATCH /plans/{id}/layout`），依赖边可增删
-  （`POST/DELETE /plans/{id}/deps`，服务端做环检测并返回路径）；默认按 0.68 缩放展示，
+  （`POST/DELETE /plans/{id}/deps`，服务端做环检测并返回路径）；默认按 0.62 缩放展示，
   **不自动 fitView**，避免整图缩到看不清，需要全貌时点「全览」；编辑器里的校验刷新不会打断视野。
   双击卡片改名，草稿按任务记忆，快照可回滚；`Ctrl+Z` 是前端撤销栈（最多 30 步、按计划隔离，
   覆盖移动/改名/依赖增删/详情保存/新建，提交后锁定）。选中节点只是视觉聚焦，其余卡片变暗但仍参与执行。
@@ -332,6 +346,26 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
   `plan_token` 实时显示在 `PM STREAM` 面板，结束后原文可在「设计来源」查看。
 - **人工确认**：生成结果默认待确认，只有校验通过才能提交；提交弹窗展示任务数、节点数与预算。
 
+### 4.9 代码评审与验收门
+
+计划 Run 在 `verify` 通过后进入评审，评审通过后再进入验收人工门（三道都是可选开关，默认开启）：
+
+- **REVIEW 节点**：读取 idea、任务验收清单、`verify` 结果与 workspace 摘要（最多 16 个文本文件 / 26,000 字，
+  跳过二进制、`.git`、`node_modules`、虚拟环境与构建产物），用评审角色模型输出严格 JSON；
+  规范化后写 `review` 工件（通过=`approved`，阻塞=`draft`），并把结构化报告写进节点 `config.review`。
+- **阻塞判定**：`severity ∈ {blocker, major}` 且带合法 `task_uid` 才算阻塞。编排器把目标 `dev_*`、`verify`
+  与 `review` 节点重置为 `pending`，反馈注入任务配置，下一轮把上一轮问题带进提示词；默认 `max_rounds=2`，
+  用尽后评审节点升级人工门，由人决定驳回或直接通过。
+- **验收门**：`gate_accept` 依赖评审（未开评审时依赖 `verify`），驳回会按 `target_node` 重置目标节点；
+  通过后 run 才 `finished`，并把 `review` 工件置为 `approved`。
+- **运行页评审面板**：`GET /runs/{id}/review` 返回结论、轮次、阻塞数、问题列表（严重级别 / 任务 / 文件 /
+  建议）、`can_rework` 与报告正文；面板可勾选任务 + 填返工说明，`POST /runs/{id}/review/rework`
+  只允许在 `waiting_human` / `failed` 时人工回退。
+- **评审指标**：`GET /runs/{id}/metrics` 的 `review` 段包含一次通过、返工次数、阻塞/问题按严重级别分布、
+  评审均值与每个评审节点的历史；运行详情页直接展示一次通过、返工次数与问题分布。
+
+详见 [docs/评审与验收门.md](docs/评审与验收门.md)。
+
 ---
 
 ## 5. API 一览（前缀 `/api`）
@@ -341,14 +375,14 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 | 供应商 | `GET /presets`；`GET/POST /providers`；`PATCH/DELETE /providers/{id}`；`GET /providers/{id}/models`；`POST /providers/{id}/models/import`；`POST /providers/{id}/test`（可带 `model_id`） |
 | 模型 | `GET/POST /models`；`PATCH/DELETE /models/{id}` |
 | 角色模板 | `GET /agent-templates`；`PATCH /agent-templates/{id}` |
-| 运行 | `POST /runs`；`GET /runs`；`GET /runs/{id}`；`POST /runs/{id}/stop`；`GET /runs/{id}/metrics` |
+| 运行 | `POST /runs`；`GET /runs`；`GET /runs/{id}`；`POST /runs/{id}/stop`；`GET /runs/{id}/metrics`；`GET /runs/{id}/review`；`POST /runs/{id}/review/rework` |
 | 事件 | `GET /runs/{id}/events`（SSE）；`GET /runs/{id}/events/history`；`GET /events/{id}` |
 | 工件 | `GET /runs/{id}/artifacts`；`GET/PATCH /runs/{id}/artifacts/{kind}` |
 | 门 | `GET /gates`；`GET /gates/{id}`；`POST /gates/{id}/approve`；`POST /gates/{id}/reject` |
 | 任务 | `GET/POST /runs/{id}/tasks`；`PATCH/DELETE /runs/{id}/tasks/{uid}` |
 | 节点 | `GET /nodes/{id}`；`POST /nodes/{id}/retry` |
 | 记忆 | `GET /memories`；`PATCH /memories/{id}` |
-| 编排 | `POST/GET /plans`；`GET /plans/{id}`；`POST /plans/{id}/generate`；`GET /plans/{id}/events`（SSE）；`POST /plans/{id}/validate`；`POST /plans/{id}/commit`；`POST /plans/{id}/cancel`；`POST /plans/{id}/archive`；`PATCH /plans/{id}/layout`；`POST/DELETE /plans/{id}/deps`；`GET /plans/{id}/snapshots`；`POST /plans/{id}/restore/{version}`；`POST /plans/{id}/tasks`；`PATCH/DELETE /plans/{id}/tasks/{uid}` |
+| 编排 | `POST/GET /plans`；`GET /plans/{id}`；`GET /plans/{id}/phases`；`GET /plans/{id}/activity`；`POST /plans/{id}/generate`；`GET /plans/{id}/events`（SSE）；`POST /plans/{id}/validate`；`POST /plans/{id}/commit`；`POST /plans/{id}/cancel`；`POST /plans/{id}/archive`；`PATCH /plans/{id}/layout`；`POST/DELETE /plans/{id}/deps`；`GET /plans/{id}/snapshots`；`POST /plans/{id}/restore/{version}`；`POST /plans/{id}/tasks`；`PATCH/DELETE /plans/{id}/tasks/{uid}` |
 
 ---
 
@@ -389,8 +423,8 @@ cd backend
 覆盖：图/任务解析/front-matter/预算估算、门禁通过/驳回/升级重试、供应商与模型 CRUD、模板绑定校验；
 编排工作台的章节索引/校验错误码/波次/关键路径/环路径、两份 fixture 的差异、计划 API 的生成/编辑/提交
 （save 与 run）/幂等/归档；以及 `tests/test_durability.py` 的并发闸门、节点超时、退避重试、
-seq 缓存、取消收据与 metrics 端点，和 `tests/test_model_discovery.py` 的预设建模型、远程列表导入、
-导入去重与协议不支持报错。
+seq 缓存、取消收据与 metrics 端点，`tests/test_model_discovery.py` 的预设建模型、远程列表导入、
+导入去重与协议不支持报错，和 `tests/test_review.py` 的评审节点/阻塞回退/轮次用尽/评审 API 与指标。
 
 ---
 
@@ -412,8 +446,13 @@ seq 缓存、取消收据与 metrics 端点，和 `tests/test_model_discovery.py
 - `Ctrl+Z` 是画布的前端撤销栈：随页面刷新、切换计划清空，只在当前浏览器生效；删除任务不可撤销；
   计划提交/归档后撤销锁定。
 - 画布坐标不进 `plan_snapshots`：恢复历史版本只恢复任务与依赖，不恢复节点位置；连线操作尚未适配触屏。
-- 1440 宽度下工作台为「任务栏 286px + 画布 1fr」两栏，任务详情是宽 360 的右侧抽屉（不占画布列）；
-  默认 0.68 缩放下 5 个波次约 990px，可落在 1000px 左右的画布内，更多波次需要横向滚动或点「全览」。
+- 1440 宽度下工作台为「阶段导航 292px + 内容 1fr」两栏，任务详情、流程监控、活动、执行图共用右侧内容区；
+  执行图默认 0.62 缩放下 5 个波次约 904px，可落在 1000px 左右的画布内，更多波次需要横向滚动或点「全览」。
+- 评审是**启发式静态评审**：只把 workspace 的文本摘要（最多 16 个文件 / 26,000 字）连同任务验收清单交给模型，
+  没有真正的 diff、AST 或测试覆盖分析；阻塞问题必须带 `task_uid` 才会触发回退，模型漏标就会放行。
+  评审与开发共用同一个项目根执行器，评审模型由 `review` 角色的默认模型决定，未绑定回退 dev 模型。
+- 验收门是计划 Run 的**单点门**（review 之后一道），不是固定模板里的 5 道 SDLC 门；验收门驳回只按
+  `target_node` 重置一个节点，批量回退请用运行页评审面板的勾选返工。
 - Windows 下命令执行把 `python` 前缀替换为当前解释器；Linux 行为一致但未在 CI 验证。
 
 ---

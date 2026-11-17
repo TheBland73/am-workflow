@@ -451,7 +451,7 @@ function Canvas({
         selectionOnDrag={false}
         minZoom={0.25}
         maxZoom={1.6}
-        defaultViewport={{ x: 10, y: 8, zoom: 0.68 }}
+        defaultViewport={{ x: 14, y: 6, zoom: 0.62 }}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{ type: "smoothstep" }}
       >

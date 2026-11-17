@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App as AntApp, ConfigProvider } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import App from "./App";
+import ErrorBoundary from "./ErrorBoundary";
 import "./styles/endfield.css";
 import "./styles/console.css";
 import "./styles/plan.css";
@@ -43,7 +44,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <AntApp>
         <QueryClientProvider client={queryClient}>
           <BrowserRouter>
-            <App />
+            <ErrorBoundary>
+              <App />
+            </ErrorBoundary>
           </BrowserRouter>
         </QueryClientProvider>
       </AntApp>

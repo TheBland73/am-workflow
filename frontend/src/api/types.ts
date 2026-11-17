@@ -116,6 +116,79 @@ export interface NodeMetric {
   last_error: string | null;
 }
 
+export type ReviewSeverity = "blocker" | "major" | "minor";
+
+export interface ReviewIssue {
+  severity: ReviewSeverity;
+  task_uid: string;
+  file: string;
+  message: string;
+  suggestion: string;
+}
+
+export interface ReviewHistoryItem {
+  round: number;
+  verdict: string;
+  issues?: number;
+  blocking?: number;
+  at?: string;
+  summary?: string;
+}
+
+export interface ReviewNodeMetric {
+  node_key: string;
+  name: string;
+  verdict: string | null;
+  round: number;
+  max_rounds: number;
+  issues: number;
+  blocking: number;
+  summary: string;
+  reviewed_at: string | null;
+  attempts: number;
+  exec_ms: number;
+  blocks: number;
+  history: ReviewHistoryItem[];
+}
+
+export interface ReviewMetrics {
+  total: number;
+  verdict: string | null;
+  round: number;
+  max_rounds: number;
+  first_pass: boolean;
+  rework_count: number;
+  blocks: number;
+  issues: number;
+  blocking: number;
+  severities: Record<string, number>;
+  avg_review_ms: number;
+  nodes: ReviewNodeMetric[];
+}
+
+export interface RunReview {
+  available: boolean;
+  run_id: string;
+  run_status: string;
+  node_id?: number;
+  node_key?: string;
+  node_status?: string;
+  verdict?: string | null;
+  summary?: string | null;
+  issues: ReviewIssue[];
+  blocking: number;
+  targets: string[];
+  round: number;
+  max_rounds: number;
+  reviewed_at?: string | null;
+  files: string[];
+  history: ReviewHistoryItem[];
+  escalated: boolean;
+  can_rework: boolean;
+  artifact?: ArtifactRecord | null;
+  body?: string;
+}
+
 export interface RunMetrics {
   run_id: string;
   status: string;
@@ -146,6 +219,7 @@ export interface RunMetrics {
   };
   events: number;
   per_node: NodeMetric[];
+  review?: ReviewMetrics;
 }
 
 export interface Snapshot {
@@ -356,6 +430,73 @@ export interface PlanDetail {
   plan: PlanHeader;
   tasks: PlanTask[];
   snapshot: PlanSnapshot | null;
+}
+
+export type PlanPhaseEdgeKind = "critical" | "handoff" | "normal";
+
+export interface PlanPhaseTask {
+  uid: string;
+  title: string;
+  role: TaskRole;
+  effort: TaskEffort;
+  priority: TaskPriority;
+  critical: boolean;
+  deps: string[];
+}
+
+export interface PlanPhase {
+  index: number;
+  title: string;
+  key: string;
+  line: number;
+  task_count: number;
+  roles: Partial<Record<TaskRole, number>>;
+  points: number;
+  cross_links: number;
+  tasks: PlanPhaseTask[];
+}
+
+export interface PlanPhaseEdge {
+  from: string;
+  to: string;
+  kind: PlanPhaseEdgeKind;
+  cross: boolean;
+}
+
+export interface PlanPhases {
+  plan_id: string;
+  product_name: string;
+  status: PlanStatus;
+  total_tasks: number;
+  phase_count: number;
+  total_sections: number;
+  covered_sections: number;
+  coverage_ratio: number;
+  uncovered: string[];
+  orphan_tasks: string[];
+  critical_path: string[];
+  edges: PlanPhaseEdge[];
+  phases: PlanPhase[];
+}
+
+export type PlanActivityKind = "created" | "generate" | "validate" | "commit" | "archive";
+
+export interface PlanActivityItem {
+  at: string | null;
+  kind: PlanActivityKind;
+  title: string;
+  detail: string;
+  version?: number | null;
+  ok?: boolean | null;
+  errors?: string[];
+  warnings?: string[];
+  stats?: { tasks: number; sections: number; covered: number; points: number };
+  run_id?: string | null;
+}
+
+export interface PlanActivity {
+  plan_id: string;
+  items: PlanActivityItem[];
 }
 
 export interface PlanListItem {

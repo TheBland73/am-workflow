@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Button, Drawer, Empty, Modal, Spin, Table, message,
+  Button, Checkbox, Drawer, Empty, Input, Modal, Spin, Table, Tag, message,
 } from "antd";
 import { Link, useParams } from "react-router-dom";
 import { api, subscribeRun } from "../api/client";
@@ -17,6 +17,7 @@ const ARTIFACT_LABELS: Record<string, string> = {
   requirement: "需求", design: "设计", task: "任务", test: "测试", changelog: "交付日志",
 };
 const ARTIFACT_KINDS = Object.keys(ARTIFACT_LABELS);
+const SEV_LABEL: Record<string, string> = { blocker: "阻塞", major: "重要", minor: "建议" };
 
 const STATUS_LABELS: Record<string, string> = {
   created: "已创建", running: "运行中", waiting_human: "等待人工",
@@ -108,6 +109,9 @@ export default function RunPage() {
   const [nodeLoading, setNodeLoading] = useState(false);
   const [artifact, setArtifact] = useState<{ kind: string; body: string; original: string; version: number } | null>(null);
   const [savingArtifact, setSavingArtifact] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reworkUids, setReworkUids] = useState<string[]>([]);
+  const [reworkNote, setReworkNote] = useState("");
 
   const snapshotQuery = useQuery({
     queryKey: ["snapshot", runId],
@@ -129,6 +133,35 @@ export default function RunPage() {
     },
   });
 
+  const reviewQuery = useQuery({
+    queryKey: ["review", runId],
+    queryFn: () => api.runReview(runId),
+    enabled: Boolean(runId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.run_status;
+      return status === "finished" || status === "failed" || status === "stopped" ? false : 8000;
+    },
+  });
+
+  const review = reviewQuery.data;
+
+  useEffect(() => {
+    // 只在评审阻塞时预选要返工的任务；通过后清空，避免把正常评审误显示成待返工。
+    setReworkUids(review?.verdict === "block" ? review?.targets ?? [] : []);
+  }, [review?.reviewed_at, review?.targets, review?.verdict]);
+
+  const rework = useMutation({
+    mutationFn: () => api.reworkReview(runId, reworkUids, reworkNote.trim() || undefined),
+    onSuccess: () => {
+      messageApi.success("已退回选中任务，评审将在验证通过后重跑");
+      setReworkNote("");
+      client.invalidateQueries({ queryKey: ["snapshot", runId] });
+      client.invalidateQueries({ queryKey: ["metrics", runId] });
+      client.invalidateQueries({ queryKey: ["review", runId] });
+    },
+    onError: (error: Error) => messageApi.error(error.message),
+  });
+
   useEffect(() => {
     if (!runId) return;
     setEvents([]);
@@ -142,6 +175,7 @@ export default function RunPage() {
       if (event.type !== "node_token") {
         client.invalidateQueries({ queryKey: ["snapshot", runId] });
         client.invalidateQueries({ queryKey: ["metrics", runId] });
+        client.invalidateQueries({ queryKey: ["review", runId] });
       }
     }, 0);
     return unsubscribe;
@@ -401,6 +435,96 @@ export default function RunPage() {
 
       <ExecutionMap snapshot={snapshot} onNodeClick={openNode} />
 
+      {review?.available ? (
+        <section className="ef-panel review-panel">
+          <div className="review-title">
+            <h2><span className="ef-eyebrow">CODE REVIEW</span>代码评审</h2>
+            <div className="review-figs">
+              <b className={review.verdict === "pass" ? "is-pass" : "is-block"}>
+                {review.verdict === "pass" ? "PASS" : "BLOCK"}
+              </b>
+              <span>第 {review.round}/{review.max_rounds} 轮 · 阻塞 {review.blocking}</span>
+              {metrics?.review ? (
+                <span>
+                  一次通过 {metrics.review.first_pass ? "是" : "否"} · 返工 {metrics.review.rework_count} 次
+                </span>
+              ) : null}
+            </div>
+          </div>
+          <p className="review-summary">{review.summary || "评审未给出摘要。"}</p>
+          {review.issues.length ? (
+            <ul className="review-issues">
+              {review.issues.map((issue, index) => {
+                const uid = issue.task_uid || "";
+                const checked = Boolean(uid) && reworkUids.includes(uid);
+                return (
+                  <li key={`${uid}-${index}`} className={`is-${issue.severity}`}>
+                    <Checkbox
+                      checked={checked}
+                      disabled={!review.can_rework || !uid}
+                      onChange={(event) => {
+                        if (!uid) return;
+                        setReworkUids((previous) => {
+                          if (!event.target.checked) return previous.filter((item) => item !== uid);
+                          return previous.includes(uid) ? previous : [...previous, uid];
+                        });
+                      }}
+                    />
+                    <Tag className={`review-sev is-${issue.severity}`}>
+                      {SEV_LABEL[issue.severity] ?? issue.severity}
+                    </Tag>
+                    <div className="review-issue-body">
+                      <b>
+                        {uid || "全局"}
+                        {issue.file ? <span className="mono"> · {issue.file}</span> : null}
+                      </b>
+                      <p>{issue.message}</p>
+                      {issue.suggestion ? <em>建议：{issue.suggestion}</em> : null}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          ) : (
+            <p className="review-empty">本轮没有发现问题。</p>
+          )}
+          <div className="review-actions">
+            {review.can_rework ? (
+              <Input
+                size="small"
+                placeholder="给返工任务的补充说明（可选）"
+                value={reworkNote}
+                onChange={(event) => setReworkNote(event.target.value)}
+              />
+            ) : (
+              <em className="review-locked">评审已归档，不可再回退</em>
+            )}
+            <Button size="small" disabled={!review.body} onClick={() => setReviewOpen(true)}>
+              查看报告
+            </Button>
+            <Button
+              size="small"
+              type="primary"
+              danger
+              disabled={!review.can_rework || reworkUids.length === 0 || rework.isPending}
+              loading={rework.isPending}
+              onClick={() => rework.mutate()}
+            >
+              回退 {reworkUids.length} 个任务
+            </Button>
+          </div>
+          <div className="review-metricline">
+            <span>问题 {metrics?.review?.issues ?? review.issues.length}</span>
+            <span>阻塞 {metrics?.review?.severities?.blocker ?? 0}</span>
+            <span>重要 {metrics?.review?.severities?.major ?? 0}</span>
+            <span>建议 {metrics?.review?.severities?.minor ?? 0}</span>
+            <span>
+              评审均值 {metrics?.review ? Math.round(metrics.review.avg_review_ms / 1000) : 0}s
+            </span>
+          </div>
+        </section>
+      ) : null}
+
       <section className="lower">
         <div className="ef-panel">
           <h2><span className="ef-eyebrow">RUN LEDGER</span>运行账本</h2>
@@ -544,6 +668,16 @@ export default function RunPage() {
             />
           </div>
         )}
+      </Modal>
+
+      <Modal
+        title="评审报告"
+        open={reviewOpen}
+        onCancel={() => setReviewOpen(false)}
+        footer={<Button onClick={() => setReviewOpen(false)}>关闭</Button>}
+        width={760}
+      >
+        <pre className="review-body">{review?.body || "报告内容为空。"}</pre>
       </Modal>
     </div>
   );

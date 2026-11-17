@@ -1,7 +1,7 @@
 import type {
-  AgentTemplate, ArtifactRecord, Gate, ModelEntry, PlanDetail, PlanEvent, PlanListItem,
-  PlanPoint, PlanTask, Preset, Provider, RemoteModel, Run, RunMetrics, Snapshot, StreamEvent,
-  Task, TestResult,
+  AgentTemplate, ArtifactRecord, Gate, ModelEntry, PlanActivity, PlanDetail, PlanEvent,
+  PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider, RemoteModel, Run, RunMetrics,
+  RunReview, Snapshot, StreamEvent, Task, TestResult,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -48,6 +48,12 @@ export const api = {
     }),
   getRun: (runId: string) => request<Snapshot>(`/runs/${runId}`),
   metrics: (runId: string) => request<RunMetrics>(`/runs/${runId}/metrics`),
+  runReview: (runId: string) => request<RunReview>(`/runs/${runId}/review`),
+  reworkReview: (runId: string, taskUids: string[], feedback?: string) =>
+    request<Record<string, unknown>>(`/runs/${runId}/review/rework`, {
+      method: "POST",
+      body: JSON.stringify({ task_uids: taskUids, feedback: feedback ?? null }),
+    }),
   stopRun: (runId: string) => request<{ id: string; status: string }>(`/runs/${runId}/stop`),
 
   history: (runId: string, since = 0) =>
@@ -157,10 +163,24 @@ export const api = {
       `/plans/${planId}/deps?source=${encodeURIComponent(source)}&target=${encodeURIComponent(target)}`,
       { method: "DELETE" },
     ),
-  commitPlan: (planId: string, mode: "save" | "run", budgetTokens?: number | null) =>
+  commitPlan: (
+    planId: string,
+    mode: "save" | "run",
+    budgetTokens?: number | null,
+    review = true,
+    acceptGate = true,
+  ) =>
     request<{ plan: PlanDetail["plan"]; run_id?: string | null; run?: Run | null }>(
       `/plans/${planId}/commit`,
-      { method: "POST", body: JSON.stringify({ mode, budget_tokens: budgetTokens ?? null }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          mode,
+          budget_tokens: budgetTokens ?? null,
+          review,
+          accept_gate: acceptGate,
+        }),
+      },
     ),
   archivePlan: (planId: string) =>
     request<PlanDetail>(`/plans/${planId}/archive`, { method: "POST" }),
@@ -170,6 +190,9 @@ export const api = {
     ),
   restorePlanSnapshot: (planId: string, version: number) =>
     request<PlanDetail>(`/plans/${planId}/restore/${version}`, { method: "POST" }),
+  planPhases: (planId: string) => request<PlanPhases>(`/plans/${planId}/phases`),
+  planActivity: (planId: string, limit = 50) =>
+    request<PlanActivity>(`/plans/${planId}/activity?limit=${limit}`),
 };
 
 /** 订阅 run 的 SSE；返回取消订阅函数。事件类型逐个注册（后端用的是命名事件）。 */

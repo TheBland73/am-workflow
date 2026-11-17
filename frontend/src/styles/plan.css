@@ -1962,3 +1962,564 @@
 .plan-history-row em { font-style: normal; color: #8a887e; font-family: var(--ef-mono, monospace); }
 .plan-history-row em.is-ok { color: #157a3b; }
 .plan-history-row em.is-bad { color: #b3261e; }
+
+/* ---------- 编排工作台 v2：Phase 导航 + 四 Tab（参考 ASF Workstation） ---------- */
+.plan-tabbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin: 14px 0 0;
+  border-bottom: 1px solid var(--ef-rule);
+  overflow-x: auto;
+}
+
+.plan-tabbar button {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 16px 11px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--ef-ink-2);
+  font: 600 13px/1 var(--ef-font-ui);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.plan-tabbar button span {
+  color: #9a978b;
+  font: 500 9.5px/1 var(--ef-font-ui);
+  letter-spacing: 0.14em;
+}
+
+.plan-tabbar button:hover { color: var(--ef-ink); }
+
+.plan-tabbar button.is-active {
+  color: var(--ef-ink);
+  border-bottom-color: var(--ef-ink);
+  background: linear-gradient(180deg, transparent 62%, var(--ef-signal) 62%, var(--ef-signal) 100%);
+}
+
+.plan-tabbar button.is-active span { color: var(--ef-ink); }
+
+.plan-tabbar-meta {
+  margin-left: auto;
+  padding: 0 4px 0 16px;
+  color: #8b887c;
+  font: 500 10.5px/1.4 var(--ef-font-ui);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+/* 两栏：左 phase 导航 + 右内容；整块固定高度，栏内各自滚动 */
+.plan-station {
+  grid-template-columns: 292px minmax(0, 1fr);
+  align-items: stretch;
+  height: clamp(600px, calc(100vh - 318px), 880px);
+  min-height: 560px;
+  margin-top: 14px;
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-panel);
+  overflow: hidden;
+}
+
+.plan-phase-nav {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--ef-rule);
+  background: #fbfaf4;
+}
+
+.plan-phase-progress {
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--ef-rule);
+  background: var(--ef-panel);
+}
+
+.plan-phase-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.plan-phase-progress-head b {
+  font: 600 11px/1.2 var(--ef-font-ui);
+  letter-spacing: 0.12em;
+  color: var(--ef-ink);
+}
+
+.plan-phase-progress-head em {
+  font: 700 15px/1 var(--ef-font-ui);
+  font-style: normal;
+  color: var(--ef-ink);
+}
+
+.plan-phase-progress .ant-progress { margin-bottom: 6px; }
+
+.plan-phase-progress > span {
+  display: block;
+  color: var(--ef-ink-2);
+  font: 500 10px/1.5 var(--ef-font-ui);
+  letter-spacing: 0.04em;
+}
+
+.plan-phase-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.plan-phase-group { border-bottom: 1px solid rgba(22, 22, 22, 0.08); }
+
+.plan-phase-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 11px 14px 7px;
+}
+
+.plan-phase-head b {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ef-ink);
+  font: 600 12px/1.3 var(--ef-font-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-phase-head i {
+  flex: none;
+  padding: 3px 5px;
+  background: var(--ef-ink);
+  color: var(--ef-panel);
+  font: 600 9.5px/1 var(--ef-font-mono);
+  font-style: normal;
+  letter-spacing: 0.04em;
+}
+
+.plan-phase-head em {
+  flex: none;
+  color: #8b887c;
+  font: 600 10px/1 var(--ef-font-mono);
+  font-style: normal;
+}
+
+.plan-phase-tasks { display: flex; flex-direction: column; padding-bottom: 6px; }
+
+.plan-phase-task {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 2px 8px;
+  padding: 6px 14px 7px 13px;
+  border: 0;
+  border-left: 3px solid transparent;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.plan-phase-task:hover { background: #f3f1e7; }
+
+.plan-phase-task.is-active {
+  border-left-color: var(--ef-ink);
+  background: var(--ef-panel);
+}
+
+.plan-phase-task.is-error .plan-phase-task-uid { color: var(--ef-danger); }
+
+.plan-phase-task-uid {
+  color: #8c897d;
+  font: 600 9.5px/1.5 var(--ef-font-mono);
+}
+
+.plan-phase-task-title {
+  overflow: hidden;
+  color: var(--ef-ink);
+  font: 600 12px/1.35 var(--ef-font-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-phase-task-meta {
+  display: flex;
+  grid-column: 2;
+  align-items: center;
+  gap: 6px;
+  color: #8b887c;
+  font: 500 9.5px/1.2 var(--ef-font-ui);
+  letter-spacing: 0.04em;
+}
+
+.plan-phase-task-meta i {
+  padding: 1px 4px;
+  background: var(--ef-signal);
+  color: var(--ef-on-signal);
+  font-style: normal;
+}
+
+.plan-phase-skeleton { display: grid; gap: 8px; padding: 14px; }
+.plan-phase-skeleton span { height: 34px; background: #f1efe6; }
+
+.plan-phase-orphan {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--ef-rule);
+  color: var(--ef-ink-2);
+  font: 500 10px/1.5 var(--ef-font-ui);
+}
+
+.plan-phase-orphan b { flex-basis: 100%; color: var(--ef-ink); }
+
+.plan-phase-orphan button {
+  padding: 2px 6px;
+  border: 1px solid var(--ef-rule);
+  background: var(--ef-panel);
+  font: 600 10px/1.4 var(--ef-font-mono);
+  cursor: pointer;
+}
+
+.plan-phase-uncovered {
+  flex: none;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--ef-rule);
+  background: var(--ef-signal);
+  color: var(--ef-on-signal);
+}
+
+.plan-phase-uncovered b {
+  display: block;
+  font: 600 11px/1.3 var(--ef-font-ui);
+  letter-spacing: 0.04em;
+}
+
+.plan-phase-uncovered span {
+  display: block;
+  overflow: hidden;
+  margin-top: 3px;
+  font: 500 10px/1.4 var(--ef-font-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右侧内容 */
+.plan-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.plan-content-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--ef-rule);
+  background: #fbfaf4;
+}
+
+.plan-content-head > div:first-child { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+
+.plan-content-head b {
+  color: var(--ef-ink);
+  font: 600 12.5px/1.2 var(--ef-font-ui);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.plan-content-head > div:first-child span {
+  overflow: hidden;
+  color: var(--ef-ink-2);
+  font: 500 10.5px/1.4 var(--ef-font-ui);
+  letter-spacing: 0.03em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-content-body { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+
+.plan-content-body.is-detail,
+.plan-content-body.is-activity,
+.plan-content-body.is-monitor { overflow-y: auto; overscroll-behavior: contain; }
+
+.plan-content-body.is-graph { overflow: hidden; }
+
+.plan-graph-pane {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px 14px 10px;
+  overflow: hidden;
+}
+
+.plan-graph-pane .plan-flow-wrap {
+  flex: 1;
+  min-height: 0;
+  height: auto;
+}
+
+.plan-graph-pane .plan-graph-legend { flex: none; margin-top: 0; }
+
+.plan-detail-pane {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 18px 22px 28px;
+}
+
+.plan-detail-pane .plan-inspector,
+.plan-content-body .plan-inspector {
+  position: static;
+  width: auto;
+  max-width: none;
+  height: auto;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+}
+
+.plan-detail-pane .plan-inspector .plan-panel-head { padding-right: 0; }
+
+.plan-source-modal { max-height: 66vh; overflow-y: auto; }
+
+/* 流程监控：只读阶段链 */
+.plan-twin-wrap { position: relative; flex: 1; min-height: 440px; }
+
+.plan-twin-wrap .react-flow { position: absolute !important; inset: 0 !important; }
+
+.plan-twin-hint {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  padding: 5px 8px;
+  border: 1px solid var(--ef-rule);
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--ef-ink-2);
+  font: 500 10px/1.4 var(--ef-font-ui);
+  letter-spacing: 0.03em;
+}
+
+.plan-twin-phase {
+  width: 380px;
+  min-height: 56px;
+  padding: 8px 12px 9px;
+  border: 1px solid var(--ef-rule);
+  border-left: 4px solid var(--ef-ink);
+  border-radius: 0;
+  background: var(--ef-panel);
+  box-shadow: 0 1px 0 rgba(22, 22, 22, 0.06);
+}
+
+.plan-twin-phase.is-critical { border-left-color: var(--ef-signal); }
+
+.plan-twin-phase.is-active {
+  outline: 2px solid var(--ef-ink);
+  outline-offset: 1px;
+}
+
+.plan-twin-phase-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #8b887c;
+  font: 600 9.5px/1 var(--ef-font-mono);
+  letter-spacing: 0.1em;
+}
+
+.plan-twin-phase-top em {
+  margin-left: auto;
+  color: #8b887c;
+  font: 500 9.5px/1 var(--ef-font-ui);
+  letter-spacing: 0.02em;
+}
+
+.plan-twin-phase-top i {
+  padding: 2px 5px;
+  background: var(--ef-signal);
+  color: var(--ef-on-signal);
+  font-style: normal;
+}
+
+.plan-twin-phase > b {
+  display: block;
+  overflow: hidden;
+  margin: 5px 0 4px;
+  color: var(--ef-ink);
+  font: 700 13px/1.3 var(--ef-font-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-twin-phase-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  color: #8b887c;
+  font: 500 10px/1.3 var(--ef-font-ui);
+  letter-spacing: 0.04em;
+}
+
+.plan-twin-phase-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--ef-rule);
+}
+
+.plan-twin-phase-tasks span {
+  overflow: hidden;
+  color: var(--ef-ink-2);
+  font: 500 9.5px/1.35 var(--ef-font-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plan-twin-phase-tasks span.is-critical { color: var(--ef-ink); font-weight: 600; }
+
+.plan-twin-terminal {
+  width: 200px;
+  padding: 6px 12px;
+  border: 1px solid var(--ef-rule);
+  border-radius: 999px;
+  background: #f6f5ee;
+  text-align: center;
+}
+
+.plan-twin-terminal small {
+  display: block;
+  color: #8b887c;
+  font: 600 8.5px/1.2 var(--ef-font-mono);
+  letter-spacing: 0.16em;
+}
+
+.plan-twin-terminal b {
+  display: block;
+  margin-top: 2px;
+  color: var(--ef-ink);
+  font: 600 12px/1.3 var(--ef-font-text);
+}
+
+.plan-twin-terminal.is-verify {
+  border-color: #b45309;
+  border-radius: 6px;
+  background: #fff8e6;
+}
+
+.plan-twin-terminal.is-verify small { color: #b45309; }
+
+.plan-twin-terminal.is-start,
+.plan-twin-terminal.is-end { background: #eef0fb; border-color: #4b45c6; }
+
+.plan-twin-handle { opacity: 0; }
+
+/* 活动时间线 */
+.plan-activity { padding: 18px 22px 28px; }
+
+.plan-activity-empty { padding: 48px 20px; color: var(--ef-ink-2); font: 500 11px/1.6 var(--ef-font-ui); text-align: center; }
+
+.plan-activity-row { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 0 12px; }
+
+.plan-activity-rail { position: relative; display: flex; flex-direction: column; align-items: center; }
+
+.plan-activity-rail i {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--ef-rule);
+  border-radius: 999px;
+  background: var(--ef-panel);
+  color: var(--ef-ink);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.plan-activity-rail span { flex: 1; width: 1px; background: var(--ef-rule); }
+
+.plan-activity-body { padding: 2px 0 20px; }
+
+.plan-activity-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.plan-activity-head b { color: var(--ef-ink); font: 600 13px/1.4 var(--ef-font-text); }
+
+.plan-activity-head em {
+  color: #8b887c;
+  font: 600 10px/1.4 var(--ef-font-mono);
+  font-style: normal;
+}
+
+.plan-activity-time { margin-left: auto; color: #8b887c; font: 500 10px/1.4 var(--ef-font-mono); }
+
+.plan-activity-body p { margin: 3px 0 0; color: var(--ef-ink-2); font: 500 11px/1.55 var(--ef-font-text); }
+
+.plan-activity-errors {
+  margin: 6px 0 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--ef-danger);
+  background: #fdf6f5;
+  color: #7a2a24;
+  font: 500 10.5px/1.5 var(--ef-font-mono);
+  list-style: none;
+}
+
+.plan-activity-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 6px;
+  color: #8b887c;
+  font: 500 10px/1.4 var(--ef-font-ui);
+  letter-spacing: 0.04em;
+}
+
+.plan-activity-foot em { color: #b45309; font-style: normal; }
+.plan-activity-foot a { color: var(--ef-ink); }
+.plan-activity-row.is-commit .plan-activity-rail i,
+.plan-activity-row.is-generate .plan-activity-rail i { background: var(--ef-signal); border-color: var(--ef-ink); }
+.plan-activity-row.is-archive .plan-activity-rail i { opacity: 0.6; }
+
+
+/* v2 layout polish */
+.plan-graph-pane .react-flow__minimap { display: none; }
+.plan-graph-pane .plan-coverage { padding: 9px 14px 7px; }
+.plan-graph-pane .plan-coverage-head { margin-bottom: 6px; }
+.plan-graph-pane .plan-coverage-list { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; padding-bottom: 2px; }
+.plan-graph-pane .plan-coverage-chip { flex: 0 0 auto; }
+
+
+.plan-detail-pane .plan-inspector { width: 100%; max-width: 880px; margin: 0 auto; }
+.plan-locked-note { flex: 1; text-align: right; color: #8b887c; font: 500 11px/1.4 var(--ef-font-ui); }
+
+.plan-commit-flags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+  margin: 10px 0 2px;
+  font-size: 12.5px;
+}
+.plan-commit-flags em { font-style: normal; color: #8a8a80; font-size: 11.5px; }

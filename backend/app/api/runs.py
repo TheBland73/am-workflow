@@ -7,16 +7,18 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 
 from app.api.schemas import RunIn
-from app.artifacts.store import list_artifacts, write_artifact
+from app.artifacts.store import latest_artifact, list_artifacts, read_artifact, write_artifact
 from app.config import settings
 from app.db.base import session_scope
 from app.db.models import (
     Artifact, Event, Gate, ModelEntry, Node, NodeAttempt, Run, Task, Workflow, new_run_id,
 )
 from app.engine.events import bus, emit, load_events, sse_format
+from app.engine.gates import GateError
 from app.engine.orchestrator import orchestrator
 from app.engine.templates import instantiate_nodes, phase_names
 
@@ -212,6 +214,71 @@ def _span_ms(start: datetime | None, end: datetime | None) -> int:
     return max(0, int((b - a).total_seconds() * 1000))
 
 
+@router.get("/runs/{run_id}/review")
+def get_run_review(run_id: str) -> dict:
+    """最新评审报告：结论、问题清单、报告正文与是否可回退。"""
+    with session_scope() as s:
+        run = s.get(Run, run_id)
+        if run is None:
+            raise HTTPException(404, "run 不存在")
+        node = (
+            s.query(Node)
+            .filter(Node.run_id == run_id, Node.type == "REVIEW")
+            .order_by(Node.order_index.desc(), Node.id.desc())
+            .first()
+        )
+        if node is None:
+            return {"available": False, "run_id": run_id, "status": run.status}
+        config = dict(node.config_json or {})
+        report = dict(config.get("review") or {})
+        issues = report.get("issues")
+        if not isinstance(issues, list):
+            issues = []
+        payload = {
+            "available": bool(report),
+            "run_id": run_id,
+            "run_status": run.status,
+            "node_id": node.id,
+            "node_key": node.node_key,
+            "node_status": node.status,
+            "verdict": report.get("verdict"),
+            "summary": report.get("summary"),
+            "issues": issues,
+            "blocking": int(report.get("blocking") or 0),
+            "targets": list(report.get("targets") or []),
+            "round": int(config.get("round") or report.get("round") or 0),
+            "max_rounds": int(config.get("max_rounds") or report.get("max_rounds") or 2),
+            "reviewed_at": report.get("reviewed_at"),
+            "files": list(report.get("files") or []),
+            "history": list(config.get("review_history") or [])[-8:],
+            "escalated": bool(config.get("escalation")),
+            "can_rework": run.status in ("waiting_human", "failed") and bool(report),
+        }
+    payload["artifact"] = latest_artifact(run_id, "review")
+    raw = read_artifact(run_id, "review")
+    if raw:
+        from app.artifacts.store import parse_front_matter
+
+        _meta, body = parse_front_matter(raw)
+        payload["body"] = body.strip()
+    return payload
+
+
+class ReviewReworkIn(BaseModel):
+    task_uids: list[str] = Field(default_factory=list)
+    feedback: str | None = None
+
+
+@router.post("/runs/{run_id}/review/rework")
+async def rework_from_review(run_id: str, payload: ReviewReworkIn) -> dict:
+    if not payload.task_uids:
+        raise HTTPException(400, "至少选择一个要回退的任务")
+    try:
+        return await orchestrator.rework_review(run_id, payload.task_uids, payload.feedback)
+    except GateError as exc:
+        raise HTTPException(400, str(exc))
+
+
 @router.get("/runs/{run_id}/metrics")
 def run_metrics(run_id: str) -> dict:
     """运行指标：耗时、重试、token/成本、门等待。供看板与回归对比使用。"""
@@ -233,6 +300,16 @@ def run_metrics(run_id: str) -> dict:
         ) if node_ids else []
         gates = s.query(Gate).filter(Gate.run_id == run_id).all()
         events = int(s.query(func.count(Event.id)).filter(Event.run_id == run_id).scalar() or 0)
+        review_data = [
+            {
+                "node_id": n.id, "node_key": n.node_key, "name": n.name,
+                "round": int((n.config_json or {}).get("round") or 0),
+                "max_rounds": int((n.config_json or {}).get("max_rounds") or 2),
+                "report": dict((n.config_json or {}).get("review") or {}),
+                "history": list((n.config_json or {}).get("review_history") or []),
+            }
+            for n in nodes if n.type == "REVIEW"
+        ]
         prices = {
             row.id: (float(row.price_in or 0), float(row.price_out or 0))
             for row in s.query(ModelEntry).all()
@@ -293,6 +370,42 @@ def run_metrics(run_id: str) -> dict:
     for g in gates:
         gate_counts[g.status] = gate_counts.get(g.status, 0) + 1
 
+    # 评审指标：轮次、一次通过、阻塞/问题分布、评审耗时。
+    severities = {"blocker": 0, "major": 0, "minor": 0}
+    review_nodes: list[dict] = []
+    review_ms: list[int] = []
+    for item in review_data:
+        rows = by_node.get(item["node_id"], [])
+        ms = [_span_ms(a.started_at, a.finished_at) for a in rows]
+        review_ms.extend(ms)
+        report = item["report"]
+        issues = report.get("issues")
+        if not isinstance(issues, list):
+            issues = []
+        for issue in issues:
+            severity = str(issue.get("severity") or "minor")
+            severities[severity] = severities.get(severity, 0) + 1
+        history = item["history"]
+        review_nodes.append({
+            "node_key": item["node_key"], "name": item["name"],
+            "verdict": report.get("verdict"),
+            "round": item["round"] or int(report.get("round") or 0),
+            "max_rounds": item["max_rounds"] or int(report.get("max_rounds") or 2),
+            "issues": len(issues), "blocking": int(report.get("blocking") or 0),
+            "summary": str(report.get("summary") or ""), "reviewed_at": report.get("reviewed_at"),
+            "attempts": len(rows), "exec_ms": sum(ms),
+            "blocks": sum(1 for h in history if str(h.get("verdict")) == "block"),
+            "history": history[-8:],
+        })
+    latest_review = review_nodes[-1] if review_nodes else None
+    first_pass = bool(
+        latest_review
+        and latest_review["verdict"] == "pass"
+        and latest_review["round"] == 1
+        and latest_review["blocks"] == 0
+    )
+    rework_count = max(0, (latest_review["round"] - 1)) if latest_review else 0
+
     return {
         "run_id": run_id,
         "status": run_status,
@@ -319,6 +432,20 @@ def run_metrics(run_id: str) -> dict:
             "open_wait_ms": sum(open_wait_ms),
         },
         "events": events,
+        "review": {
+            "total": len(review_nodes),
+            "verdict": latest_review["verdict"] if latest_review else None,
+            "round": latest_review["round"] if latest_review else 0,
+            "max_rounds": latest_review["max_rounds"] if latest_review else 0,
+            "first_pass": first_pass,
+            "rework_count": rework_count,
+            "blocks": latest_review["blocks"] if latest_review else 0,
+            "issues": latest_review["issues"] if latest_review else 0,
+            "blocking": latest_review["blocking"] if latest_review else 0,
+            "severities": severities,
+            "avg_review_ms": int(sum(review_ms) / len(review_ms)) if review_ms else 0,
+            "nodes": review_nodes,
+        },
         "per_node": per_node,
     }
 

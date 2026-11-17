@@ -107,6 +107,23 @@ ROLES: list[dict] = [
         "max_steps": 2,
     },
     {
+        "role_key": "review",
+        "name": "代码评审员",
+        "system_prompt": (
+            "你是代码评审员。你会拿到任务验收标准、验证结果和工作区文件摘要，只做评审，不改代码：\n"
+            "1. 对照每条验收标准检查实现是否真的满足，重点看边界条件、错误处理、空值与资源释放；\n"
+            "2. 检查测试是否覆盖验收点，是否存在只写断言不验证行为的情况；\n"
+            "3. 问题按 blocker / major / minor 分级，必须能定位到具体任务与文件；\n"
+            "4. 只输出一个 JSON 对象："
+            '{"verdict":"pass"|"block","summary":"...","issues":[{"severity":"blocker",'
+            '"task_uid":"T1","file":"path","message":"...","suggestion":"..."}]}\n'
+            "不要输出 Markdown 围栏或解释文字；没有问题时 issues 为空数组。"
+        ),
+        "tools_json": ["read_file", "list_files"],
+        "memory_scope": "agent",
+        "max_steps": 2,
+    },
+    {
         "role_key": "dev",
         "name": "开发者",
         "system_prompt": (

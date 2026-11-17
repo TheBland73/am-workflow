@@ -156,6 +156,9 @@ def test_plan_commit_run_creates_nodes(monkeypatch) -> None:
         assert first["config"]["effort"] == "M"
         assert first["config"]["priority"] == "P1"
         assert first["config"]["description"]
+        assert first["config"]["phase"]
+        assert first["config"]["phase_index"] >= 1
+        assert "阶段" in detail["run"]["idea"]
         assert len(detail["tasks"]) == 8
         kinds = {artifact["kind"] for artifact in detail["artifacts"]}
         assert "design" in kinds
@@ -231,3 +234,56 @@ def test_plan_canvas_layout_and_dependency_edges() -> None:
         locked = client.patch(f"/api/plans/{plan_id}/layout", json={"positions": {}})
         assert locked.status_code == 400
         assert locked.json()["detail"]["code"] == "plan_locked"
+
+
+def test_plan_phases_and_activity() -> None:
+    with TestClient(app) as client:
+        created = client.post("/api/plans", json={
+            "product_name": "客户反馈收集与归类",
+            "source_type": "text",
+            "design_text": DESIGN,
+        })
+        assert created.status_code == 201, created.text
+        plan_id = created.json()["plan"]["id"]
+        seed_tasks(plan_id)
+        assert client.post(f"/api/plans/{plan_id}/validate").status_code == 200
+
+        phases = client.get(f"/api/plans/{plan_id}/phases")
+        assert phases.status_code == 200, phases.text
+        body = phases.json()
+        assert body["total_tasks"] == 8
+        assert body["phase_count"] == 8
+        assert body["covered_sections"] == 8
+        assert [phase["index"] for phase in body["phases"]] == list(range(1, 9))
+        assert all(phase["task_count"] == 1 for phase in body["phases"])
+        assert body["phases"][0]["tasks"][0]["uid"] == "T1"
+        assert body["phases"][0]["points"] == 2
+        assert len(body["critical_path"]) == 8
+        assert all(edge["kind"] in {"normal", "handoff", "critical"} for edge in body["edges"])
+        assert body["orphan_tasks"] == []
+
+        activity = client.get(f"/api/plans/{plan_id}/activity")
+        assert activity.status_code == 200, activity.text
+        items = activity.json()["items"]
+        kinds = [item["kind"] for item in items]
+        assert "created" in kinds and "validate" in kinds
+        latest = next(item for item in items if item["kind"] == "validate")
+        assert latest["ok"] is True
+        assert latest["stats"]["tasks"] == 8
+
+        assert client.get("/api/plans/nope/phases").status_code == 404
+        assert client.get("/api/plans/nope/activity").status_code == 404
+
+
+def test_activity_lines_normalizes_legacy_objects():
+    from app.api.plans import _activity_lines
+
+    assert _activity_lines(None) == []
+    assert _activity_lines("纯文本") == ["纯文本"]
+    assert _activity_lines({"message": "单条对象"}) == ["单条对象"]
+    assert _activity_lines([
+        {"code": "title_length", "message": "标题太短", "hint": "写清交付物", "details": {"uid": "T1"}},
+        "字符串也行",
+        {"code": "description_length", "message": "描述太短"},
+    ]) == ["[T1] 标题太短（写清交付物）", "字符串也行", "描述太短"]
+

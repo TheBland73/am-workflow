@@ -1,21 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  Button, Empty, InputNumber, Modal, Progress, Radio, Table, Tag, Tooltip, message,
+  Button, Checkbox, Empty, InputNumber, Modal, Progress, Radio, Tag, Tooltip, message,
 } from "antd";
 import {
-  AimOutlined, CheckOutlined, DeleteOutlined, HistoryOutlined, ReloadOutlined,
-  RocketOutlined, SaveOutlined, ThunderboltOutlined,
+  AimOutlined, CheckOutlined, DeleteOutlined, FileTextOutlined, HistoryOutlined,
+  ReloadOutlined, RocketOutlined, SaveOutlined, ThunderboltOutlined,
 } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import { api, subscribePlan } from "../api/client";
 import type {
-  PlanDetail, PlanPoint, PlanStatus, PlanTask, PlanValidationError, TaskEffort, TaskPriority,
+  PlanDetail, PlanPoint, PlanStatus, PlanValidationError,
 } from "../api/types";
 import PlanGraph, { ROLE_META } from "../canvas/PlanGraph";
+import PlanActivity from "../panels/PlanActivity";
 import PlanInspector from "../panels/PlanInspector";
+import PlanPhaseNav from "../panels/PlanPhaseNav";
 import PlanSourcePanel from "../panels/PlanSourcePanel";
-import PlanTaskNav from "../panels/PlanTaskNav";
+import PlanTwinGraph from "../panels/PlanTwinGraph";
 
 const STATUS_LABEL: Record<PlanStatus, string> = {
   draft: "草稿",
@@ -30,63 +32,24 @@ const STATUS_LABEL: Record<PlanStatus, string> = {
   failed: "生成失败",
 };
 
-const EFFORT_LABEL: Record<TaskEffort, string> = { S: "S", M: "M", L: "L", XL: "XL" };
-const PRIORITY_LABEL: Record<TaskPriority, string> = { P0: "P0", P1: "P1", P2: "P2" };
-
 type UndoEntry = { label: string; run: () => Promise<void> };
 
-const COLUMNS = [
-  {
-    title: "UID",
-    dataIndex: "task_uid",
-    width: 64,
-    render: (value: string) => <span className="am-mono">{value}</span>,
-  },
-  {
-    title: "任务",
-    dataIndex: "title",
-    render: (value: string, task: PlanTask) => (
-      <div className="plan-title-cell">
-        <b>{value}</b>
-        <span>{task.design_section}</span>
-      </div>
-    ),
-  },
-  {
-    title: "依赖",
-    dataIndex: "deps",
-    width: 130,
-    render: (deps: string[]) => (deps.length
-      ? deps.map((dep) => <Tag key={dep} className="ef-tag">{dep}</Tag>)
-      : <span className="plan-muted">—</span>),
-  },
-  {
-    title: "角色",
-    dataIndex: "role_key",
-    width: 88,
-    render: (value: string) => <span className="plan-role">{value.toUpperCase()}</span>,
-  },
-  { title: "工作量", dataIndex: "effort", width: 72, render: (value: TaskEffort) => EFFORT_LABEL[value] },
-  { title: "优先级", dataIndex: "priority", width: 72, render: (value: TaskPriority) => PRIORITY_LABEL[value] },
-  {
-    title: "验收",
-    dataIndex: "acceptance",
-    width: 70,
-    render: (items: string[]) => `${items.length} 条`,
-  },
-];
+type ViewKey = "detail" | "monitor" | "activity" | "graph";
+
 
 export default function PlanPage() {
   const { planId = "" } = useParams();
   const client = useQueryClient();
   const [messageApi, holder] = message.useMessage();
   const [selectedUid, setSelectedUid] = useState<string | null>(null);
-  const [view, setView] = useState<"graph" | "table" | "source">("graph");
+  const [view, setView] = useState<ViewKey>("graph");
   const [genText, setGenText] = useState("");
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMode, setCommitMode] = useState<"save" | "run">("run");
   const [commitBudget, setCommitBudget] = useState<number | null>(null);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [commitReview, setCommitReview] = useState(true);
+  const [commitAccept, setCommitAccept] = useState(true);
+  const [sourceOpen, setSourceOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [fitTick, setFitTick] = useState(0);
   const [resetTick, setResetTick] = useState(0);
@@ -128,6 +91,7 @@ export default function PlanPage() {
     onSuccess: (_, version) => {
       messageApi.success(`已恢复到 v${version}`);
       setHistoryOpen(false);
+      client.invalidateQueries({ queryKey: ["plan-phases"] });
       refreshAfterGraphEdit();
     },
     onError: (error: Error) => messageApi.error(error.message),
@@ -179,11 +143,14 @@ export default function PlanPage() {
     if (!selectedUid && tasks.length > 0) setSelectedUid(tasks[0].task_uid);
   }, [selectedUid, tasks]);
 
-  const waveMap = useMemo(() => snapshot?.waves ?? {}, [snapshot]);
-
   function selectTask(uid: string | null) {
     setSelectedUid(uid);
-    if (uid) setInspectorOpen(true);
+  }
+
+  /** 左侧阶段导航点任务：选中并切到任务详情。 */
+  function openTask(uid: string) {
+    setSelectedUid(uid);
+    setView("detail");
   }
 
   const generate = useMutation({
@@ -192,6 +159,8 @@ export default function PlanPage() {
       setSelectedUid(null);
       setGenText("");
       client.invalidateQueries({ queryKey: ["plan", planId] });
+      client.invalidateQueries({ queryKey: ["plan-phases"] });
+      client.invalidateQueries({ queryKey: ["plan-activity"] });
     },
     onError: (error: Error) => messageApi.error(error.message),
   });
@@ -244,6 +213,8 @@ export default function PlanPage() {
       await entry.run();
       messageApi.success(`已撤销：${entry.label}`);
       client.invalidateQueries({ queryKey: ["plan", planId] });
+      client.invalidateQueries({ queryKey: ["plan-phases"] });
+      client.invalidateQueries({ queryKey: ["plan-activity"] });
       client.invalidateQueries({ queryKey: ["plans"] });
       scheduleValidate();
     } catch (error) {
@@ -295,6 +266,8 @@ export default function PlanPage() {
 
   function refreshAfterGraphEdit() {
     client.invalidateQueries({ queryKey: ["plan", planId] });
+    client.invalidateQueries({ queryKey: ["plan-phases"] });
+    client.invalidateQueries({ queryKey: ["plan-activity"] });
     client.invalidateQueries({ queryKey: ["plans"] });
     scheduleValidate();
   }
@@ -345,17 +318,42 @@ export default function PlanPage() {
 
   const commit = useMutation({
     mutationFn: (mode: "save" | "run") =>
-      api.commitPlan(planId, mode, mode === "run" ? commitBudget : null),
+      api.commitPlan(
+        planId,
+        mode,
+        mode === "run" ? commitBudget : null,
+        mode === "run" ? commitReview : false,
+        mode === "run" ? commitAccept : false,
+      ),
     onSuccess: (_result, mode) => {
       setCommitOpen(false);
       messageApi.success(
         mode === "run" ? "已提交并创建运行，可在页头打开运行详情" : "已保存为已提交计划",
       );
       client.invalidateQueries({ queryKey: ["plan", planId] });
+      client.invalidateQueries({ queryKey: ["plan-phases"] });
+      client.invalidateQueries({ queryKey: ["plan-activity"] });
       client.invalidateQueries({ queryKey: ["plans"] });
     },
     onError: (error: Error) => messageApi.error(error.message),
   });
+
+  const phasesQuery = useQuery({
+    queryKey: ["plan-phases", planId, snapshot?.version ?? 0, tasks.length],
+    queryFn: () => api.planPhases(planId),
+    enabled: Boolean(planId) && tasks.length > 0,
+  });
+
+  const activityQuery = useQuery({
+    queryKey: ["plan-activity", planId, snapshot?.version ?? 0],
+    queryFn: () => api.planActivity(planId, 60),
+    enabled: Boolean(planId) && view === "activity",
+  });
+
+  const errorUids = useMemo(
+    () => new Set(errors.map((error) => error.task_uid).filter(Boolean) as string[]),
+    [errors],
+  );
 
   if (!plan || !detail) {
     return (
@@ -391,6 +389,7 @@ export default function PlanPage() {
           </div>
         </div>
         <div className="plan-head-actions">
+          <Button icon={<FileTextOutlined />} onClick={() => setSourceOpen(true)}>设计来源</Button>
           <Button icon={<ReloadOutlined />} onClick={() => planQuery.refetch()}>刷新</Button>
           {generating ? (
             <Button danger onClick={() => cancel.mutate()} loading={cancel.isPending}>取消生成</Button>
@@ -409,6 +408,8 @@ export default function PlanPage() {
               icon={<RocketOutlined />}
               onClick={() => {
                 setCommitBudget(plan.budget_tokens ?? null);
+                setCommitReview(true);
+                setCommitAccept(true);
                 setCommitOpen(true);
               }}
             >
@@ -445,49 +446,48 @@ export default function PlanPage() {
         {plan.error ? <span className="plan-status-error">ERROR · {plan.error}</span> : null}
       </div>
 
-      <div className="plan-station-top">
-        <div className="plan-station-metrics">
-          <span><small>TASKS</small><b>{metrics.task_count ?? tasks.length}</b></span>
-          <span><small>WAVES</small><b>{metrics.wave_count ?? "—"}</b></span>
-          <span><small>PARALLEL</small><b>{metrics.max_parallel ?? "—"}</b></span>
-          <span><small>CRITICAL</small><b>{metrics.critical_path_tasks ?? "—"}<em>/{metrics.critical_path_points ?? "—"}pt</em></b></span>
-          <span><small>TOTAL</small><b>{metrics.total_points ?? "—"}<em>pt</em></b></span>
-          {coverage && coverage.total > 0 ? (
-            <span className={coverage.covered < coverage.total ? "is-warn" : "is-ok"}>
-              <small>COVERAGE</small>
-              <b>{coverage.covered}<em>/{coverage.total} 章</em></b>
-            </span>
-          ) : null}
-        </div>
-        <div className="plan-tabs" role="tablist" aria-label="编排视图">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === "graph"}
-            className={view === "graph" ? "is-active" : ""}
-            onClick={() => setView("graph")}
-          >
-            执行图 <span>GRAPH</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === "table"}
-            className={view === "table" ? "is-active" : ""}
-            onClick={() => setView("table")}
-          >
-            任务表 <span>TABLE</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === "source"}
-            className={view === "source" ? "is-active" : ""}
-            onClick={() => setView("source")}
-          >
-            设计来源 <span>SOURCE</span>
-          </button>
-        </div>
+      <div className="plan-tabbar" role="tablist" aria-label="编排视图">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "detail"}
+          className={view === "detail" ? "is-active" : ""}
+          onClick={() => setView("detail")}
+        >
+          任务详情 <span>TASK DETAILS</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "monitor"}
+          className={view === "monitor" ? "is-active" : ""}
+          onClick={() => setView("monitor")}
+        >
+          流程监控 <span>FLOW MONITOR</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "activity"}
+          className={view === "activity" ? "is-active" : ""}
+          onClick={() => setView("activity")}
+        >
+          活动 <span>ACTIVITY</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "graph"}
+          className={view === "graph" ? "is-active" : ""}
+          onClick={() => setView("graph")}
+        >
+          执行图 <span>DEPENDENCY</span>
+        </button>
+        <span className="plan-tabbar-meta">
+          {phasesQuery.data
+            ? `${phasesQuery.data.phase_count} 阶段 · ${phasesQuery.data.total_tasks} 任务`
+            : snapshot ? `快照 v${snapshot.version}` : "尚未生成"}
+        </span>
       </div>
 
       {generating || genText ? (
@@ -526,208 +526,221 @@ export default function PlanPage() {
       ) : null}
 
       <div className={`plan-station${empty ? " is-empty" : ""}`}>
-        <PlanTaskNav
-          tasks={tasks}
-          snapshot={snapshot}
-          selected={selectedUid}
-          onSelect={selectTask}
-          onInspect={() => setInspectorOpen(true)}
+        <PlanPhaseNav
+          phases={phasesQuery.data}
+          loading={phasesQuery.isLoading}
+          selectedUid={selectedUid}
+          errorUids={errorUids}
+          onSelect={openTask}
         />
 
-        <section className="plan-stage plan-stage-station">
-          <div className="plan-stage-head">
+        <section className="plan-content">
+          <div className="plan-content-head">
             <div>
               <b>编排工作台 / WORKSTATION</b>
               <span>
-                {snapshot ? `快照 v${snapshot.version} · ${Object.keys(waveMap).length} 波次` : "尚未生成"}
+                {snapshot
+                  ? `快照 v${snapshot.version} · ${phasesQuery.data?.phase_count ?? 0} 阶段 · ${tasks.length} 任务`
+                  : "尚未生成"}
               </span>
             </div>
             <div className="plan-stage-tools">
-              <Button size="small" className="plan-detail-btn" onClick={() => setFitTick((value) => value + 1)}>
-                全览
-              </Button>
-              <Button size="small" className="plan-detail-btn" onClick={() => setResetTick((value) => value + 1)}>
-                重置布局
-              </Button>
-              <Button size="small" className="plan-detail-btn" icon={<HistoryOutlined />} onClick={() => setHistoryOpen(true)}>
+              {view === "graph" ? (
+                <>
+                  <Button size="small" className="plan-detail-btn" onClick={() => setFitTick((value) => value + 1)}>
+                    全览
+                  </Button>
+                  <Button size="small" className="plan-detail-btn" onClick={() => setResetTick((value) => value + 1)}>
+                    重置布局
+                  </Button>
+                </>
+              ) : null}
+              <Button
+                size="small"
+                className="plan-detail-btn"
+                icon={<HistoryOutlined />}
+                onClick={() => setHistoryOpen(true)}
+              >
                 历史
               </Button>
-              <Button size="small" className="plan-detail-btn" onClick={() => setInspectorOpen(true)}>
-                任务详情
-              </Button>
               <span className="plan-stage-mode">
-                {view === "graph" ? "DEPENDENCY GRAPH" : view === "table" ? "TASK REGISTER" : "DESIGN SOURCE"}
+                {view === "graph"
+                  ? "DEPENDENCY GRAPH"
+                  : view === "monitor"
+                    ? "FLOW MONITOR"
+                    : view === "activity"
+                      ? "ACTIVITY"
+                      : "TASK DETAILS"}
               </span>
             </div>
           </div>
 
-          <div className="plan-stage-body">
-            {view === "graph" && coverage && coverage.total > 0 ? (
-              <div className="plan-coverage">
-                <div className="plan-coverage-head">
-                  <b>设计覆盖 / COVERAGE</b>
-                  <span>{coverage.covered}/{coverage.total} 章节有任务承接</span>
-                  {coverage.uncovered.length > 0 ? (
-                    <em>{coverage.uncovered.length} 个章节还没有任务{warnings.length ? ` · ${warnings.length} 条提示` : ""}</em>
-                  ) : (
-                    <em className="is-ok">全部章节已承接</em>
-                  )}
-                </div>
-                <div className="plan-coverage-list">
-                  {coverage.sections.map((section) => {
-                    const focused = focusSection === section.key;
-                    const lost = !section.tasks.length;
-                    return (
-                      <button
-                        key={`${section.key}-${section.line}`}
-                        type="button"
-                        className={[
-                          "plan-coverage-chip",
-                          lost ? "is-open" : "",
-                          focused ? "is-focus" : "",
-                        ].join(" ").trim()}
-                        title={lost
-                          ? `${section.title} · 暂无任务承接`
-                          : `${section.title} · ${section.tasks.join(" / ")}`}
-                        onClick={() => {
-                          if (lost) {
-                            messageApi.info("该章节还没有任务：在任务表新增任务，并把「设计章节」指向它");
-                            return;
-                          }
-                          setFocusSection(focused ? null : section.key);
-                          if (!focused && section.tasks[0]) setSelectedUid(section.tasks[0]);
-                        }}
-                      >
-                        <span>{section.title}</span>
-                        <b>{lost ? "—" : section.tasks.length}</b>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : null}
+          <div className={`plan-content-body is-${view}`}>
             {empty ? (
               <div className="plan-empty">
                 <b>空 · 等待生成</b>
-                <span>PM 会依据章节索引提出 8–40 个任务；程序负责校验、分波与关键路径。</span>
+                <span>PM 会依据章节索引提出 8–40 个任务；程序负责校验、分阶段与关键路径。</span>
               </div>
-            ) : view === "graph" ? (
-              snapshot?.validation && !snapshot.validation.ok && !Object.keys(waveMap).length ? (
-                <div className="plan-graph-blocked">
-                  <b>依赖关系无效 · 波次无法计算</b>
-                  <span>先修复上方校验错误；重新校验通过后会自动绘制依赖图。仍可切到「任务表」逐条编辑。</span>
-                </div>
-              ) : (
-                <>
-                  <PlanGraph
-                    tasks={tasks}
-                    snapshot={snapshot}
-                    layout={planLayout}
-                    selected={selectedUid}
-                    focusUids={focusUids}
-                    onSelect={selectTask}
-                    onMoveNodes={moveNodes}
-                    onAddDep={addDependency}
-                    onRemoveDep={removeDependency}
-                    onRename={renameTask}
-                    fitToken={fitTick}
-                    resetToken={resetTick}
-                  />
-                  <div className="plan-graph-legend">
-                    <span className="plan-canvas-hint">拖动节点自动保存 · 右侧手柄拖到目标左侧新增依赖 · 点击连线删除 · 双击改名 · Ctrl+Z 撤销</span>
-                    <span><i className="plan-key is-normal" />普通依赖</span>
-                    <span><i className="plan-key is-critical" />关键路径</span>
-                    <span><i className="plan-key is-handoff" />跨角色交接</span>
-                    <span><i className="plan-key is-error" />校验错误</span>
-                    <span className="plan-legend-roles">
-                      {Object.entries(ROLE_META).map(([key, meta]) => (
-                        <em key={key}><i style={{ background: meta.color }} />{meta.label}</em>
-                      ))}
-                    </span>
-                    <span className="plan-graph-foot">
-                      {Object.keys(waveMap).length} WAVES · 选中节点看链路 · 点章节聚焦
-                    </span>                  </div>
-                </>
-              )
-            ) : view === "table" ? (
-              <div className="plan-table">
-                <Table
-                  rowKey="task_uid"
-                  size="small"
-                  columns={COLUMNS}
-                  dataSource={tasks}
-                  pagination={false}
-                  rowClassName={(task) => [
-                    selectedUid === task.task_uid ? "is-selected" : "",
-                    errors.some((error) => error.task_uid === task.task_uid) ? "is-error" : "",
-                  ].join(" ").trim()}
-                  onRow={(task) => ({ onClick: () => selectTask(task.task_uid) })}
+            ) : view === "detail" ? (
+              <div className="plan-detail-pane">
+                <PlanInspector
+                  plan={plan}
+                  tasks={tasks}
+                  selected={selected}
+                  errors={errors}
+                  onSaved={(task) => {
+                    const previous = tasks.find((item) => item.task_uid === task.task_uid);
+                    if (previous) {
+                      pushUndo({
+                        label: "保存任务详情",
+                        run: async () => {
+                          await api.patchPlanTask(planId, previous.task_uid, {
+                            title: previous.title,
+                            description: previous.description,
+                            deps: previous.deps,
+                            design_section: previous.design_section,
+                            acceptance: previous.acceptance,
+                            role_key: previous.role_key,
+                            effort: previous.effort,
+                            priority: previous.priority,
+                          });
+                        },
+                      });
+                    }
+                    setSelectedUid(task.task_uid);
+                    client.invalidateQueries({ queryKey: ["plan", planId] });
+                    client.invalidateQueries({ queryKey: ["plan-phases"] });
+                    scheduleValidate();
+                  }}
+                  onCreated={(task) => {
+                    pushUndo({
+                      label: "新建任务",
+                      run: () => api.deletePlanTask(planId, task.task_uid).then(() => undefined),
+                    });
+                    setSelectedUid(task.task_uid);
+                    client.invalidateQueries({ queryKey: ["plan", planId] });
+                    client.invalidateQueries({ queryKey: ["plan-phases"] });
+                    scheduleValidate();
+                  }}
+                  onDeleted={(uid) => {
+                    if (selectedUid === uid) setSelectedUid(null);
+                    client.invalidateQueries({ queryKey: ["plan", planId] });
+                    client.invalidateQueries({ queryKey: ["plan-phases"] });
+                    scheduleValidate();
+                  }}
+                  locked={plan.status === "committed" || plan.status === "archived"}
                 />
               </div>
+            ) : view === "monitor" ? (
+              <PlanTwinGraph
+                phases={phasesQuery.data}
+                selectedUid={selectedUid}
+                onSelect={openTask}
+              />
+            ) : view === "activity" ? (
+              <PlanActivity items={activityQuery.data?.items} loading={activityQuery.isLoading} />
             ) : (
-              <div className="plan-source-inline">
-                <PlanSourcePanel plan={plan} />
+              <div className="plan-graph-pane">
+                {coverage && coverage.total > 0 ? (
+                  <div className="plan-coverage">
+                    <div className="plan-coverage-head">
+                      <b>设计覆盖 / COVERAGE</b>
+                      <span>{coverage.covered}/{coverage.total} 章节有任务承接</span>
+                      {coverage.uncovered.length > 0 ? (
+                        <em>{coverage.uncovered.length} 个章节还没有任务{warnings.length ? ` · ${warnings.length} 条提示` : ""}</em>
+                      ) : (
+                        <em className="is-ok">全部章节已承接</em>
+                      )}
+                    </div>
+                    <div className="plan-coverage-list">
+                      {coverage.sections.map((section) => {
+                        const focused = focusSection === section.key;
+                        const lost = !section.tasks.length;
+                        return (
+                          <button
+                            key={`${section.key}-${section.line}`}
+                            type="button"
+                            className={[
+                              "plan-coverage-chip",
+                              lost ? "is-open" : "",
+                              focused ? "is-focus" : "",
+                            ].join(" ").trim()}
+                            title={lost
+                              ? `${section.title} · 暂无任务承接`
+                              : `${section.title} · ${section.tasks.join(" / ")}`}
+                            onClick={() => {
+                              if (lost) {
+                                messageApi.info("该章节还没有任务：在任务详情里新增任务，并把「设计章节」指向它");
+                                return;
+                              }
+                              setFocusSection(focused ? null : section.key);
+                              if (!focused && section.tasks[0]) setSelectedUid(section.tasks[0]);
+                            }}
+                          >
+                            <span>{section.title}</span>
+                            <b>{lost ? "—" : section.tasks.length}</b>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+
+                {snapshot?.validation && !snapshot.validation.ok && !Object.keys(snapshot.waves ?? {}).length ? (
+                  <div className="plan-graph-blocked">
+                    <b>依赖关系无效 · 阶段无法计算</b>
+                    <span>先修复上方校验错误；重新校验通过后会自动绘制依赖图。仍可在「任务详情」里逐条编辑。</span>
+                  </div>
+                ) : (
+                  <>
+                    <PlanGraph
+                      tasks={tasks}
+                      snapshot={snapshot}
+                      layout={planLayout}
+                      selected={selectedUid}
+                      focusUids={focusUids}
+                      onSelect={selectTask}
+                      onMoveNodes={moveNodes}
+                      onAddDep={addDependency}
+                      onRemoveDep={removeDependency}
+                      onRename={renameTask}
+                      fitToken={fitTick}
+                      resetToken={resetTick}
+                    />
+                    <div className="plan-graph-legend">
+                      <span className="plan-canvas-hint">拖动节点自动保存 · 右侧手柄拖到目标左侧新增依赖 · 点击连线删除 · 双击改名 · Ctrl+Z 撤销</span>
+                      <span><i className="plan-key is-normal" />普通依赖</span>
+                      <span><i className="plan-key is-critical" />关键路径</span>
+                      <span><i className="plan-key is-handoff" />跨角色交接</span>
+                      <span><i className="plan-key is-error" />校验错误</span>
+                      <span className="plan-legend-roles">
+                        {Object.entries(ROLE_META).map(([key, meta]) => (
+                          <em key={key}><i style={{ background: meta.color }} />{meta.label}</em>
+                        ))}
+                      </span>
+                      <span className="plan-graph-foot">
+                        {phasesQuery.data?.phase_count ?? 0} PHASES · 选中节点看链路 · 点章节聚焦
+                      </span>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
         </section>
-
-        <div className={`plan-inspector-wrap${inspectorOpen ? " is-open" : ""}`}>
-          <button
-            type="button"
-            className="plan-drawer-close"
-            aria-label="关闭任务详情"
-            onClick={() => setInspectorOpen(false)}
-          >
-            ×
-          </button>
-          <PlanInspector
-            plan={plan}
-            tasks={tasks}
-            selected={selected}
-            errors={errors}
-            onSaved={(task) => {
-              const previous = tasks.find((item) => item.task_uid === task.task_uid);
-              if (previous) {
-                pushUndo({
-                  label: "保存任务详情",
-                  run: async () => {
-                    await api.patchPlanTask(planId, previous.task_uid, {
-                      title: previous.title,
-                      description: previous.description,
-                      deps: previous.deps,
-                      design_section: previous.design_section,
-                      acceptance: previous.acceptance,
-                      role_key: previous.role_key,
-                      effort: previous.effort,
-                      priority: previous.priority,
-                    });
-                  },
-                });
-              }
-              setSelectedUid(task.task_uid);
-              client.invalidateQueries({ queryKey: ["plan", planId] });
-              scheduleValidate();
-            }}
-            onCreated={(task) => {
-              pushUndo({ label: "新建任务", run: () => api.deletePlanTask(planId, task.task_uid).then(() => undefined) });
-              setSelectedUid(task.task_uid);
-              client.invalidateQueries({ queryKey: ["plan", planId] });
-              scheduleValidate();
-            }}
-            onDeleted={(uid) => {
-              if (selectedUid === uid) setSelectedUid(null);
-              client.invalidateQueries({ queryKey: ["plan", planId] });
-              scheduleValidate();
-            }}
-          />
-        </div>
       </div>
 
-      <div
-        className={`plan-drawer-backdrop${inspectorOpen ? " is-open" : ""}`}
-        onClick={() => setInspectorOpen(false)}
-      />
+      <Modal
+        title="设计来源"
+        open={sourceOpen}
+        footer={null}
+        width={760}
+        onCancel={() => setSourceOpen(false)}
+      >
+        <div className="plan-source-modal">
+          <PlanSourcePanel plan={plan} />
+        </div>
+      </Modal>
 
       <Modal
         title="快照历史"
@@ -785,7 +798,8 @@ export default function PlanPage() {
       >
         <p className="plan-commit-note">
           提交后计划将锁定为已提交。仅保存不创建运行；创建运行会按依赖写入
-          dev_* 节点（同一波并行、跨波串行），末尾追加一个 verify 节点，然后立即开始执行。
+          dev_* 节点（同一波并行、跨波串行），末尾追加一个 verify 节点；
+          可选代码评审 Agent 与验收人工门，门通过后才结束运行。
         </p>
         <Radio.Group
           value={commitMode}
@@ -811,8 +825,31 @@ export default function PlanPage() {
           />
           <em>tokens · 留空用系统默认</em>
         </div>
+        <div className="plan-commit-flags">
+          <Checkbox
+            checked={commitReview}
+            disabled={commitMode !== "run"}
+            onChange={(event) => setCommitReview(event.target.checked)}
+          >
+            追加代码评审 Agent
+          </Checkbox>
+          <Checkbox
+            checked={commitAccept}
+            disabled={commitMode !== "run"}
+            onChange={(event) => setCommitAccept(event.target.checked)}
+          >
+            追加验收人工门
+          </Checkbox>
+          <em>评审发现阻塞问题时自动退回对应任务，最多返工 2 轮</em>
+        </div>
         <div className="plan-commit-facts">
-          <span><AimOutlined /> {tasks.length} 任务 · {tasks.length + 1} 节点 · {metrics.wave_count ?? "—"} 波次</span>
+          <span>
+            <AimOutlined /> {tasks.length} 任务 ·{" "}
+            {commitMode === "run"
+              ? tasks.length + 1 + (commitReview ? 1 : 0) + (commitAccept ? 1 : 0)
+              : 0}{" "}
+            节点 · {metrics.wave_count ?? "—"} 波次
+          </span>
           <span><HistoryOutlined /> {snapshot ? `快照 v${snapshot.version}` : "无快照"}</span>
           <span><CheckOutlined /> 预算 {(commitBudget ?? plan.budget_tokens ?? 0).toLocaleString()} tokens</span>
         </div>

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  Button, Form, Input, InputNumber, Modal, Select, Space, Table, Tooltip, message,
+  Button, Form, Input, InputNumber, Modal, Select, Space, Table, message,
 } from "antd";
 import { EditOutlined } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -15,6 +15,7 @@ export default function TemplatesPage() {
   const client = useQueryClient();
   const [messageApi, contextHolder] = message.useMessage();
   const [modal, setModal] = useState<{ open: boolean; edit?: AgentTemplate }>({ open: false });
+  const [promptView, setPromptView] = useState<{ open: boolean; row?: AgentTemplate }>({ open: false });
   const [form] = Form.useForm();
 
   const templates = useQuery({ queryKey: ["templates"], queryFn: api.templates });
@@ -49,11 +50,20 @@ export default function TemplatesPage() {
       </div>
 
       <div className="am-card" style={{ padding: 8 }}>
+        <div className="tpl-toolbar">
+          <span>
+            共 {templates.data?.items.length ?? 0} 个角色
+            <em>模型绑定后，运行时优先用该角色绑定的模型</em>
+          </span>
+          <span className="tpl-toolbar-hint">滚轮滚动列表 · 点击提示词查看全文</span>
+        </div>
         <Table
           rowKey="id" size="middle" loading={templates.isLoading}
+          className="tpl-table"
           dataSource={templates.data?.items ?? []} pagination={false}
+          scroll={{ y: "calc(100vh - 400px)" }}
           columns={[
-            { title: "角色", dataIndex: "name", width: 160,
+            { title: "角色", dataIndex: "name", width: 150,
               render: (name: string, row: AgentTemplate) => (
                 <div>
                   <div style={{ fontWeight: 600 }}>{name}</div>
@@ -61,10 +71,14 @@ export default function TemplatesPage() {
                 </div>
               ) },
             { title: "系统提示词", dataIndex: "system_prompt", ellipsis: true,
-              render: (prompt: string) => (
-                <Tooltip title={<pre style={{ margin: 0, whiteSpace: "pre-wrap", maxWidth: 560 }}>{prompt}</pre>}>
-                  <span style={{ color: "#4b5563" }}>{prompt}</span>
-                </Tooltip>
+              render: (prompt: string, row: AgentTemplate) => (
+                <span
+                  className="tpl-prompt"
+                  title="点击查看全文"
+                  onClick={() => setPromptView({ open: true, row })}
+                >
+                  {prompt}
+                </span>
               ) },
             { title: "工具", dataIndex: "tools_json", width: 190,
               render: (tools: string[]) => tools.length
@@ -122,6 +136,16 @@ export default function TemplatesPage() {
             <Input.TextArea autoSize={{ minRows: 10, maxRows: 22 }} className="am-mono" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title={`系统提示词：${promptView.row?.name ?? ""}`}
+        open={promptView.open}
+        width={780}
+        onCancel={() => setPromptView({ open: false })}
+        footer={<Button onClick={() => setPromptView({ open: false })}>关闭</Button>}
+      >
+        <pre className="tpl-prompt-body">{promptView.row?.system_prompt || "（空）"}</pre>
       </Modal>
     </div>
   );

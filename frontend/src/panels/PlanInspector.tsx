@@ -14,6 +14,7 @@ interface Props {
   onSaved: (task: PlanTask) => void;
   onCreated: (task: PlanTask) => void;
   onDeleted: (uid: string) => void;
+  locked?: boolean;
 }
 
 const ROLES: Array<{ value: TaskRole; label: string }> = [
@@ -63,7 +64,7 @@ function toDraft(task: PlanTask): Draft {
 }
 
 export default function PlanInspector({
-  plan, tasks, selected, errors, onSaved, onCreated, onDeleted,
+  plan, tasks, selected, errors, onSaved, onCreated, onDeleted, locked = false,
 }: Props) {
   const [draft, setDraft] = useState<Draft | null>(selected ? toDraft(selected) : null);
   const [saving, setSaving] = useState(false);
@@ -176,7 +177,7 @@ export default function PlanInspector({
         {holder}
         <div className="plan-panel-head">
           <b>任务详情 / INSPECT</b>
-          <Button size="small" icon={<PlusOutlined />} onClick={create} loading={saving}>新增</Button>
+          <Button size="small" icon={<PlusOutlined />} disabled={locked} onClick={create} loading={saving}>新增</Button>
         </div>
         <div className="plan-empty">
           <b>未选中任务</b>
@@ -193,6 +194,9 @@ export default function PlanInspector({
         <b>任务详情 / INSPECT</b>
         <span className="plan-kicker">{selected.task_uid}</span>
         {dirty ? <span className="plan-dirty">未保存</span> : null}
+        {locked ? (
+          <div className="plan-locked-note">计划已提交，任务详情只读；如需修改请在提交前操作。</div>
+        ) : null}
       </div>
 
       {selectedErrors.length > 0 ? (
@@ -210,6 +214,7 @@ export default function PlanInspector({
         <span>标题 · TITLE</span>
         <Input
           value={draft.title}
+          disabled={locked}
           maxLength={40}
           onChange={(event) => edit({ ...draft, title: event.target.value })}
         />
@@ -220,6 +225,7 @@ export default function PlanInspector({
         <Input.TextArea
           rows={4}
           value={draft.description}
+          disabled={locked}
           onChange={(event) => edit({ ...draft, description: event.target.value })}
         />
       </label>
@@ -229,6 +235,7 @@ export default function PlanInspector({
           <span>角色 · ROLE</span>
           <Select
             value={draft.role_key}
+            disabled={locked}
             options={ROLES}
             onChange={(value) => edit({ ...draft, role_key: value })}
           />
@@ -237,6 +244,7 @@ export default function PlanInspector({
           <span>工作量 · EFFORT</span>
           <Select
             value={draft.effort}
+            disabled={locked}
             options={EFFORTS}
             onChange={(value) => edit({ ...draft, effort: value })}
           />
@@ -248,6 +256,7 @@ export default function PlanInspector({
           <span>优先级 · PRIORITY</span>
           <Select
             value={draft.priority}
+            disabled={locked}
             options={PRIORITIES}
             onChange={(value) => edit({ ...draft, priority: value })}
           />
@@ -257,6 +266,7 @@ export default function PlanInspector({
           <Select
             showSearch
             value={draft.design_section || undefined}
+            disabled={locked}
             options={sectionOptions}
             onChange={(value) => edit({ ...draft, design_section: value })}
             placeholder="选择章节"
@@ -270,6 +280,7 @@ export default function PlanInspector({
           mode="multiple"
           allowClear
           value={draft.deps}
+          disabled={locked}
           options={depsOptions}
           onChange={(value) => edit({ ...draft, deps: value })}
           placeholder="无依赖"
@@ -281,10 +292,12 @@ export default function PlanInspector({
         <Input.TextArea
           rows={4}
           value={draft.acceptance}
+          disabled={locked}
           onChange={(event) => edit({ ...draft, acceptance: event.target.value })}
         />
       </label>
 
+      {locked ? null : (
       <div className="plan-actions">
         <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={save}>
           保存并校验
@@ -311,6 +324,7 @@ export default function PlanInspector({
           <Button danger icon={<DeleteOutlined />}>删除</Button>
         </Popconfirm>
       </div>
+      )}
     </aside>
   );
 }

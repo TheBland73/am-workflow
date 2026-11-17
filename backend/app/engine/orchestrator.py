@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Gate, Node, NodeAttempt, Run, Workflow
+from app.db.models import Gate, Node, NodeAttempt, Run, Task, Workflow
 from app.engine.events import emit
 from app.engine.gates import GateError, decide_gate as _decide_gate
 from app.engine.runners import NodeContext, NodeFailure, classify_failure, execute_node, lesson_for
@@ -195,6 +195,9 @@ class Orchestrator:
             heartbeat.cancel()
 
         self._finish_attempt(attempt_id)
+        if node["type"] == "REVIEW" and result.get("verdict") == "block":
+            await self._handle_review_block(run_id, node, attempt_id, attempt_no, result)
+            return
         self._update_node(node["id"], status="done", clear_feedback=True,
                           drop=["retry_at", "retry_count"])
         await emit(run_id, "node_finished", node["id"], {
@@ -254,6 +257,128 @@ class Orchestrator:
         await emit(run_id, "gate_requested", node["id"], {
             **gate, "reason": "达到最大重试次数，转人工", "escalation": True,
         })
+
+    # ---------- 评审回流 ----------
+    async def _handle_review_block(self, run_id: str, node: dict, attempt_id: int,
+                                   attempt_no: int, result: dict) -> None:
+        """评审阻塞：回退对应 dev 任务并重跑 verify/review；轮次用尽则转人工门。"""
+        config = dict(node.get("config") or {})
+        round_no = int(config.get("round") or 1)
+        max_rounds = max(1, int(config.get("max_rounds") or 2))
+        summary = str(result.get("summary") or "评审未通过")
+        _, nodes = self._load(run_id)
+        dev_nodes = {
+            n["node_key"][4:]: n for n in nodes if n["node_key"].startswith("dev_")
+        }
+        targets = [str(uid) for uid in (result.get("targets") or [])]
+        targets = [uid for uid in targets if uid in dev_nodes]
+        if not targets:
+            targets = [uid for uid, n in dev_nodes.items() if n["status"] == "done"]
+        message = summary
+        if result.get("blocking"):
+            message = f"{summary}（{result.get('blocking')} 个阻塞项）"
+
+        if round_no >= max_rounds:
+            reject = f"评审连续 {round_no} 轮未通过，返工轮次已用尽：{summary}"
+            self._update_node(
+                node["id"], status="waiting_human", feedback=reject, drop=["retry_at"],
+                extra={"escalation": True, "escalation_reason": reject},
+            )
+            from app.engine.gates import request_gate
+
+            gate = request_gate(run_id, node["id"], feedback=reject)
+            self._set_run(run_id, status="waiting_human")
+            await emit(run_id, "review_blocked", node["id"], {
+                "round": round_no, "max_rounds": max_rounds, "targets": targets,
+                "summary": summary[:500], "escalated": True,
+            })
+            await emit(run_id, "gate_requested", node["id"], {
+                **gate, "reason": "评审阻塞且返工轮次用尽", "escalation": True,
+            })
+            lesson_for(NodeContext(
+                run_id=run_id, node_id=node["id"], node_key=node["node_key"],
+                type=node["type"], name=node["name"], phase=node["phase"],
+                config=config, assignee=node.get("assignee") or {},
+                attempt_id=attempt_id, attempt_no=attempt_no,
+            ), reject)
+            return
+
+        # 回退：dev 目标 + verify + review 自身（review 轮次 +1）。
+        self._update_node(node["id"], status="pending", feedback=message,
+                          extra={"round": round_no + 1}, drop=["retry_at"])
+        for other in nodes:
+            if other["node_key"] == "verify" and other["status"] in ("done", "failed", "running"):
+                self._update_node(other["id"], status="pending", drop=["retry_at"])
+        with session_scope() as s:
+            for uid in targets:
+                row = (
+                    s.query(Task)
+                    .filter(Task.run_id == run_id, Task.task_uid == uid)
+                    .one_or_none()
+                )
+                if row is not None:
+                    row.status = "pending"
+        for uid in targets:
+            self._update_node(dev_nodes[uid]["id"], status="pending",
+                              feedback=message, drop=["retry_at"])
+        await emit(run_id, "review_blocked", node["id"], {
+            "round": round_no, "max_rounds": max_rounds, "targets": targets,
+            "issues": int(result.get("issues") or 0),
+            "blocking": int(result.get("blocking") or 0),
+            "summary": summary[:500], "escalated": False,
+        })
+        await emit(run_id, "node_log", node["id"], {
+            "level": "warn",
+            "message": (
+                f"评审第 {round_no}/{max_rounds} 轮发现阻塞，已回退 "
+                f"{', '.join(targets) or '（无目标）'} 并重跑验证"
+            ),
+        })
+
+    async def rework_review(self, run_id: str, task_uids: list[str],
+                            feedback: str | None = None) -> dict:
+        """人工从评审报告回退指定任务（评审面板的「回退选中任务」）。"""
+        with session_scope() as s:
+            run = s.get(Run, run_id)
+            if run is None:
+                raise GateError("运行不存在")
+            if run.status not in ("waiting_human", "failed"):
+                raise GateError("只有等待人工处理或失败的运行才能回退任务")
+        _, nodes = self._load(run_id)
+        dev_nodes = {
+            n["node_key"][4:]: n for n in nodes if n["node_key"].startswith("dev_")
+        }
+        wanted = [str(uid).strip().upper() for uid in task_uids if str(uid).strip().upper() in dev_nodes]
+        if not wanted:
+            raise GateError("没有可回退的任务")
+        review = next((n for n in nodes if n["type"] == "REVIEW"), None)
+        verify = next((n for n in nodes if n["node_key"] == "verify"), None)
+        message = (feedback or "").strip() or "人工依据评审意见回退，请修复后重新提交验证。"
+        for uid in wanted:
+            self._update_node(dev_nodes[uid]["id"], status="pending",
+                              feedback=message, drop=["retry_at", "retry_count"])
+        if verify is not None:
+            self._update_node(verify["id"], status="pending", drop=["retry_at", "retry_count"])
+        if review is not None:
+            config = dict(review.get("config") or {})
+            round_no = int(config.get("round") or 1)
+            self._update_node(review["id"], status="pending", feedback=message,
+                              extra={"round": round_no + 1}, drop=["retry_at"])
+        with session_scope() as s:
+            for uid in wanted:
+                row = (
+                    s.query(Task)
+                    .filter(Task.run_id == run_id, Task.task_uid == uid)
+                    .one_or_none()
+                )
+                if row is not None:
+                    row.status = "pending"
+        self._set_run(run_id, status="running")
+        await emit(run_id, "review_rework", review["id"] if review else None, {
+            "targets": wanted, "feedback": message[:500],
+        })
+        self.kick(run_id)
+        return {"run_id": run_id, "targets": wanted, "feedback": message}
 
     # ---------- 门决策入口（供 API 调用） ----------
     async def decide_gate(self, *, gate_id: int, action: str, feedback: str | None = None,

@@ -129,6 +129,9 @@ class PlanCommit(BaseModel):
     status: str = "pending"
     # 可选：本次运行的 token 预算；不传则用系统默认。
     budget_tokens: int | None = None
+    # run 模式下追加「代码评审节点」与「验收门」；默认开启，可显式关闭。
+    review: bool = True
+    accept_gate: bool = True
 
 
 class PlanLayout(BaseModel):
