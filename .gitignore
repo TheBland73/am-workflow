@@ -26,3 +26,8 @@ frontend/.vite/
 .DS_Store
 Thumbs.db
 frontend/.tmp-build/
+
+# 插件状态（video2code / video-agent-kit / 渲染输出）
+.v2c/
+.video_agent/
+out/
