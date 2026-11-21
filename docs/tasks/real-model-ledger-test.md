@@ -5,7 +5,7 @@
 
 - 配套需求规格：[`docs/tasks/ledger-idea.txt`](ledger-idea.txt)（直接粘贴到“新建运行”的输入框）
 - 预计耗时：20–40 分钟（取决于模型速度）
-- 建议预算：`300000` tokens（19 个节点、含讨论与重试）
+- 建议预算：`300000` tokens（21 个左右的节点、含三方讨论与重试）
 - 建议并发：`AM_NODE_CONCURRENCY=2`，避免真实供应商限流
 
 ## 0. 一页速览
@@ -14,7 +14,7 @@
 |---|------|------|------|
 | 1 | 启动 | `uvicorn app.main:app --port 8099` | 打开 `http://127.0.0.1:8099` |
 | 2 | 接模型 | 供应商页新增 DeepSeek + `deepseek-chat` | 连接测试通过 |
-| 3 | 绑角色 | 角色页把 9 个角色绑到该模型 | 无“尚未配置”报错 |
+| 3 | 绑角色 | 角色页把 10 个角色绑到该模型 | 无“尚未配置”报错 |
 | 4 | 建运行 | 粘贴 `ledger-idea.txt`，预算 300000 | 运行进入 `idea` |
 | 5 | 过 5 个门 | 方案 → 需求 → 设计 → 任务图 → 验收 | 每次通过后自动续跑 |
 | 6 | 验收 | 手工跑 CLI + `unittest` | 全绿，工件齐 |
@@ -49,9 +49,11 @@ cd backend
    下拉可自动填入模型名。
 5. 点供应商行的「测试」：有本地模型时会真发一句 8-token 对话，返回延迟与回复；模型行的 ⚗ 按钮
    可单独验证某个模型名（401 一般是 Key 错，404 一般是模型名或 Base URL 错）。
-6. 左侧「角色」→ 把 **9 个角色全部**绑定到该模型（`discuss_pro`、`discuss_con`、`proposal`、
-   `requirement`、`design`、`task_breaker`、`pm`、`dev`、`delivery`）。未绑定的角色会回退到
+6. 左侧「角色」→ 把 **10 个角色全部**绑定到该模型（`discuss_pro`、`discuss_con`、`discuss_mod`、
+   `proposal`、`requirement`、`design`、`task_breaker`、`pm`、`dev`、`delivery`）。未绑定的角色会回退到
    第一个可用模型；只有一个模型时能跑通，但多模型环境建议全绑，避免角色串用。
+   `discuss_mod`（讨论主持人）负责蒸馏共识与未决项，绑定后讨论阶段为
+   主张 → 质疑 → 回应 → 蒸馏四个节点。
 
 ### 2.2 脚本方式（可选，等价于上面的点击，一步到位）
 
@@ -92,7 +94,7 @@ $env:DEEPSEEK_API_KEY = "sk-..."
 
 ## 5. 验收清单
 
-- [ ] 运行状态 `finished`，`19` 个左右的节点全部 `done`（3 个 `dev_*` + 1 个 `verify` 是展开后新增的）。
+- [ ] 运行状态 `finished`，`21` 个左右的节点全部 `done`（模板 18 个；3 个 `dev_*` 是展开后新增的）。
 - [ ] 磁盘：`runs\<run_id>\artifacts\` 下有 idea/proposal/requirement/design/task/test/changelog 七类 `.md`；
       `runs\<run_id>\workspace\` 下有 `ledger.py`、`test_ledger.py`、`README.md`。
 - [ ] 手工跑 CLI（路径按实际 `run_id` 替换）：
