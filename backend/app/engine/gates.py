@@ -8,13 +8,39 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
+from app.artifacts.store import parse_front_matter
+from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Gate, Node, Run
+from app.db.models import Artifact, Gate, Node, Run
 
 
 class GateError(ValueError):
     pass
+
+
+def _pending_questions(s, run_id: str) -> list[str]:
+    """提取讨论稿蒸馏部分的未决项（`- [ ]` 行），供方案确认门卡片展示。
+
+    必须复用调用方 session（连接池 size=1，另开 session 会在池上死等）。
+    """
+    row = (
+        s.query(Artifact)
+        .filter(Artifact.run_id == run_id, Artifact.kind == "discussion",
+                Artifact.status == "active")
+        .order_by(Artifact.version.desc())
+        .first()
+    )
+    if row is None:
+        return []
+    path = Path(row.path)
+    if not path.is_absolute():
+        path = settings.base_dir / path
+    if not path.exists():
+        return []
+    _meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
+    return [line.strip() for line in body.splitlines() if line.strip().startswith("- [ ]")]
 
 
 def request_gate(run_id: str, node_id: int, feedback: str | None = None) -> dict:
@@ -29,9 +55,14 @@ def request_gate(run_id: str, node_id: int, feedback: str | None = None) -> dict
         if run:
             run.status = "waiting_human"
         s.flush()
+        description = (node.config_json or {}).get("description") or ""
+        if node.node_key == "gate_proposal":
+            pending = _pending_questions(s, run_id)
+            if pending:
+                description += "\n\n讨论未决项（需人工拍板）：\n" + "\n".join(pending)
         return {"id": gate.id, "run_id": run_id, "node_id": node_id, "status": "open",
                 "title": (node.config_json or {}).get("title") or node.name,
-                "description": (node.config_json or {}).get("description") or "",
+                "description": description,
                 "artifact": (node.config_json or {}).get("artifact")}
 
 
