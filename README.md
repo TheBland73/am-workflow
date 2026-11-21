@@ -47,10 +47,10 @@
 一次完整端到端运行（Mock 模型，含需求门驳回重做）：
 
 ```
-run 93c8a002d591  finished
+run 4e02c0f8928b  finished
 20 个节点全部 done（含三方讨论 4 节点）；requirement attempt=2（反馈被采纳，产出 R6 导出周报）
 7 类工件 active（过门后 front-matter 状态为 approved；discussion 随发言节点递增至 v4）；2 个开发任务完成；verify 退出码 0
-tokens: in 23,025 / out 3,527，预算 1,200,000 内
+tokens: in 23,098 / out 3,564，预算 1,200,000 内
 ```
 
 ---
