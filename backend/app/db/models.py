@@ -82,6 +82,9 @@ class AgentTemplate(Base):
     )
     max_steps: Mapped[int] = mapped_column(Integer, default=12)
     stop_condition: Mapped[list] = mapped_column(JSON, default=list)
+    # 内置模板指纹（内部字段，不进 API 序列化）：用于区分「内置定义未变的行」
+    # 与「用户经 PATCH 改过的行」，NULL 表示旧库遗留行（见 engine/templates.py）。
+    builtin_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
