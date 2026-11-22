@@ -84,6 +84,8 @@ export interface Gate {
   decided_by: string | null;
   created_at?: string | null;
   decided_at: string | null;
+  title?: string | null;
+  description?: string | null;
 }
 
 export interface ArtifactRecord {

@@ -38,8 +38,10 @@ export default function GateConsole({
   );
   const kind = (node?.config?.artifact as string) ?? "";
   const escalation = Boolean(node?.config?.escalation);
-  const title = String(node?.config?.title ?? node?.name ?? "人工审批");
-  const description = String(node?.config?.description ?? "");
+  // 快照里的 gate 行带 title/description（含方案确认门的讨论未决项），刷新后仍可见；
+  // 旧快照没有这两个字段时回退节点配置。
+  const title = String(gate?.title ?? node?.config?.title ?? node?.name ?? "人工审批");
+  const description = String(gate?.description ?? node?.config?.description ?? "");
 
   useEffect(() => {
     setFeedback("");
@@ -135,7 +137,14 @@ export default function GateConsole({
         </div>
       )}
       {description && (
-        <p style={{ fontSize: "0.74rem", color: "var(--ef-ink-2)", margin: "0.45rem 0 0" }}>
+        <p
+          style={{
+            fontSize: "0.74rem",
+            color: "var(--ef-ink-2)",
+            margin: "0.45rem 0 0",
+            whiteSpace: "pre-wrap",
+          }}
+        >
           {description}
         </p>
       )}

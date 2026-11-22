@@ -8,15 +8,42 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+from fastapi.testclient import TestClient
+
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
 from app.db.models import Node, Run, Workflow, new_run_id
 from app.engine import runners
-from app.engine.gates import request_gate
+from app.engine.gates import _pending_questions, get_gate, request_gate
+from app.engine.orchestrator import orchestrator
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
+from app.main import app
 from scripts.mock_provider import _pick
 
 DISCUSSION_NODES = ("discuss_pro", "discuss_con", "discuss_response", "discuss_mod")
+
+# 未决项段落作用域工件：段外（主张/证据）也放 `- [ ]`，用于验证只抓「未决项」段内。
+SCOPED_DISCUSSION = """# 三方讨论
+
+## 主张
+
+- [ ] 段外勾选项：主张里的待办，不属于未决项
+
+## 共识蒸馏
+
+### 共识
+
+- C1：先做单人闭环，实时协作延后。
+
+### 未决项
+
+- [ ] 段内一：人工门的具体位置
+- [ ] 段内二：实时协作的排期
+
+### 证据
+
+- [ ] 段外勾选项：证据段里的待办
+"""
 
 
 def _make_run() -> str:
@@ -95,3 +122,59 @@ def test_gate_proposal_description_includes_pending_questions(monkeypatch) -> No
     gate = request_gate(run_id, _node_id(run_id, "gate_proposal"))
     assert "讨论未决项" in gate["description"]
     assert "- [ ] 人工门的具体位置" in gate["description"]
+
+
+def test_get_gate_cold_read_keeps_pending_questions(monkeypatch) -> None:
+    """get_gate 走独立 session 冷读（模拟前端刷新/重载），未决项仍在。"""
+    run_id = _make_run()
+    _run_discussion_nodes(run_id, monkeypatch)
+    gate = request_gate(run_id, _node_id(run_id, "gate_proposal"))
+
+    cold = get_gate(gate["id"])
+    assert cold is not None
+    assert cold["title"] == gate["title"]
+    assert "讨论未决项" in cold["description"]
+    assert "- [ ] 人工门的具体位置" in cold["description"]
+    # 只追加一次，冷读不会把未决项段落再拼一遍。
+    assert cold["description"].count("讨论未决项（需人工拍板）：") == 1
+
+
+def test_snapshot_gate_row_includes_pending_questions(monkeypatch) -> None:
+    """GET /api/runs/{run_id} 快照的 gate 行带 description，刷新后卡片仍可见未决项。"""
+    run_id = _make_run()
+    _run_discussion_nodes(run_id, monkeypatch)
+    gate = request_gate(run_id, _node_id(run_id, "gate_proposal"))
+
+    async def no_recover() -> None:
+        # 不启动编排器：否则本进程其他用例遗留的 running run 会被拉起并调用模型。
+        return None
+
+    monkeypatch.setattr(orchestrator, "recover", no_recover)
+    with TestClient(app) as client:
+        response = client.get(f"/api/runs/{run_id}")
+    assert response.status_code == 200, response.text
+    row = next(item for item in response.json()["gates"] if item["id"] == gate["id"])
+    assert row["status"] == "open"
+    assert row["node_key"] == "gate_proposal"
+    assert row["title"] == gate["title"]
+    assert row["created_at"]
+    assert "讨论未决项" in row["description"]
+    assert "- [ ] 人工门的具体位置" in row["description"]
+
+
+def test_pending_questions_limited_to_pending_section() -> None:
+    run_id = _make_run()
+    write_artifact(run_id, "discussion", SCOPED_DISCUSSION, created_by="test", inputs=[])
+    with session_scope() as s:
+        items = _pending_questions(s, run_id)
+    assert items == ["- [ ] 段内一：人工门的具体位置", "- [ ] 段内二：实时协作的排期"]
+
+
+def test_pending_questions_falls_back_to_full_scan_without_heading() -> None:
+    """旧工件没有「未决项」标题：退回全文扫描，保持原有行为。"""
+    run_id = _make_run()
+    body = "# 旧讨论稿\n\n## 待办\n\n- [ ] 旧格式问题一\n- [ ] 旧格式问题二\n"
+    write_artifact(run_id, "discussion", body, created_by="test", inputs=[])
+    with session_scope() as s:
+        items = _pending_questions(s, run_id)
+    assert items == ["- [ ] 旧格式问题一", "- [ ] 旧格式问题二"]
