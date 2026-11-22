@@ -9,11 +9,10 @@
 
 设计依据（已合入 main，见 `docs/`）：
 
-- `docs/设计规格说明书.md`：实现基线 v0.2（§4 数据模型、§5 API、§6 全流程、§7 排期）
+- `docs/设计规格说明书.md`：设计基线 v0.2（W1 已实现 8 阶段 / 18 节点；评审、测试、部署为后续迭代设计）
 - `docs/research/前沿技术调研与技术选型.md`：选型论据（§11 增补：评审/测试/分布式专项）
 - `docs/评审与测试体系设计.md`：三级评审 + 四级测试 + 缺陷闭环 + 质量钩子 + 调度拆屏障（模块详设）
 - `docs/分布式执行模式设计.md`：多 PC 协作模式（**封存仅设计**，单机模式是主线）
-- `docs/tasks/三方讨论-开发工单.md`：本周开发任务（临时工单，完成后删除）
 - `docs/模型接入配置设计.md`：Provider / Model / Binding 与上下文预算
 - `docs/迭代优化-可靠执行.md`：并发闸门 / 超时 / 退避 / 心跳 / 指标（对标 Temporal、Airflow、Prefect）
 - `docs/迭代优化-可交互编排画布.md`：React Flow 画布、坐标/依赖落库、设计覆盖率
@@ -30,7 +29,7 @@
 | 后端 API（FastAPI + SQLAlchemy + SQLite WAL） | ✅ 可运行 |
 | 编排引擎（依赖就绪并发、重试、门禁、恢复） | ✅ |
 | 可靠执行（全局并发闸门 / 节点超时 / 指数退避 / attempt 心跳 / 取消收据 / 运行指标） | ✅ 迭代一期 |
-| 固定 SDLC 模板（8 阶段 / 16 节点，展开后追加 `dev_*` 与 `verify`） | ✅ |
+| 固定 SDLC 模板（8 阶段 / 18 节点，讨论含主张/质疑/回应/蒸馏 4 节点，展开后追加 `dev_*`） | ✅ |
 | 人工门（通过 / 驳回+反馈+回退 / 编辑后通过） | ✅ 5 个门 |
 | SSE 事件流 + Last-Event-ID 补发 | ✅ |
 | 工件链（idea/discussion/proposal/requirement/design/task/review/changelog） | ✅ 8 类 |
@@ -39,7 +38,7 @@
 | 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 阶段导航 + 四视图 → 编辑/撤销 → 按角色提交运行） | ✅ ORCH-01 |
 | 代码评审与验收门（REVIEW 节点 / 阻塞自动回退 / 验收人工门 / 评审面板与指标） | ✅ 迭代二期 |
 | 离线 Mock 供应商（流式 + 工具调用） | ✅ `scripts/mock_provider.py` |
-| 单元测试 | ✅ 51 passed |
+| 单元测试 | ✅ 65 passed |
 
 > 本轮「可靠执行」迭代的对标项目、改动清单与验收方式见
 > [docs/迭代优化-可靠执行.md](docs/迭代优化-可靠执行.md)。
@@ -47,10 +46,10 @@
 一次完整端到端运行（Mock 模型，含需求门驳回重做）：
 
 ```
-run 68588a9c31c4  finished
-18 个节点全部 done；requirement attempt=2（反馈被采纳，产出 R6 导出周报）
-7 类工件 active（过门后 front-matter 状态为 approved）；2 个开发任务完成；verify 退出码 0
-tokens: in 16,999 / out 3,015，预算 800,000 内
+run 4e02c0f8928b  finished
+20 个节点全部 done（含三方讨论 4 节点）；requirement attempt=2（反馈被采纳，产出 R6 导出周报）
+7 类工件 active（过门后 front-matter 状态为 approved；discussion 随发言节点递增至 v4）；2 个开发任务完成；verify 退出码 0
+tokens: in 23,098 / out 3,564，预算 1,200,000 内
 ```
 
 ---
@@ -196,6 +195,14 @@ cd backend
 脚本会用 `tests/fixtures/designs/chat-product.md` 创建计划、生成、校验并仅保存提交，打印任务数与波次/关键路径指标。
 产品名只存在于 `tests/fixtures/designs/`；页面、API、模板与断言不依赖具体产品。
 
+### 2.8 升级说明：内置角色模板
+
+内置角色模板在应用启动时按**内容指纹**（名称 / 提示词 / 工具集 / 记忆作用域 / 步数 / 停止条件）同步：
+
+- 未在「角色模板」页改过的内置角色会随版本自动刷新；
+- 用户在「角色模板」里改过的角色会保留，不会被覆盖；模型绑定与创建时间始终保留；
+- 旧库首次升级时没有指纹可比对，会一次性刷新全部内置字段（此前的本地修改会被覆盖）。
+
 ---
 
 ## 3. 目录结构
@@ -224,7 +231,7 @@ am-workflow/
 │   │   ├── tools/registry.py  文件读写、命令执行、finish
 │   │   ├── artifacts/store.py 工件版本、front-matter、文件落盘
 │   │   ├── memory/store.py    L0/L1/L2 记忆
-│   │   └── agents/templates/roles.py  9 个角色的提示词与工具集（含 pm）
+│   │   └── agents/templates/roles.py  11 个角色的提示词与工具集（含 pm 与讨论主持人）
 │   ├── scripts/               mock_provider / e2e_demo / drive_run / check_sse / smoke_plan / setup_real_model
 │   ├── tests/                 core / gates / api / planner / plans_api / durability / model_discovery / fixtures
 │   └── requirements.txt

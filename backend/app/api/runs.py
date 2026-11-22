@@ -18,7 +18,7 @@ from app.db.models import (
     Artifact, Event, Gate, ModelEntry, Node, NodeAttempt, Run, Task, Workflow, new_run_id,
 )
 from app.engine.events import bus, emit, load_events, sse_format
-from app.engine.gates import GateError
+from app.engine.gates import GateError, gate_payload
 from app.engine.orchestrator import orchestrator
 from app.engine.templates import instantiate_nodes, phase_names
 
@@ -150,15 +150,9 @@ def get_run(run_id: str) -> dict:
                     "error": attempt.error,
                 } if attempt else None,
             })
-        gate_rows = [
-            {
-                "id": g.id, "node_id": g.node_id,
-                "node_key": next((n["node_key"] for n in node_rows if n["id"] == g.node_id), ""),
-                "status": g.status, "feedback": g.feedback, "decided_by": g.decided_by,
-                "created_at": _iso(g.created_at), "decided_at": _iso(g.decided_at),
-            }
-            for g in gates
-        ]
+        # 与 request_gate 共用同一份 payload：刷新/重载后卡片仍能拿到 title/description
+        # （方案确认门的 description 含讨论未决项）。
+        gate_rows = [gate_payload(s, g) for g in gates]
         task_rows = [
             {
                 "task_uid": t.task_uid, "title": t.title, "deps": list(t.deps_json or []),

@@ -27,11 +27,26 @@
       "key": "discuss_con", "type": "AGENT", "name": "讨论·质疑", "phase": "discussion",
       "deps": ["discuss_pro"], "assignee": {"role": "discuss_con"},
       "config": {"artifact": "discussion", "append": true,
+                 "inputs": ["idea", "discussion"],
                  "instruction": "阅读已有讨论稿（主张），输出「质疑」部分并追加到讨论稿。"}
     },
     {
+      "key": "discuss_response", "type": "AGENT", "name": "讨论·回应", "phase": "discussion",
+      "deps": ["discuss_con"], "assignee": {"role": "discuss_pro"},
+      "config": {"artifact": "discussion", "append": true,
+                 "inputs": ["idea", "discussion"],
+                 "instruction": "阅读讨论稿中的「质疑」部分（Q1..Qn），逐条回应：采纳/不采纳 + 理由 + 调整后的方案。输出「回应」部分并追加到讨论稿。"}
+    },
+    {
+      "key": "discuss_mod", "type": "AGENT", "name": "讨论·主持人蒸馏", "phase": "discussion",
+      "deps": ["discuss_response"], "assignee": {"role": "discuss_mod"},
+      "config": {"artifact": "discussion", "append": true,
+                 "inputs": ["idea", "discussion"],
+                 "instruction": "通读讨论稿全文，追加「共识蒸馏」部分：共识 / 分歧（引用原文，保留分歧）/ 证据 / 未决项。"}
+    },
+    {
       "key": "proposal", "type": "AGENT", "name": "方案架构师", "phase": "proposal",
-      "deps": ["discuss_con"], "assignee": {"role": "proposal"},
+      "deps": ["discuss_mod"], "assignee": {"role": "proposal"},
       "config": {"artifact": "proposal", "inputs": ["idea", "discussion"],
                  "instruction": "综合想法与讨论稿，输出建设方案，逐条回应质疑。"}
     },

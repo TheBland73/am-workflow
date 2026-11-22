@@ -87,3 +87,24 @@ def test_budget_estimate_and_truncate() -> None:
     assert estimate_tokens("abcdefgh") == 2
     truncated = truncate_to_tokens("你" * 100, 10)
     assert truncated.startswith("你" * 9) and "截断" in truncated
+
+
+def test_sdlc_template_three_party_discussion() -> None:
+    from app.engine.templates import load_definition
+
+    definition = load_definition("sdlc_v1")
+    nodes = {n["key"]: n for n in definition["nodes"]}
+    assert len(definition["nodes"]) == 18
+    assert nodes["discuss_response"]["deps"] == ["discuss_con"]
+    assert nodes["discuss_mod"]["deps"] == ["discuss_response"]
+    assert nodes["proposal"]["deps"] == ["discuss_mod"]
+    assert nodes["discuss_response"]["assignee"]["role"] == "discuss_pro"
+
+
+def test_roles_include_discuss_mod() -> None:
+    from app.agents.templates.roles import ROLES
+
+    mod = next(r for r in ROLES if r["role_key"] == "discuss_mod")
+    assert mod["memory_scope"] == "agent"
+    assert mod["tools_json"] == []
+    assert len(ROLES) == 11
