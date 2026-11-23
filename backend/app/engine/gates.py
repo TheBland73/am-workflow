@@ -15,6 +15,7 @@ from app.artifacts.store import parse_front_matter
 from app.config import settings
 from app.db.base import session_scope
 from app.db.models import Artifact, Gate, Node, Run
+from app.engine.node_actions import downstream_nodes
 
 PENDING_SECTION = "未决项"
 PENDING_TITLE = "讨论未决项（需人工拍板）"
@@ -143,24 +144,20 @@ def open_gate_for_run(run_id: str) -> dict | None:
         return {"id": gate.id, "node_id": gate.node_id} if gate else None
 
 
-def _downstream(node_id: int, nodes: list[Node]) -> list[Node]:
-    """返回依赖图上 node 的所有下游节点（含间接）。"""
-    by_id = {n.id: n for n in nodes}
-    children: dict[int, list[int]] = {}
-    for n in nodes:
-        for dep_key in n.deps_json or []:
-            parent = next((x for x in nodes if x.node_key == dep_key), None)
-            if parent is not None:
-                children.setdefault(parent.id, []).append(n.id)
-    result: list[int] = []
-    stack = list(children.get(node_id, []))
-    while stack:
-        current = stack.pop()
-        if current in result:
-            continue
-        result.append(current)
-        stack.extend(children.get(current, []))
-    return [by_id[i] for i in result if i in by_id]
+def downstream_of(node_id: int, nodes: list[Node]) -> list[Node]:
+    """返回依赖图上 node 的所有下游节点（含间接）。
+
+    公共实现：节点血缘遍历统一收敛到 ``engine.node_actions.downstream_nodes``，
+    ``decide_gate`` 的 reject 重置与节点动作的重置共用同一份算法，避免两份逻辑漂移。
+    """
+    node = next((item for item in nodes if item.id == node_id), None)
+    if node is None:
+        return []
+    return downstream_nodes(nodes, node.node_key)
+
+
+# 兼容旧私有名（orchestrator / 历史调用点仍可按 _downstream 引用）。
+_downstream = downstream_of
 
 
 def _reset(node: Node) -> None:
@@ -222,7 +219,7 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
             target.status = "pending"
             target.config_json = {**(target.config_json or {}), "feedback": feedback}
             reset_keys.append(target.node_key)
-            for downstream in _downstream(target.id, nodes):
+            for downstream in downstream_of(target.id, nodes):
                 if downstream.id == gate_node.id:
                     continue
                 if downstream.status in ("done", "failed", "waiting_human", "running", "ready"):
