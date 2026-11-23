@@ -18,6 +18,8 @@
 - `docs/迭代优化-可交互编排画布.md`：React Flow 画布、坐标/依赖落库、设计覆盖率
 - `docs/编排工作台-迭代记录.md`：R1–R6 体验迭代（正确性 / 视觉语义 / 可编辑 / 提交运行 / 生成链路 / 阶段视图）
 - `docs/评审与验收门.md`：代码评审 Agent、阻塞自动回退、验收门、评审面板与指标
+- `docs/节点交互设计.md`：节点动作矩阵、状态迁移、接口契约与审计事件（节点交互增量 v1，模块文档 1）
+- `docs/运行图交互设计.md`：运行图节点选中/血缘、节点检查器、`graphLayout` 共享模块（节点交互增量 v1，模块文档 2）
 - `docs/tasks/real-model-ledger-test.md`：真实模型测试案例（「随手账本」需求规格与 5 门检查点）
 
 ---
@@ -37,8 +39,9 @@
 | 前端（终末地控制台风格：运行列表 / 运行详情 / 人工门 / 工件编辑 / 供应商 / 角色模板） | ✅ 已构建 |
 | 编排工作台（设计规格 → PM 提议 → 校验/波次/关键路径 → 阶段导航 + 四视图 → 编辑/撤销 → 按角色提交运行） | ✅ ORCH-01 |
 | 代码评审与验收门（REVIEW 节点 / 阻塞自动回退 / 验收人工门 / 评审面板与指标） | ✅ 迭代二期 |
+| 节点交互（运行图节点选中/血缘 + 节点检查器 + 重试/重置/跳过/注入反馈 + 审计事件） | ✅ 迭代三期 |
 | 离线 Mock 供应商（流式 + 工具调用） | ✅ `scripts/mock_provider.py` |
-| 单元测试 | ✅ 65 passed |
+| 单元测试 | ✅ 87 passed |
 
 > 本轮「可靠执行」迭代的对标项目、改动清单与验收方式见
 > [docs/迭代优化-可靠执行.md](docs/迭代优化-可靠执行.md)。
@@ -240,6 +243,7 @@ am-workflow/
 ├── docs/                      设计文档与迭代记录
 │   ├── 设计规格说明书.md / 模型接入配置设计.md
 │   ├── 迭代优化-可靠执行.md / 迭代优化-可交互编排画布.md / 编排工作台-迭代记录.md
+│   ├── 节点交互设计.md / 运行图交互设计.md（节点交互增量 v1 模块文档）
 │   ├── research/前沿技术调研与技术选型.md
 │   └── tasks/                 需求规格与测试案例（ledger-idea、real-model-ledger-test、orchestration-workbench）
 ├── runs/                      运行产物（工件、工作区），git 忽略
@@ -392,7 +396,7 @@ run 级 token 预算在每次调用后扣减，超限抛 `BudgetExceeded` 并升
 | 工件 | `GET /runs/{id}/artifacts`；`GET/PATCH /runs/{id}/artifacts/{kind}` |
 | 门 | `GET /gates`；`GET /gates/{id}`；`POST /gates/{id}/approve`；`POST /gates/{id}/reject` |
 | 任务 | `GET/POST /runs/{id}/tasks`；`PATCH/DELETE /runs/{id}/tasks/{uid}` |
-| 节点 | `GET /nodes/{id}`；`POST /nodes/{id}/retry` |
+| 节点 | `GET /nodes/{id}?messages=40&events=20`（详情扩展：`max_attempts`/上下游/`open_gate`/`can_*`/节点事件/产出工件）；`POST /nodes/{id}/retry`；`POST /nodes/{id}/reset`；`POST /nodes/{id}/skip`；`POST /nodes/{id}/feedback` |
 | 记忆 | `GET /memories`；`PATCH /memories/{id}` |
 | 编排 | `POST/GET /plans`；`GET /plans/{id}`；`GET /plans/{id}/phases`；`GET /plans/{id}/activity`；`POST /plans/{id}/generate`；`GET /plans/{id}/events`（SSE）；`POST /plans/{id}/validate`；`POST /plans/{id}/commit`；`POST /plans/{id}/cancel`；`POST /plans/{id}/archive`；`PATCH /plans/{id}/layout`；`POST/DELETE /plans/{id}/deps`；`GET /plans/{id}/snapshots`；`POST /plans/{id}/restore/{version}`；`POST /plans/{id}/tasks`；`PATCH/DELETE /plans/{id}/tasks/{uid}` |
 
@@ -436,7 +440,9 @@ cd backend
 编排工作台的章节索引/校验错误码/波次/关键路径/环路径、两份 fixture 的差异、计划 API 的生成/编辑/提交
 （save 与 run）/幂等/归档；以及 `tests/test_durability.py` 的并发闸门、节点超时、退避重试、
 seq 缓存、取消收据与 metrics 端点，`tests/test_model_discovery.py` 的预设建模型、远程列表导入、
-导入去重与协议不支持报错，和 `tests/test_review.py` 的评审节点/阻塞回退/轮次用尽/评审 API 与指标。
+导入去重与协议不支持报错，`tests/test_review.py` 的评审节点/阻塞回退/轮次用尽/评审 API 与指标，
+以及 `tests/test_node_actions.py` 的节点详情投影（`max_attempts`/上下游/门/事件/`can_*`）、动作矩阵与错误码、
+open 门关闭、下游重置、skip 幂等与审计事件（本轮合计 **87 passed**）。
 
 ---
 
@@ -468,6 +474,17 @@ seq 缓存、取消收据与 metrics 端点，`tests/test_model_discovery.py` �
 - 验收门是计划 Run 的**单点门**（review 之后一道），不是固定模板里的 5 道 SDLC 门；验收门驳回只按
   `target_node` 重置一个节点，批量回退请用运行页评审面板的勾选返工。
 - Windows 下命令执行把 `python` 前缀替换为当前解释器；Linux 行为一致但未在 CI 验证。
+- 节点交互 v1：**HUMAN_GATE 节点不可跳过**（skip 返回 400 `gate_node_protected`，人工门只能走 approve/reject）；
+  运行中节点不可 retry/reset/skip（409 `node_running`），单节点 cancel/pause 与 run 级 resume 均未做
+  （设计取舍见 [`docs/节点交互设计.md`](docs/节点交互设计.md) §10）。
+- 节点动作的审计**只落 `events` 表**（`node_skipped`/`node_reset`/`node_feedback_injected` 与扩展后的 `node_retried`，
+  payload 带 `actor="human"`、`reason`、`reset_nodes`），没有独立动作历史表与多用户权限审计；动作按单进程语义执行，
+  多 worker 部署需要 DB 租约（M2）。
+- 级联重置下游（retry/reset 的 `reset_downstream`、skip 的 `cascade_downstream`）与门 reject 行为一致：
+  只重置 `done/failed/waiting_human/running/ready` 下游节点，**不取消**其已在执行的 attempt；在并发中的运行上使用需谨慎。
+- `GET /nodes/{id}` 只加字段、旧请求体仍可用；节点详情在运行中由 SSE 精准刷新 + 8s 兜底轮询，终态后停止刷新。
+- 前端仍**没有自动化测试栈**：本轮把血缘/门阻挡/相位分列抽成 `frontend/src/canvas/graphLayout.ts` 纯函数，
+  以 `npm run typecheck` + 手工验收守护（见 [`docs/运行图交互设计.md`](docs/运行图交互设计.md) §10），未引入 vitest。
 
 ---
 
@@ -478,3 +495,7 @@ seq 缓存、取消收据与 metrics 端点，`tests/test_model_discovery.py` �
    方案确认 / 需求审查 / 设计审查 / 任务图确认 / 验收确认。
 3. bug：W1 要求「2 个任务并行」，实现为任务图展开后依赖就绪即并发，验收时两个无依赖的 dev 节点
    确实并行执行（事件时间戳交错），但受 Mock 响应速度影响，单次演示中肉眼不易分辨。
+4. **勘误（2026-11-22）**：此前 `POST /nodes/{id}/retry` 不校验 run 状态，会把 `finished/failed/stopped`
+   的 run 无条件改回 `running`（终态 run 可被"复活"）。节点交互增量后，retry 对终态 run 返回 409 `run_terminal`，
+   run 状态与 `error` 保持不变；如需恢复终态运行，应另做 run 级 `POST /runs/{id}/resume`（未实现，见
+   [`docs/节点交互设计.md`](docs/节点交互设计.md) §10）。
