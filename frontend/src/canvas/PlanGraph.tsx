@@ -21,6 +21,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Modal, Input } from "antd";
 import type { PlanSnapshot, PlanTask } from "../api/types";
+import { collectLineageByKey } from "./graphLayout";
 
 export interface PlanPoint {
   x: number;
@@ -237,32 +238,9 @@ function Canvas({
   const active = useMemo(() => {
     if (focusUids && focusUids.length) return new Set(focusUids);
     if (!selected) return null;
-    const byUid = new Map(tasks.map((task) => [task.task_uid, task]));
-    if (!byUid.has(selected)) return null;
-    const children = new Map<string, string[]>();
-    tasks.forEach((task) => {
-      task.deps.forEach((dep) => {
-        const bucket = children.get(dep) ?? [];
-        bucket.push(task.task_uid);
-        children.set(dep, bucket);
-      });
-    });
-    const seen = new Set<string>([selected]);
-    const walk = (pick: (uid: string) => string[]) => {
-      const stack = [selected];
-      while (stack.length) {
-        const current = stack.pop()!;
-        pick(current).forEach((uid) => {
-          if (!seen.has(uid) && byUid.has(uid)) {
-            seen.add(uid);
-            stack.push(uid);
-          }
-        });
-      }
-    };
-    walk((uid) => byUid.get(uid)?.deps ?? []);
-    walk((uid) => children.get(uid) ?? []);
-    return seen;
+    // 血缘算法与运行图共用 graphLayout；任务键是 task_uid（不是 node_key）。
+    const lineage = collectLineageByKey(selected, tasks, (task) => task.task_uid);
+    return lineage.size > 0 ? lineage : null;
   }, [tasks, selected, focusUids]);
 
   useEffect(() => {

@@ -59,10 +59,68 @@ export interface NodeMessage {
   tool_call_id?: string | null;
 }
 
+/** 上下游节点的轻量引用（GET /nodes/{id}）。 */
+export interface NodeDownstreamRef {
+  node_key: string;
+  name: string;
+  status: string;
+}
+
+/** 节点当前挂起的人工门（GET /nodes/{id}）；无门时为 null。 */
+export interface NodeGateRef {
+  id: number;
+  node_id: number;
+  node_key: string;
+  status: string;
+}
+
 export type NodeDetail = Omit<Node, "attempts"> & {
   attempts: NodeAttemptDetail[];
   messages: NodeMessage[];
+  max_attempts: number;
+  order_index: number;
+  run_status: string;
+  upstream: NodeDownstreamRef[];
+  downstream: NodeDownstreamRef[];
+  open_gate: NodeGateRef | null;
+  can_retry: boolean;
+  can_reset: boolean;
+  can_skip: boolean;
+  can_feedback: boolean;
+  can_edit_config: boolean;
+  events: StreamEvent[];
+  artifact_kinds: string[];
 };
+
+/** POST /nodes/{id}/retry 请求体。expected_status 用于幂等保护（契约 §4）。 */
+export interface RetryNodeBody {
+  feedback?: string;
+  reset_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** POST /nodes/{id}/reset 请求体。 */
+export interface ResetNodeBody {
+  reset_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** POST /nodes/{id}/skip 请求体。 */
+export interface SkipNodeBody {
+  reason?: string;
+  cascade_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** 节点动作端点的统一响应（契约 §4；feedback 响应没有 run_id）。 */
+export interface NodeActionResponse {
+  node_id: number;
+  status: string;
+  run_id?: string;
+  reset_nodes?: string[];
+  closed_gates?: number;
+  feedback?: string;
+}
 
 export interface Task {
   task_uid: string;

@@ -1,16 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Button, Checkbox, Drawer, Empty, Input, Modal, Spin, Table, Tag, message,
+  Button, Checkbox, Drawer, Empty, Input, Modal, Spin, Tag, message,
 } from "antd";
 import { Link, useParams } from "react-router-dom";
 import { api, subscribeRun } from "../api/client";
 import type {
-  ArtifactRecord, Gate, Node, NodeDetail, Snapshot, StreamEvent,
+  ArtifactRecord, Node, Snapshot, StreamEvent,
 } from "../api/types";
 import Dial from "../canvas/Dial";
 import ExecutionMap from "../canvas/ExecutionMap";
+import { heldKeys } from "../canvas/graphLayout";
 import GateConsole from "../panels/GateConsole";
+import NodeInspector from "../panels/NodeInspector";
+import type { NodeActionRequest } from "../panels/NodeInspector";
 
 const ARTIFACT_LABELS: Record<string, string> = {
   idea: "想法", discussion: "讨论", proposal: "方案", review: "评审",
@@ -18,6 +21,8 @@ const ARTIFACT_LABELS: Record<string, string> = {
 };
 const ARTIFACT_KINDS = Object.keys(ARTIFACT_LABELS);
 const SEV_LABEL: Record<string, string> = { blocker: "阻塞", major: "重要", minor: "建议" };
+// 事件抽屉里 node_id 改为显示 node_key，比数字列宽：仅本抽屉内联放宽，不改全局 .log-line。
+const LOG_LINE_STYLE = { gridTemplateColumns: "58px 74px minmax(0, 1fr)" };
 
 const STATUS_LABELS: Record<string, string> = {
   created: "已创建", running: "运行中", waiting_human: "等待人工",
@@ -66,6 +71,12 @@ function eventText(event: StreamEvent) {
     case "node_failed": return `${key} 失败：${String(payload.message ?? "")}`;
     case "node_retried": return `${key} 已重试`;
     case "node_retry_scheduled": return `${key} 将在 ${String(payload.delay_s ?? "")}s 后重试（第 ${String(payload.next_attempt ?? "")} 次）`;
+    case "node_skipped": return `${key} 已跳过${payload.reason ? `：${String(payload.reason).slice(0, 60)}` : ""}`;
+    case "node_reset": {
+      const reset = Array.isArray(payload.reset_nodes) ? payload.reset_nodes.length : 0;
+      return `${key} 已重置${reset ? `（下游 ${reset} 个）` : ""}`;
+    }
+    case "node_feedback_injected": return `${key} 已注入反馈${payload.feedback ? `：${String(payload.feedback).slice(0, 60)}` : ""}`;
     case "nodes_reset": return `重置 ${Array.isArray(payload.nodes) ? payload.nodes.length : 0} 个节点`;
     case "gate_requested": return `等待审批：${key}`;
     case "gate_decided": return `审批 ${String(payload.action ?? "")}：${key}`;
@@ -79,39 +90,25 @@ function eventText(event: StreamEvent) {
   }
 }
 
-function heldKeys(nodes: Node[], gate: Gate | null) {
-  const result = new Set<string>();
-  const gateNode = nodes.find((node) => node.id === gate?.node_id);
-  if (!gateNode) return result;
-  const queue = nodes.filter((node) => node.deps.includes(gateNode.node_key));
-  while (queue.length) {
-    const node = queue.shift()!;
-    if (result.has(node.node_key)) continue;
-    if (node.status === "done" || node.status === "skipped") continue;
-    result.add(node.node_key);
-    for (const candidate of nodes) {
-      if (candidate.deps.includes(node.node_key) && !result.has(candidate.node_key)) {
-        queue.push(candidate);
-      }
-    }
-  }
-  return result;
-}
-
 export default function RunPage() {
   const { runId = "" } = useParams();
   const client = useQueryClient();
   const [messageApi, holder] = message.useMessage();
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const seen = useRef(new Set<number>());
+  const selectedNodeIdRef = useRef<number | null>(null);
+  const [selectedNodeId, setSelectedNodeId] = useState<number | null>(null);
   const [logOpen, setLogOpen] = useState(false);
-  const [nodeDetail, setNodeDetail] = useState<NodeDetail | null>(null);
-  const [nodeLoading, setNodeLoading] = useState(false);
+  const [filterNodeId, setFilterNodeId] = useState<number | null>(null);
   const [artifact, setArtifact] = useState<{ kind: string; body: string; original: string; version: number } | null>(null);
   const [savingArtifact, setSavingArtifact] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reworkUids, setReworkUids] = useState<string[]>([]);
   const [reworkNote, setReworkNote] = useState("");
+
+  useEffect(() => {
+    selectedNodeIdRef.current = selectedNodeId;
+  }, [selectedNodeId]);
 
   const snapshotQuery = useQuery({
     queryKey: ["snapshot", runId],
@@ -143,6 +140,19 @@ export default function RunPage() {
     },
   });
 
+  // 节点详情查询：queryKey 精确到 nodeId，SSE 只按需 invalidate 该 key（不再手工 fetch）。
+  const nodeQuery = useQuery({
+    queryKey: ["node", runId, selectedNodeId],
+    queryFn: () => api.getNode(selectedNodeId as number, { messages: 40, events: 20 }),
+    enabled: selectedNodeId != null && Boolean(runId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "pending" || status === "running" || status === "waiting_human"
+        ? 8000
+        : false;
+    },
+  });
+
   const review = reviewQuery.data;
 
   useEffect(() => {
@@ -166,20 +176,54 @@ export default function RunPage() {
     if (!runId) return;
     setEvents([]);
     seen.current = new Set();
+    const isTerminal = (type: string) =>
+      type === "run_finished" || type === "run_error" || type === "run_stopped";
     const unsubscribe = subscribeRun(runId, (event) => {
       if (event.seq != null) {
         if (seen.current.has(event.seq)) return;
         seen.current.add(event.seq);
       }
       setEvents((previous) => [...previous.slice(-399), event]);
-      if (event.type !== "node_token") {
+      const selected = selectedNodeIdRef.current;
+      if (isTerminal(event.type)) {
+        // 终态事件：整页全量刷新（含已打开的节点详情）。
+        if (selected != null) {
+          client.invalidateQueries({ queryKey: ["node", runId, selected] });
+        }
         client.invalidateQueries({ queryKey: ["snapshot", runId] });
         client.invalidateQueries({ queryKey: ["metrics", runId] });
         client.invalidateQueries({ queryKey: ["review", runId] });
+        return;
       }
+      if (event.type === "node_token") return;
+      if (selected != null && event.node_id === selected) {
+        // 选中节点的事件只精准刷新该节点详情（key 含 nodeId，避免刷新所有节点查询）。
+        client.invalidateQueries({ queryKey: ["node", runId, selected] });
+        return;
+      }
+      client.invalidateQueries({ queryKey: ["snapshot", runId] });
+      client.invalidateQueries({ queryKey: ["metrics", runId] });
+      client.invalidateQueries({ queryKey: ["review", runId] });
     }, 0);
     return unsubscribe;
   }, [client, runId]);
+
+  // Esc 关闭节点检查器；输入框/文本域内不拦截，Modal 内的 Esc 交给 antd 处理。
+  useEffect(() => {
+    if (selectedNodeId == null) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // 事件抽屉盖在检查器之上：Esc 先交给抽屉自己关闭，不连带关闭检查器。
+      if (logOpen) return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || target?.isContentEditable) return;
+      if (target?.closest(".ant-modal")) return;
+      setSelectedNodeId(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [logOpen, selectedNodeId]);
 
   const snapshot: Snapshot | undefined = snapshotQuery.data;
   const metrics = metricsQuery.data;
@@ -187,7 +231,7 @@ export default function RunPage() {
   const nodes = snapshot?.nodes ?? [];
   const openGate = snapshot?.gates.find((gate) => gate.status === "open") ?? null;
   const held = useMemo(
-    () => heldKeys(nodes, openGate),
+    () => heldKeys(nodes, openGate ?? null),
     [nodes, openGate],
   );
   const doneCount = nodes.filter((node) => node.status === "done" || node.status === "skipped").length;
@@ -247,15 +291,51 @@ export default function RunPage() {
     }
   };
 
-  const openNode = async (node: Node) => {
-    setNodeLoading(true);
+  // 选中节点：再次点击同一节点取消；详情由 nodeQuery 按 selectedNodeId 拉取。
+  const openNode = (node: Node) => {
+    setSelectedNodeId((current) => (current === node.id ? null : node.id));
+  };
+
+  // 节点动作：短事务端点由后端实现，成功后刷新快照/指标/该节点详情（契约 §8）。
+  const runNodeAction = async (request: NodeActionRequest) => {
+    if (selectedNodeId == null) return;
+    const nodeId = selectedNodeId;
     try {
-      setNodeDetail(await api.getNode(node.id));
+      switch (request.kind) {
+        case "retry":
+          await api.retryNode(nodeId, {
+            feedback: request.feedback,
+            reset_downstream: request.resetDownstream,
+            expected_status: request.expectedStatus,
+          });
+          break;
+        case "reset":
+          await api.resetNode(nodeId, {
+            reset_downstream: request.resetDownstream,
+            expected_status: request.expectedStatus,
+          });
+          break;
+        case "skip":
+          await api.skipNode(nodeId, {
+            reason: request.reason,
+            cascade_downstream: request.cascadeDownstream,
+            expected_status: request.expectedStatus,
+          });
+          break;
+        case "feedback":
+          if (!request.feedback) throw new Error("反馈内容不能为空");
+          await api.injectFeedback(nodeId, request.feedback);
+          break;
+      }
     } catch (error) {
-      messageApi.error((error as Error).message);
-    } finally {
-      setNodeLoading(false);
+      // 失败（如 409 status_conflict）也刷新一次，让面板回到服务端真实状态再重试。
+      client.invalidateQueries({ queryKey: ["snapshot", runId] });
+      client.invalidateQueries({ queryKey: ["node", runId, nodeId] });
+      throw error;
     }
+    client.invalidateQueries({ queryKey: ["snapshot", runId] });
+    client.invalidateQueries({ queryKey: ["metrics", runId] });
+    client.invalidateQueries({ queryKey: ["node", runId, nodeId] });
   };
 
   const stopRun = async () => {
@@ -281,6 +361,15 @@ export default function RunPage() {
   }
 
   const { run, stats } = snapshot;
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null;
+  const nodeKeyById = new Map(nodes.map((node) => [node.id, node.node_key]));
+  // 事件抽屉的节点过滤：数值 node_id 渲染成 node_key（契约 F7）。
+  const visibleLogEvents = filterNodeId == null
+    ? events
+    : events.filter((event) => event.node_id === filterNodeId);
+  const logFilterKey = filterNodeId == null
+    ? null
+    : nodeKeyById.get(filterNodeId) ?? `#${filterNodeId}`;
   const activeArtifacts = snapshot.artifacts.filter((item) => item.status === "active");
   const pendingKinds = ARTIFACT_KINDS.filter(
     (kind) => !activeArtifacts.some((item) => item.kind === kind),
@@ -426,14 +515,28 @@ export default function RunPage() {
             <b>{stats.events}</b><span>事件</span>
             <b>{stats.tool_calls}</b><span>工具调用</span>
           </div>
-          <button type="button" className="linkish" onClick={() => setLogOpen(true)}>
+          <button
+            type="button"
+            className="linkish"
+            onClick={() => {
+              setFilterNodeId(null);
+              setLogOpen(true);
+            }}
+          >
             查看全部事件 / LOG
           </button>
         </div>
         </div>
       </section>
 
-      <ExecutionMap snapshot={snapshot} onNodeClick={openNode} />
+      <ExecutionMap
+        snapshot={snapshot}
+        onNodeClick={openNode}
+        selectedNodeId={selectedNodeId}
+        onNodeSelect={(node) => {
+          if (!node) setSelectedNodeId(null);
+        }}
+      />
 
       {review?.available ? (
         <section className="ef-panel review-panel">
@@ -585,66 +688,54 @@ export default function RunPage() {
       <Drawer
         open={logOpen}
         onClose={() => setLogOpen(false)}
-        title="运行事件流"
+        title={logFilterKey ? `运行事件流 · 只看 ${logFilterKey}` : "运行事件流"}
         width={620}
+        extra={filterNodeId != null ? (
+          <Button size="small" onClick={() => setFilterNodeId(null)}>查看全部</Button>
+        ) : null}
         styles={{ body: { background: "#161616", color: "#f4f4f2", padding: 12 } }}
       >
         <div className="am-log">
-          {events.length === 0 && <Empty description="暂无事件" image={Empty.PRESENTED_IMAGE_SIMPLE} />}
-          {events.map((event, index) => (
-            <div key={`${event.seq ?? index}-${event.type}`} className={`log-line ${event.type.includes("fail") || event.type.includes("error") ? "is-error" : ""}`}>
+          {visibleLogEvents.length === 0 && <Empty description="暂无事件" image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+          {visibleLogEvents.map((event, index) => (
+            <div
+              key={`${event.seq ?? index}-${event.type}`}
+              className={`log-line ${event.type.includes("fail") || event.type.includes("error") ? "is-error" : ""}`}
+              style={LOG_LINE_STYLE}
+            >
               <time>{event.ts?.slice(11, 19) ?? "--:--:--"}</time>
-              <span className="node">{event.node_id ?? "run"}</span>
+              <span className="node">
+                {event.node_id != null ? (nodeKeyById.get(event.node_id) ?? `#${event.node_id}`) : "run"}
+              </span>
               <span className="msg">{eventText(event)}</span>
             </div>
           ))}
         </div>
       </Drawer>
 
-      <Drawer
-        open={Boolean(nodeDetail) || nodeLoading}
-        onClose={() => { setNodeDetail(null); setNodeLoading(false); }}
-        title={nodeDetail ? `${nodeDetail.name} · ${nodeDetail.node_key}` : "节点详情"}
-        width={680}
-      >
-        {nodeLoading && <Spin />}
-        {nodeDetail && !nodeLoading && (
-          <div className="node-detail">
-            <p className="ef-facts">
-              <span>类型 <b>{nodeDetail.type}</b></span>
-              <span>状态 <b>{statusLabel(nodeDetail.status)}</b></span>
-              <span>相位 <b>{nodeDetail.phase}</b></span>
-              <span>尝试 <b>{nodeDetail.attempts.length}/{nodeDetail.max_attempts}</b></span>
-            </p>
-            <h4>尝试记录</h4>
-            <Table
-              size="small"
-              rowKey="id"
-              pagination={false}
-              dataSource={nodeDetail.attempts}
-              columns={[
-                { title: "#", dataIndex: "attempt_no", width: 48 },
-                { title: "状态", dataIndex: "status", width: 100 },
-                { title: "开始", dataIndex: "started_at", render: (value: string | null) => fmtTime(value) },
-                { title: "结束", dataIndex: "finished_at", render: (value: string | null) => fmtTime(value) },
-                { title: "TOKEN", render: (_: unknown, row: { tokens_in: number; tokens_out: number }) => (row.tokens_in + row.tokens_out).toLocaleString() },
-              ]}
-            />
-            {nodeDetail.attempts.some((item) => item.error) && (
-              <pre className="am-artifact">{nodeDetail.attempts.map((item) => item.error).filter(Boolean).join("\n\n")}</pre>
-            )}
-            <h4>最近消息</h4>
-            <div className="node-messages">
-              {nodeDetail.messages.slice(-8).map((item, index) => (
-                <div key={index} className={`node-msg is-${item.role}`}>
-                  <b>{item.role}</b>
-                  <pre>{item.content.slice(0, 1600)}</pre>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </Drawer>
+      <NodeInspector
+        runId={runId}
+        runStatus={run.status}
+        node={selectedNode}
+        detail={nodeQuery.data}
+        detailError={nodeQuery.error?.message}
+        events={events}
+        open={selectedNodeId != null}
+        onClose={() => setSelectedNodeId(null)}
+        onAction={runNodeAction}
+        eventText={eventText}
+        artifacts={snapshot.artifacts}
+        onOpenArtifact={openArtifact}
+        onSelectNode={(nodeKey) => {
+          const target = nodes.find((node) => node.node_key === nodeKey);
+          if (target) setSelectedNodeId(target.id);
+          else messageApi.warning(`节点 ${nodeKey} 不在当前快照中`);
+        }}
+        onFilterEvents={(target) => {
+          setFilterNodeId(target.id);
+          setLogOpen(true);
+        }}
+      />
 
       <Modal
         open={Boolean(artifact)}
