@@ -114,4 +114,5 @@ class AnthropicAdapter(ProtocolAdapter):
 def usage_of(data: dict) -> Usage:
     usage = data.get("usage") or {}
     return Usage(input_tokens=usage.get("input_tokens") or 0,
-                 output_tokens=usage.get("output_tokens") or 0)
+                 output_tokens=usage.get("output_tokens") or 0,
+                 cached_tokens=usage.get("cache_read_input_tokens") or 0)

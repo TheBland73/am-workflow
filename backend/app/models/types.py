@@ -32,6 +32,7 @@ class Message:
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0   # 输入里命中前缀缓存的 token 数；供应商不回报时为 0
 
     @property
     def total(self) -> int:

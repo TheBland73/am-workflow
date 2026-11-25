@@ -19,6 +19,7 @@ def add_attempt_usage(attempt_id: int, usage: Usage, *, model_id: int | None = N
         if attempt:
             attempt.tokens_in += usage.input_tokens
             attempt.tokens_out += usage.output_tokens
+            attempt.cached_tokens = int(attempt.cached_tokens or 0) + usage.cached_tokens
             if model_id is not None:
                 attempt.model_id = model_id
 

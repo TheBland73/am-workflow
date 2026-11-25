@@ -86,7 +86,7 @@ def _ensure_columns() -> None:
     tables = set(inspector.get_table_names())
     additions: dict[str, dict[str, str]] = {
         "agent_templates": {"builtin_hash": "VARCHAR(64)"},
-        "node_attempts": {"heartbeat_at": "DATETIME"},
+        "node_attempts": {"heartbeat_at": "DATETIME", "cached_tokens": "INTEGER"},
         "plans": {"layout_json": "JSON"},
         "plan_snapshots": {"coverage_json": "JSON"},
     }
