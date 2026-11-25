@@ -134,8 +134,9 @@ def load_events(run_id: str, since: int = 0, limit: int = 5000) -> list[dict]:
         ]
 
 
-def emit_token(run_id: str, node_id: int | None, text: str) -> None:
-    """流式 token：内存直推，不写库、不分配 seq（§5.3 红线）。"""
+def emit_token(run_id: str, node_id: int | None, text: str,
+               extra: dict | None = None) -> None:
+    """流式 token：内存直推，不写库、不分配 seq（§5.3 红线）。extra 是随载荷带上的附加字段。"""
     bus.publish(
         run_id,
         {
@@ -143,7 +144,7 @@ def emit_token(run_id: str, node_id: int | None, text: str) -> None:
             "type": "node_token",
             "node_id": node_id,
             "ts": datetime.now(timezone.utc).isoformat(),
-            "payload": {"text": text},
+            "payload": {"text": text, **(extra or {})},
         },
     )
 

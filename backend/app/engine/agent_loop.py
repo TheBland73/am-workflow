@@ -5,6 +5,9 @@ import json
 from dataclasses import dataclass
 
 from app.config import settings
+from app.conversation.compact import make_summarizer, maybe_compact
+from app.conversation.policy import DEFAULT_POLICY
+from app.conversation.store import record_compaction
 from app.db.base import session_scope
 from app.db.models import Message as MessageRow
 from app.engine.events import emit, emit_token
@@ -49,7 +52,8 @@ def _brief(value, limit: int = 600) -> str:
 
 
 async def _call_stream(model: ModelInfo, messages: list[Message], schemas: list[dict] | None,
-                       params: GenParams, *, run_id: str, node_id: int) -> tuple[Message, Usage]:
+                       params: GenParams, *, run_id: str, node_id: int,
+                       token_extra: dict | None = None) -> tuple[Message, Usage]:
     adapter = pool.adapter_for(model)
     provider = model.provider
     assert provider is not None
@@ -60,7 +64,7 @@ async def _call_stream(model: ModelInfo, messages: list[Message], schemas: list[
         async for event in adapter.stream(messages, schemas, params):
             if event.kind == "text_delta":
                 if settings.stream_tokens:
-                    emit_token(run_id, node_id, event.text)
+                    emit_token(run_id, node_id, event.text, token_extra)
             elif event.kind == "usage" and event.usage:
                 usage = event.usage
             elif event.kind == "done":
@@ -74,7 +78,8 @@ async def _call_stream(model: ModelInfo, messages: list[Message], schemas: list[
 
 async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelInfo,
                     system_prompt: str, user_prompt: str, toolbox: Toolbox | None,
-                    max_steps: int = 12, temperature: float = 0.4) -> AgentResult:
+                    max_steps: int = 12, temperature: float = 0.4, quiet: bool = False,
+                    token_extra: dict | None = None) -> AgentResult:
     if toolbox is not None and not model.cap_tools:
         return await _run_json_protocol(
             run_id=run_id, node_id=node_id, attempt_id=attempt_id, model=model,
@@ -94,10 +99,25 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
             temperature=temperature,
             max_tokens=min(4096, model.max_output_tokens or 4096),
         )
-        await emit(run_id, "node_log", node_id,
-                   {"level": "info", "message": f"第 {step}/{max_steps} 步：请求模型 {model.display_name}"})
+        if len(messages) > 2:
+            # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）
+            compacted, before_tokens, after_tokens = await maybe_compact(
+                run_id=run_id, node_id=node_id, model=model,
+                policy=DEFAULT_POLICY, messages=messages,
+                summarize=make_summarizer(run_id=run_id, attempt_id=attempt_id, model=model))
+            if compacted is not messages:
+                await record_compaction(
+                    run_id=run_id, node_id=node_id, attempt_id=attempt_id, scope="agent_loop",
+                    summary=compacted[1].content, before_tokens=before_tokens,
+                    after_tokens=after_tokens)
+                messages = compacted
+        if not quiet:
+            await emit(run_id, "node_log", node_id,
+                       {"level": "info",
+                        "message": f"第 {step}/{max_steps} 步：请求模型 {model.display_name}"})
         message, usage = await _call_stream(model, messages, schemas, params,
-                                            run_id=run_id, node_id=node_id)
+                                            run_id=run_id, node_id=node_id,
+                                            token_extra=token_extra)
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
         add_attempt_usage(attempt_id, usage, model_id=model.id)
