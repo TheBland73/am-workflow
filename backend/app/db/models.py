@@ -82,6 +82,7 @@ class AgentTemplate(Base):
     )
     max_steps: Mapped[int] = mapped_column(Integer, default=12)
     stop_condition: Mapped[list] = mapped_column(JSON, default=list)
+    meta_json: Mapped[dict] = mapped_column(JSON, default=dict)   # 一句话简介、专长标签、适合的会议角色
     # 内置模板指纹（内部字段，不进 API 序列化）：用于区分「内置定义未变的行」
     # 与「用户经 PATCH 改过的行」，NULL 表示旧库遗留行（见 engine/templates.py）。
     builtin_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -110,6 +111,7 @@ class Run(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     budget_tokens: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict)   # 运行级配置（新建运行时填写）
 
 
 class Node(Base):
@@ -209,6 +211,9 @@ class Gate(Base):
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"))
     status: Mapped[str] = mapped_column(String(30), default="open")
     feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kind: Mapped[str | None] = mapped_column(String(40), nullable=True)   # 确认点类型；旧门为空
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict)        # 挂起时给判定者看的内容
+    decision_json: Mapped[dict] = mapped_column(JSON, default=dict)       # 做出的决定
     decided_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -340,4 +345,121 @@ class ConversationMessage(Base):
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
     cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+# ---------------- 会议运行时 ----------------
+# 会议状态：进行中、挂起、等待返工、已完成、已归档
+MEETING_ACTIVE = "active"
+MEETING_SUSPENDED = "suspended"
+MEETING_WAITING_REWORK = "waiting_rework"
+MEETING_COMPLETED = "completed"
+MEETING_ABANDONED = "abandoned"
+
+
+class Meeting(Base):
+    """一场会议：一个 MEETING 节点的一次实例。运行状态放这里，不放节点配置。"""
+    __tablename__ = "meetings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), index=True)
+    node_key: Mapped[str] = mapped_column(String(80))
+    protocol: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(30), default=MEETING_ACTIVE)
+    phase: Mapped[str] = mapped_column(String(60), default="")
+    round: Mapped[int] = mapped_column(Integer, default=1)
+    charter_json: Mapped[dict] = mapped_column(JSON, default=dict)    # 会议章程快照
+    config_json: Mapped[dict] = mapped_column(JSON, default=dict)     # 生效参数
+    state_json: Mapped[dict] = mapped_column(JSON, default=dict)      # 协议的中间状态
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MeetingParticipant(Base):
+    __tablename__ = "meeting_participants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(
+        ForeignKey("meetings.id", ondelete="CASCADE"), index=True
+    )
+    role_key: Mapped[str | None] = mapped_column(String(80), nullable=True)   # 临时角色为空
+    display_name: Mapped[str] = mapped_column(String(120))
+    # facilitator / participant / proxy / reviewer / quality_reviewer / author / chair
+    mode: Mapped[str] = mapped_column(String(40), default="participant")
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+    model_id: Mapped[int | None] = mapped_column(
+        ForeignKey("model_entries.id", ondelete="SET NULL"), nullable=True
+    )
+    # user / moderator / template / adhoc
+    source: Mapped[str] = mapped_column(String(20), default="template")
+    expertise_json: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(20), default="active")   # active / removed
+    position: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MeetingTurn(Base):
+    """发言：纪要的一条。只追加；未完成的那条在完成时补上内容。"""
+    __tablename__ = "meeting_turns"
+    __table_args__ = (UniqueConstraint("meeting_id", "seq", name="uq_meeting_turn_seq"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(
+        ForeignKey("meetings.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer)
+    round: Mapped[int] = mapped_column(Integer, default=1)
+    phase: Mapped[str] = mapped_column(String(60), default="")
+    speaker_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    speaker_name: Mapped[str] = mapped_column(String(120), default="")
+    kind: Mapped[str] = mapped_column(String(40))
+    decision_point_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    structured_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reply_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    model_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DecisionPoint(Base):
+    """决策点：账本的一行。表态矩阵是 {参会者 id: {"level": 1-5, "reason": str, "round": int}}。"""
+    __tablename__ = "decision_points"
+    __table_args__ = (UniqueConstraint("meeting_id", "index", name="uq_decision_point_index"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(
+        ForeignKey("meetings.id", ondelete="CASCADE"), index=True
+    )
+    index: Mapped[str] = mapped_column(String(20))     # D1、D2……
+    title: Mapped[str] = mapped_column(String(300), default="")
+    question: Mapped[str] = mapped_column(Text, default="")
+    options_json: Mapped[list] = mapped_column(JSON, default=list)
+    raised_by: Mapped[str | None] = mapped_column(String(120), nullable=True)   # 提出者
+    # open / agreed / ruled / deferred / reopened
+    status: Mapped[str] = mapped_column(String(20), default="open")
+    conclusion: Mapped[str] = mapped_column(Text, default="")
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    exchange_summary: Mapped[str] = mapped_column(Text, default="")
+    stances_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    origin_round: Mapped[int] = mapped_column(Integer, default=1)
+    closed_round: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(String(20), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MeetingIntervention(Base):
+    """插话请求：排队 → 注入 或 取消。"""
+    __tablename__ = "meeting_interventions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    meeting_id: Mapped[int] = mapped_column(
+        ForeignKey("meetings.id", ondelete="CASCADE"), index=True
+    )
+    content: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    created_by: Mapped[str] = mapped_column(String(80), default="user")
+    injected_turn_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

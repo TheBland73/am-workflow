@@ -85,10 +85,12 @@ def _ensure_columns() -> None:
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
     additions: dict[str, dict[str, str]] = {
-        "agent_templates": {"builtin_hash": "VARCHAR(64)"},
+        "agent_templates": {"builtin_hash": "VARCHAR(64)", "meta_json": "JSON"},
         "node_attempts": {"heartbeat_at": "DATETIME", "cached_tokens": "INTEGER"},
         "plans": {"layout_json": "JSON"},
         "plan_snapshots": {"coverage_json": "JSON"},
+        "runs": {"config_json": "JSON"},
+        "gates": {"kind": "VARCHAR(40)", "payload_json": "JSON", "decision_json": "JSON"},
     }
     # 先在事务之外把已有列读出来：SQLite 连接池 size=1，事务内再 inspect 会自锁。
     existing_by_table = {
