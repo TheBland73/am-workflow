@@ -148,7 +148,8 @@ class NodeAttempt(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     tokens_in: Mapped[int] = mapped_column(Integer, default=0)
     tokens_out: Mapped[int] = mapped_column(Integer, default=0)
-    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # 可空：这一列是后来用 ALTER TABLE 补的，补列之前就存在的行是 NULL，读取处要兜底
+    cached_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 

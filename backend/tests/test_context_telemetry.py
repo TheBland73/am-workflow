@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+from sqlalchemy import text
 
 from app.conversation.telemetry import cache_hit_rate, parse_cached_tokens
 from app.db.base import init_db, session_scope
@@ -14,7 +15,7 @@ from app.models.providers.openai_chat import OpenAIChatAdapter
 from app.models.types import GenParams, Message, StreamEvent, Usage
 
 
-def _make_attempt(run_id: str, **fields) -> int:
+def _make_attempt(run_id: str) -> int:
     """建一条最简的执行记录（运行 → 节点 → 执行），返回它的 id。"""
     init_db()
     seed_defaults()
@@ -25,7 +26,7 @@ def _make_attempt(run_id: str, **fields) -> int:
         node = Node(node_key="n", type="AGENT", name="n", run_id=run_id, status="pending")
         s.add(node)
         s.flush()
-        attempt = NodeAttempt(node_id=node.id, attempt_no=1, status="running", **fields)
+        attempt = NodeAttempt(node_id=node.id, attempt_no=1, status="running")
         s.add(attempt)
         s.flush()
         return attempt.id
@@ -81,8 +82,12 @@ def test_attempt_usage_accumulates_cached_tokens() -> None:
 
 
 def test_attempt_usage_treats_missing_cached_tokens_as_zero() -> None:
-    # 补列之前就存在的执行记录，这一列是 NULL，累加时按 0 处理
-    attempt_id = _make_attempt("telemetry-run-null", cached_tokens=None)
+    # 补列之前就存在的执行记录，这一列是 NULL：启动时用 ALTER TABLE 加的列，旧行不会填默认值。
+    # 所以用 SQL 把它置成 NULL，而不是靠 ORM 赋 None（ORM 会把 None 当成没给值，默认值 0 照样生效）
+    attempt_id = _make_attempt("telemetry-run-null")
+    with session_scope() as s:
+        s.execute(text("UPDATE node_attempts SET cached_tokens = NULL WHERE id = :id"),
+                  {"id": attempt_id})
     add_attempt_usage(attempt_id, Usage(input_tokens=10, cached_tokens=7))
     with session_scope() as s:
         assert s.get(NodeAttempt, attempt_id).cached_tokens == 7
