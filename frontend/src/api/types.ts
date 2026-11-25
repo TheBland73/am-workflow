@@ -513,6 +513,166 @@ export interface PlanListItem {
   updated_at: string | null;
 }
 
+/* ---------- 数据统计（ANALYTICS） ---------- */
+
+/** 统计时间窗：后端按 runs.created_at、UTC 自然日切桶。 */
+export interface AnalyticsWindow {
+  days: number;
+  start: string;
+  end: string;
+  start_date: string;
+  end_date: string;
+  basis: string;
+  timezone: string;
+}
+
+export type AnalyticsRange = 7 | 30 | 90;
+
+export interface AnalyticsCostModel {
+  model_id: number | null;
+  model_name: string;
+  cost: number;
+  total_tokens: number;
+}
+
+export interface AnalyticsCost {
+  /** false = 当前范围内没有「配了单价且成交过」的模型：只展示空状态，不展示 0 元结论。 */
+  available: boolean;
+  currency: string | null;
+  priced_models: number;
+  note: string;
+  estimated_cost: number;
+  unpriced_tokens: number;
+  by_model?: AnalyticsCostModel[];
+}
+
+export interface AnalyticsOverview {
+  window: AnalyticsWindow;
+  runs: {
+    total: number;
+    finished: number;
+    failed: number;
+    running: number;
+    waiting_human: number;
+    stopped: number;
+    created: number;
+  };
+  success_rate: number;
+  duration: {
+    avg_ms: number | null;
+    min_ms: number | null;
+    max_ms: number | null;
+    total_ms: number;
+    samples: number;
+    basis: string;
+  };
+  tokens: { input: number; output: number; total: number };
+  cost: AnalyticsCost;
+}
+
+export interface AnalyticsTrendPoint {
+  date: string;
+  runs: number;
+  finished: number;
+  failed: number;
+  tokens_in: number;
+  tokens_out: number;
+  total_tokens: number;
+}
+
+export interface AnalyticsTrends {
+  window: AnalyticsWindow;
+  items: AnalyticsTrendPoint[];
+  totals: {
+    runs: number;
+    finished: number;
+    failed: number;
+    tokens_in: number;
+    tokens_out: number;
+    total_tokens: number;
+  };
+}
+
+export interface AnalyticsStatusItem {
+  status: string;
+  count: number;
+  ratio: number;
+}
+
+export interface AnalyticsDistribution {
+  window: AnalyticsWindow;
+  total: number;
+  items: AnalyticsStatusItem[];
+}
+
+export interface AnalyticsModelUsage {
+  model_id: number | null;
+  model_name: string;
+  provider: string;
+  tokens_in: number;
+  tokens_out: number;
+  total: number;
+  attempts: number;
+  cost: number;
+  ratio: number;
+}
+
+export interface AnalyticsUsage {
+  window: AnalyticsWindow;
+  tokens: { input: number; output: number; total: number };
+  by_model: AnalyticsModelUsage[];
+  cost: AnalyticsCost;
+}
+
+export interface AnalyticsRunItem {
+  id: string;
+  idea: string;
+  status: RunStatus;
+  current_phase: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  tokens_in: number;
+  tokens_out: number;
+  total_tokens: number;
+  cost: number;
+  cost_available: boolean;
+  nodes_total: number;
+  nodes_done: number;
+  tasks_total: number;
+  tasks_done: number;
+  error: string | null;
+}
+
+export interface AnalyticsRecentRuns {
+  window: AnalyticsWindow;
+  limit: number;
+  status: string | null;
+  items: AnalyticsRunItem[];
+}
+
+export interface AnalyticsFailedItem {
+  id: string;
+  idea: string;
+  status: RunStatus;
+  current_phase: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+  failed_at: string | null;
+  error: string;
+  error_truncated: boolean;
+  node_key: string | null;
+  node_name: string | null;
+  node_phase: string | null;
+  node_error: string | null;
+}
+
+export interface AnalyticsFailedRuns {
+  window: AnalyticsWindow;
+  limit: number;
+  items: AnalyticsFailedItem[];
+}
+
 export interface PlanEvent {
   seq: number;
   type: "plan_token" | "plan_generated" | "plan_failed";
