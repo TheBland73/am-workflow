@@ -308,3 +308,35 @@ class Memory(Base):
     evidence_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Conversation(Base):
+    """会话：一段有明确归属的消息日志（工具循环、会议里的一次发言等）。"""
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(24), index=True)
+    node_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    scope: Mapped[str] = mapped_column(String(40), default="agent_loop")
+    owner: Mapped[str] = mapped_column(String(120), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConversationMessage(Base):
+    """会话消息：只追加。kind 为 summary 的消息标记一次压缩的边界。"""
+    __tablename__ = "conversation_messages"
+    __table_args__ = (UniqueConstraint("conversation_id", "seq", name="uq_conversation_msg_seq"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text, default="")
+    kind: Mapped[str] = mapped_column(String(20), default="normal")
+    meta_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
