@@ -8,7 +8,7 @@ from dataclasses import dataclass
 class ContextPolicy:
     compact_at: float = 0.80   # 估算占用达到可用窗口的这个比例才压缩
     compact_to: float = 0.50   # 压缩后的目标占用
-    keep_recent: int = 6       # 压缩时保留最近多少条消息不动
+    keep_recent: int = 6       # 压缩时至多原样保留最近多少条消息（压完仍超预算时会被截短，见 compact.py）
 
 
 DEFAULT_POLICY = ContextPolicy()

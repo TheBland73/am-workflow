@@ -33,7 +33,8 @@ class Segment:
     text: str
     role: str = "user"           # user / assistant
     name: str = ""               # 冻结段的名字，用于冻结校验
-    limit: int | None = None     # 该段的 token 上限（估算），超出即截断
+    limit: int | None = None     # 预算不够时这个段允许缩到的基准（估算）。装配器不会主动按它截断，
+                                 # 要预先截断请先用 capped()；不给的冻结段永远不会被缩小
 
 
 @dataclass
