@@ -2,9 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from types import SimpleNamespace
 
+import httpx
+
+from app.conversation import compact
 from app.conversation.compact import compact_messages, needs_compaction
 from app.conversation.policy import ContextPolicy
+from app.db.base import init_db
+from app.models.providers.openai_chat import OpenAIChatAdapter
 from app.models.types import Message, ToolCall
 
 POLICY = ContextPolicy(compact_at=0.8, compact_to=0.5, keep_recent=2)
@@ -80,3 +87,137 @@ def test_kept_messages_never_start_with_an_orphaned_tool_result() -> None:
         messages, summarize=summarize, input_budget=800, policy=POLICY))
     assert [m.role for m in result[2:]] == ["assistant"]          # 最近两条里的工具结果没有孤立保留
     assert "[工具结果]" in seen[0]
+
+
+def test_long_history_is_summarized_from_oldest_to_newest_in_chunks() -> None:
+    # 待压缩的内容超过一次摘要的容量时，从旧到新分块、滚动摘要。
+    # 离保留窗口最近的部分最有用，不能像"整段截到上限"那样把它截掉
+    messages = [Message(role="system", content="系统")]
+    for index in range(6):
+        messages.append(Message(role="user", content=f"第{index}段开始" + "字" * 10_000))
+        messages.append(Message(role="assistant", content=f"第{index}段结束" + "字" * 10_000))
+    messages += [Message(role="user", content="最近的问题"), Message(role="assistant", content="最近的回答")]
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return f"摘要{len(seen)}"
+
+    result, _, _ = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=1_000_000, policy=POLICY))
+    assert len(seen) == 6                                     # 每块两万 token 左右，共六块
+    assert "第0段开始" in seen[0] and "第5段结束" in seen[-1]
+    assert "摘要1" in seen[1] and "摘要5" in seen[-1]          # 后一块连同前一块的摘要一起送入
+    assert result[1].content == "【较早对话的摘要】\n摘要6"
+    assert [m.content for m in result[2:]] == ["最近的问题", "最近的回答"]
+
+
+def test_usage_estimate_counts_tool_call_arguments() -> None:
+    # 工具调用的参数也在输入里（写文件时参数就是整个文件内容），不计就会太晚压缩
+    call = ToolCall(id="c1", name="write_file", args={"path": "a.py", "content": "字" * 3000})
+    plain = [Message(role="system", content="系统"), Message(role="user", content="字" * 1000)]
+    heavy = plain + [Message(role="assistant", content="", tool_calls=[call])]
+    assert needs_compaction(plain, input_budget=4000, policy=POLICY) is False
+    assert needs_compaction(heavy, input_budget=4000, policy=POLICY) is True
+
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return "摘要"
+
+    asyncio.run(compact_messages(
+        heavy + [Message(role="user", content="字" * 100)] * 3, summarize=summarize,
+        input_budget=100_000, policy=POLICY))
+    assert "write_file" in seen[0] and "a.py" in seen[0]       # 摘要的输入里看得到调用过什么、传了什么
+
+
+def test_summarizer_waits_for_the_provider_slot(monkeypatch) -> None:
+    # 摘要也是一次模型调用，要和正文调用一样受供应商并发数的约束
+    init_db()
+    order: list[str] = []
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        order.append("call")
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "摘要"}}]})
+
+    class Gate:
+        async def __aenter__(self) -> None:
+            order.append("enter")
+
+        async def __aexit__(self, *exc) -> None:
+            order.append("exit")
+
+    async def slot(provider):
+        order.append("slot")
+        return Gate()
+
+    monkeypatch.setattr(compact.pool, "slot", slot)
+    monkeypatch.setattr(compact.pool, "adapter_for",
+                        lambda model: OpenAIChatAdapter(base_url="http://mock/v1", api_key=""))
+    monkeypatch.setattr(
+        OpenAIChatAdapter, "_client",
+        lambda self: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    model = SimpleNamespace(id=None, model_name="m", max_output_tokens=4096,
+                            provider=SimpleNamespace(id=1))
+
+    asyncio.run(compact.make_summarizer(run_id="compact-slot", attempt_id=0, model=model)("旧对话"))
+    assert order == ["slot", "enter", "call", "exit"]
+    sent = json.loads(requests[0].content)
+    assert [m["content"] for m in sent["messages"]] == [compact.SUMMARIZER_PROMPT, "旧对话"]
+
+
+def test_folds_whole_tool_groups_into_the_summary_when_still_above_the_trigger() -> None:
+    # 保留部分里带着很大的工具调用参数（截不掉），压完仍在触发线之上：下一步请求会立刻再次
+    # 触发压缩。这时把保留部分里较早的几组整组并进摘要，直到落到触发线以下
+    def write(index: int) -> Message:
+        return Message(role="assistant", content="", tool_calls=[
+            ToolCall(id=f"c{index}", name="write_file", args={"path": "a.py", "content": "字" * 3000})])
+
+    messages = [Message(role="system", content="系统"), Message(role="user", content="任务")]
+    for index in range(5):
+        messages += [write(index), Message(role="tool", content="写好了", tool_call_id=f"c{index}")]
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return "摘要"
+
+    result, before, after = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=3000, policy=POLICY))
+    assert before >= 0.8 * 3000
+    assert after < 0.8 * 3000
+    assert [m.role for m in result] == ["system", "user"]      # 最近的一组也整组并进了摘要
+    assert len(seen) == 2 and "摘要" in seen[1] and "write_file" in seen[1]
+
+
+def test_kept_part_stays_valid_when_only_some_groups_are_folded() -> None:
+    # 只并入一部分时，留下的保留部分仍以"助手发起调用 → 工具结果"的完整一组开头
+    def write(index: int, size: int) -> Message:
+        return Message(role="assistant", content="", tool_calls=[
+            ToolCall(id=f"c{index}", name="write_file",
+                     args={"path": f"a{index}.py", "content": "字" * size})])
+
+    messages = [Message(role="system", content="系统"), Message(role="user", content="任务")]
+    for index in range(3):
+        messages += [write(index, 3000), Message(role="tool", content=f"{index} 写好了", tool_call_id=f"c{index}")]
+    messages += [write(3, 300), Message(role="tool", content="3 写好了", tool_call_id="c3")]
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return "摘要"
+
+    keep_four = ContextPolicy(compact_at=0.8, compact_to=0.5, keep_recent=4)
+    result, _, after = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=3000, policy=keep_four))
+    assert after < 0.8 * 3000
+    kept = result[2:]
+    assert [m.role for m in kept] == ["assistant", "tool"]      # 最后那一组留着，前一组整组并进了摘要
+    assert kept[0].tool_calls[0].id == "c3"
+    assert len(seen) == 2
+    assert "a2.py" in seen[1] and "2 写好了" in seen[1]         # 并进去的是完整的一组
+    assert "a3.py" not in seen[1]
