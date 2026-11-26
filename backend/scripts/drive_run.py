@@ -45,6 +45,20 @@ def snapshot(client: httpx.Client, run_id: str) -> dict:
     return resp.json()
 
 
+def approve_gate(client: httpx.Client, gate: dict) -> dict:
+    """按确认点的类型作答：会议内的确认点要带决定的内容，工件门直接通过。"""
+    kind = gate.get("kind") or ""
+    body: dict = {"decided_by": "demo"}
+    if kind == "clarify":
+        questions = (gate.get("payload") or {}).get("questions") or []
+        body["data"] = {"answers": ["以背景材料为准"] * max(1, len(questions))}
+    elif kind == "consensus":
+        body["data"] = {"option": "integrate"}
+    elif kind == "escalation":
+        body["data"] = {"option": "accept"}
+    return client.post(f"/gates/{gate['id']}/approve", json=body)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8099/api")
@@ -83,11 +97,12 @@ def main() -> None:
                 if gate is None:
                     time.sleep(0.4)
                     continue
-                print(f"[gate] #{gate['id']} {gate['node_key']}")
+                print(f"[gate] #{gate['id']} {gate['node_key']}"
+                      + (f" ({gate['kind']})" if gate.get("kind") else ""))
                 if gate["node_key"] == "gate_requirement" and args.demo_reject and not rejected:
                     rejected = True
                     resp = client.post(f"/gates/{gate['id']}/reject", json={
-                        "feedback": "需求缺少「导出周报」的验收标准，请补充 R6 并给出 Given/When/Then。",
+                        "feedback": "需求规格的 R1 缺少验收标准，请补充 Given/When/Then。",
                         "target_node": "requirement", "decided_by": "demo",
                     })
                 elif gate["node_key"] == "gate_design":
@@ -96,8 +111,7 @@ def main() -> None:
                         "artifact_body": EDIT_DESIGN,
                     })
                 else:
-                    resp = client.post(f"/gates/{gate['id']}/approve",
-                                       json={"decided_by": "demo"})
+                    resp = approve_gate(client, gate)
                 if resp.status_code >= 400:
                     raise SystemExit(f"门决策失败：{resp.status_code} {resp.text}")
                 data = resp.json()

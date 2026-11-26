@@ -646,8 +646,11 @@ class Orchestrator:
                 for node in s.query(Node).filter(Node.run_id == run_id, Node.status == "running").all():
                     node.status = "pending"
                     reset += 1
-            if reset:
-                await emit(run_id, "run_recovered", None, {"reset_nodes": reset})
+            # 被取消的运行（节点已回到待调度、没有 running 节点）也要留一条恢复事件：
+            # 它同样是"进程重启后由恢复流程重新拉起"，下游要靠这个事件确认恢复发生过。
+            if reset or status in ("created", "running"):
+                await emit(run_id, "run_recovered", None,
+                           {"reset_nodes": reset, "status": status})
             if status == "waiting_human":
                 with session_scope() as s:
                     open_gate = (

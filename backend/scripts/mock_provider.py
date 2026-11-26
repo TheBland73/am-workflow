@@ -91,7 +91,7 @@ WHEN 开发节点全部完成 THE SYSTEM SHALL 运行验证命令并据退出码
     if "R6" in joined or "周报" in joined or "导出" in joined:
         text = text.replace("## 3. 非功能需求", """### R6 周报导出
 
-WHEN 成员在反馈列表点击「导出周报」THE SYSTEM SHALL 生成当前筛选结果的 Markdown 周报并下载。
+WHEN 成员在反馈列表点击「导出周报」 THE SYSTEM SHALL 生成当前筛选结果的 Markdown 周报并下载。
 
 验收标准：
 - Given 已筛选出至少一条反馈，When 点击导出周报，Then 下载文件包含主题聚类与优先级建议。

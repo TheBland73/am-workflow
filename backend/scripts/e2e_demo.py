@@ -79,6 +79,23 @@ def decide(client: httpx.Client, gate: dict, action: str, **kwargs) -> None:
         print()
 
 
+def approve_gate(client: httpx.Client, gate: dict) -> None:
+    """按确认点的类型作答：会议内的确认点要带决定的内容，工件门直接通过。"""
+    kind = gate.get("kind") or ""
+    if kind == "clarify":
+        questions = (gate.get("payload") or {}).get("questions") or []
+        decide(client, gate, "approve", decided_by="demo",
+               data={"answers": ["以背景材料为准"] * max(1, len(questions))})
+    elif kind == "roster":
+        decide(client, gate, "approve", decided_by="demo")
+    elif kind == "consensus":
+        decide(client, gate, "approve", decided_by="demo", data={"option": "integrate"})
+    elif kind == "escalation":
+        decide(client, gate, "approve", decided_by="demo", data={"option": "accept"})
+    else:
+        decide(client, gate, "approve", decided_by="demo")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8099/api")
@@ -116,11 +133,11 @@ def main() -> None:
                 if args.demo_reject and not rejected and gate["node_key"] == "gate_requirement":
                     rejected = True
                     decide(client, gate, "reject",
-                           feedback="需求缺少「导出周报」的验收标准，请补充 R6 并给出 Given/When/Then。",
+                           feedback="需求规格的 R1 缺少验收标准，请补充 Given/When/Then。",
                            target_node="requirement", decided_by="demo")
                     continue
                 if args.auto:
-                    decide(client, gate, "approve", decided_by="demo")
+                    approve_gate(client, gate)
                 else:
                     action = input("通过(a) / 驳回(r) / 编辑后通过(e)? [a] ").strip().lower() or "a"
                     if action == "r":
@@ -136,7 +153,7 @@ def main() -> None:
                                      json={"body": body, "status": "approved"})
                         decide(client, gate, "approve", decided_by="human")
                     else:
-                        decide(client, gate, "approve", decided_by="human")
+                        approve_gate(client, gate)
                 continue
             time.sleep(0.6)
 
