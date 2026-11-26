@@ -79,7 +79,8 @@ async def _call_stream(model: ModelInfo, messages: list[Message], schemas: list[
 async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelInfo,
                     system_prompt: str, user_prompt: str, toolbox: Toolbox | None,
                     max_steps: int = 12, temperature: float = 0.4, quiet: bool = False,
-                    token_extra: dict | None = None) -> AgentResult:
+                    token_extra: dict | None = None,
+                    extra_messages: list[Message] | None = None) -> AgentResult:
     if toolbox is not None and not model.cap_tools:
         return await _run_json_protocol(
             run_id=run_id, node_id=node_id, attempt_id=attempt_id, model=model,
@@ -88,10 +89,9 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
         )
 
     schemas = toolbox.schemas() if toolbox else None
-    messages = [
-        Message(role="system", content=system_prompt),
-        Message(role="user", content=user_prompt),
-    ]
+    messages = [Message(role="system", content=system_prompt)]
+    messages += extra_messages if extra_messages is not None else [
+        Message(role="user", content=user_prompt)]
     total = Usage()
     for step in range(1, max_steps + 1):
         params = GenParams(
@@ -99,8 +99,9 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
             temperature=temperature,
             max_tokens=min(4096, model.max_output_tokens or 4096),
         )
-        if len(messages) > 2:
+        if extra_messages is None and len(messages) > 2:
             # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）。
+            # 调用方给了现成的消息列表（会议）时跳过：冻结区由调用方自己管理，这里压了会破坏前缀。
             # 摘要失败时按原消息继续——压缩只是优化，不该让已经跑了很久的节点作废、从头重来。
             # 预算耗尽是例外：那是要由人处理的事，照常上抛。
             try:

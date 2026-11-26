@@ -17,7 +17,7 @@ from app.db.models import (MEETING_ABANDONED, MEETING_ACTIVE, MEETING_COMPLETED,
 from app.engine.events import emit
 from app.engine.feedback import REOPEN_KINDS
 from app.engine.gates import gate_payload
-from app.engine.runners import NodeContext
+from app.engine.runners import NodeContext, NodeFailure
 from app.meeting import store
 from app.meeting.checkpoints import get_decision
 from app.meeting.protocols.base import get_protocol
@@ -109,7 +109,13 @@ async def run_meeting(ctx: NodeContext) -> dict:
                    {"meeting_id": meeting_id, "reason": reason})
     if reason != "new":
         store.update_meeting(meeting_id, status=MEETING_ACTIVE)
-    result = await protocol.run(mtg)
+    from app.meeting.calls import CallOutputError
+
+    try:
+        result = await protocol.run(mtg)
+    except CallOutputError as exc:
+        # 结构化输出不合格：按普通节点失败处理，编排器会带反馈重试；重入时从当前步骤续开
+        raise NodeFailure(f"模型输出不符合要求：{exc}") from exc
     if result.action == "suspend":
         return {"suspended": True, "meeting_id": meeting_id, "checkpoint": result.checkpoint,
                 "summary": result.summary}

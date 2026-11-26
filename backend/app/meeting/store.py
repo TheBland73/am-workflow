@@ -272,3 +272,26 @@ def attach_intervention_turn(intervention_id: int, turn_id: int) -> None:
         row = _require(s, MeetingIntervention, intervention_id, "插话")
         row.status = "injected"
         row.injected_turn_id = turn_id
+
+
+def count_turns(meeting_id: int) -> int:
+    with session_scope() as s:
+        return s.query(func.count(MeetingTurn.id)).filter(
+            MeetingTurn.meeting_id == meeting_id).scalar() or 0
+
+
+def find_turn(meeting_id: int, *, phase: str, round: int, kind: str,
+              speaker_id: int) -> dict | None:
+    """取某步骤某轮里某参会者的那条发言，断点续跑时用。"""
+    with session_scope() as s:
+        row = (
+            s.query(MeetingTurn)
+            .filter(MeetingTurn.meeting_id == meeting_id, MeetingTurn.phase == phase,
+                    MeetingTurn.round == round, MeetingTurn.kind == kind,
+                    MeetingTurn.speaker_id == speaker_id, MeetingTurn.content != "")
+            .order_by(MeetingTurn.seq.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return {"turn_id": row.id, "content": row.content, "data": dict(row.structured_json or {})}

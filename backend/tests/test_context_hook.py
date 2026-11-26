@@ -173,8 +173,29 @@ def test_failed_summarization_does_not_kill_the_node(monkeypatch) -> None:
     assert logs and all(level == "warn" and "压缩" in message for level, message in logs)
 
 
-def test_budget_exhausted_during_summarization_still_stops_the_run(monkeypatch) -> None:
-    # 预算耗尽是例外：那是必须由人处理的事，照常上抛
+def test_extra_messages_skip_the_compaction_hook(monkeypatch) -> None:
+    """会议把整份上下文经 extra_messages 交给工具循环：冻结区由会议自己压，钩子不能再动它。"""
+    node_id, attempt_id = _setup("hook-j")
+    seen: list[list[Message]] = []
+    _install_fake_stream(monkeypatch, seen, tool_calls=5)
+    touched: list[int] = []
+
+    async def spy_maybe_compact(**kwargs):
+        touched.append(1)
+        return kwargs["messages"], -1, -1
+
+    monkeypatch.setattr(agent_loop, "maybe_compact", spy_maybe_compact)
+    history = [Message(role="user", content="字" * 900) for _ in range(10)]
+    result = asyncio.run(run_agent(
+        run_id="hook-j", node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
+        system_prompt="系统", user_prompt="", toolbox=Toolbox(workspace_dir("hook-j"), allow_shell=False),
+        max_steps=6, quiet=True, extra_messages=history))
+    assert result.content == "完成"
+    assert touched == []                                     # 钩子一次都没有被调用
+    assert seen[-1][1].content == "字" * 900                  # 原始上下文原样还在
+
+
+def test_budget_exhausted_during_summarization_still_stops_the_run(monkeypatch) -> None:    # 预算耗尽是例外：那是必须由人处理的事，照常上抛
     node_id, attempt_id = _setup("hook-i")
     toolbox = Toolbox(workspace_dir("hook-i"), allow_shell=False)
     _install_fake_stream(monkeypatch, [], tool_calls=5)
