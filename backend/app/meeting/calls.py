@@ -21,6 +21,7 @@ from app.conversation.store import record_compaction
 from app.engine.agent_loop import _extract_json, run_agent
 from app.engine.events import emit
 from app.engine.runners import NodeFailure
+from app.engine.usage import BudgetExceeded
 from app.meeting import store
 from app.meeting.prompts import BASE_SYSTEM_PROMPT, call_tag, persona_block
 from app.meeting.session import MeetingSession
@@ -75,14 +76,20 @@ async def _summarize_exchanges(mtg: MeetingSession, model, text: str) -> str:
     """把较早的逐字发言压成摘要。也走工具循环并带调用标识，Mock 与测试替身按标识路由。"""
     input_budget = ContextBudget(model.context_window, model.max_output_tokens).input_budget
     prompt = (
+        f"{_SUMMARIZER}\n\n"
         "把下面这些会议发言压成一段摘要。保留：已经确定的结论及其理由、还没解决的问题、"
         "谁坚持什么。不要加入原文没有的信息。只输出摘要正文，不要标题。\n\n"
         f"{truncate_to_tokens(text, int(input_budget * 0.6))}\n\n{call_tag('summarize')}")
     result = await run_agent(
         run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id, model=model,
         system_prompt=BASE_SYSTEM_PROMPT, user_prompt=prompt, toolbox=None,
-        max_steps=1, temperature=0.2, quiet=True)
-    return strip_outer_fence(result.content).strip() or "（摘要为空）"
+        max_steps=1, temperature=0.2, quiet=True,
+        token_extra={"meeting_id": mtg.meeting_id})
+    summary = strip_outer_fence(result.content).strip()
+    if not summary:
+        # 空摘要会顶掉滚动摘要里此前的内容（与 A3 的 make_summarizer 同一口径）
+        raise RuntimeError("摘要模型返回了空正文")
+    return summary
 
 
 async def _fit(mtg: MeetingSession, model, segments: list[Segment],
@@ -90,19 +97,27 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
     """追加区占到压缩阈值时，把其中较早的发言压成一条摘要。只改这次发出的视图，不改纪要。
 
     压缩只动追加区：冻结区（章程、人设、账本快照）是前缀缓存命中的部分，本轮内逐字节不变。
+    摘要失败时按原视图继续——压缩只是优化，不该让一次发言作废；预算耗尽是例外。
     """
     policy = DEFAULT_POLICY
     fixed = estimate_tokens(BASE_SYSTEM_PROMPT) + sum(
         estimate_tokens(s.text) for s in segments if s.kind == "frozen")
     append = [s for s in segments if s.kind == "append"]
     size = fixed + sum(estimate_tokens(s.text) for s in append) + _TAIL_RESERVE
-    if len(append) <= policy.keep_recent or size < policy.compact_at * input_budget:
+    if size < policy.compact_at * input_budget:
         return segments
     messages = [Message(role="system", content="系统")]
     messages += [Message(role=s.role, content=s.text) for s in append]
-    compacted, before, after = await compact_messages(
-        messages, summarize=lambda text: _summarize_exchanges(mtg, model, text),
-        input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy)
+    try:
+        compacted, before, after = await compact_messages(
+            messages, summarize=lambda text: _summarize_exchanges(mtg, model, text),
+            input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy)
+    except BudgetExceeded:
+        raise
+    except Exception as exc:
+        await emit(mtg.run_id, "node_log", mtg.node_id, {
+            "level": "warn", "message": f"会议上下文压缩失败，按原内容继续：{exc}"[:300]})
+        return segments
     if compacted is messages:
         return segments
     await record_compaction(
@@ -129,13 +144,17 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
         await drain_interventions(mtg)
     model = _model_for(participant)
     persona = Segment("frozen", persona_block(participant),
-                      name=f"角色人设:{participant.get('display_name')}")
-    segments = list(charter or []) + [persona] + list(segments)
+                      name=f"角色人设:{participant.get('id')}")
+    segments = [s for s in list(charter or []) + [persona] + list(segments) if s.text.strip()]
     budget = ContextBudget(model.context_window, model.max_output_tokens)
     segments = await _fit(mtg, model, segments, budget.input_budget)
     tail = Segment("tail", f"{instruction}\n\n{call_tag(kind)}", name="instruction")
     built = mtg.builder.build(segments + [tail], system=BASE_SYSTEM_PROMPT,
                               input_budget=budget.input_budget)
+    if built.truncated:
+        await emit(mtg.run_id, "node_log", mtg.node_id, {
+            "level": "warn",
+            "message": f"上下文超出预算，已截短：{'、'.join(built.truncated)}"[:300]})
     if built.frozen_changed:
         await emit(mtg.run_id, "context_prefix_changed", mtg.node_id,
                    {"meeting_id": mtg.meeting_id, "segments": built.frozen_changed})
@@ -178,8 +197,12 @@ async def speak_many(mtg: MeetingSession, calls: list[dict], *,
     """
     if not calls:
         return []
-    phase, round_no = _phase(mtg), calls[0].get("turn_round") or mtg.round_no()
-    kind = calls[0]["turn_kind"]
+    rounds = {call.get("turn_round") or mtg.round_no() for call in calls}
+    kinds = {call["turn_kind"] for call in calls}
+    if len(rounds) > 1 or len(kinds) > 1:
+        raise ValueError("同一批并行发言必须属于同一轮、同一类型")
+    phase, round_no = _phase(mtg), rounds.pop()
+    kind = kinds.pop()
     done: set[int] = set()
     if resumable:
         done = store.completed_speakers(mtg.meeting_id, phase=phase, round=round_no, kind=kind)
@@ -196,11 +219,21 @@ async def speak_many(mtg: MeetingSession, calls: list[dict], *,
         pending.append(index)
     if pending:
         await drain_interventions(mtg)
-    outputs = await asyncio.gather(*(
-        speak(mtg, drain=False, **calls[index]) for index in pending))
+    # 一名发言者失败时不留下同组的孤儿调用：取消其余任务，重试时不会出现重复发言
+    tasks = [asyncio.create_task(speak(mtg, drain=False, **calls[index]))
+             for index in pending]
+    try:
+        outputs = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     for index, output in zip(pending, outputs):
         results[index] = output
-    return [r for r in results if r is not None]
+    if any(result is None for result in results):
+        raise RuntimeError("并行发言的结果不完整")
+    return results
 
 
 async def drain_interventions(mtg: MeetingSession) -> bool:

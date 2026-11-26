@@ -114,6 +114,32 @@ def test_participants_cannot_be_changed_after_roster(monkeypatch) -> None:
     assert response.status_code == 400
 
 
+def test_invalid_model_id_keeps_roster(monkeypatch) -> None:
+    mtg = _meeting()
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试",
+                          mode="participant", system_prompt="你是测试")
+    payload = {"participants": [{"display_name": "架构", "persona": "x",
+                                 "mode": "participant", "model_id": 999_999}]}
+    with _client(monkeypatch) as client:
+        response = client.put(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/participants",
+                              json=payload)
+    assert response.status_code == 400
+    assert [r["display_name"] for r in store.list_participants(mtg.meeting_id)] == ["主持人", "测试"]
+
+
+def test_unknown_role_key_keeps_roster(monkeypatch) -> None:
+    mtg = _meeting()
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试",
+                          mode="participant", system_prompt="你是测试")
+    payload = {"participants": [{"role_key": "no_such_role", "display_name": "架构",
+                                 "mode": "participant"}]}
+    with _client(monkeypatch) as client:
+        response = client.put(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/participants",
+                              json=payload)
+    assert response.status_code == 400
+    assert [r["display_name"] for r in store.list_participants(mtg.meeting_id)] == ["主持人", "测试"]
+
+
 def test_patch_decision_point_while_suspended(monkeypatch) -> None:
     mtg = _meeting()
     point_id = store.upsert_decision_point(mtg.meeting_id, "D1", title="先做哪个平台",
@@ -124,6 +150,35 @@ def test_patch_decision_point_while_suspended(monkeypatch) -> None:
             json={"status": "deferred", "conclusion": "留待用户决定"})
     assert response.status_code == 200, response.text
     assert store.list_decision_points(mtg.meeting_id)[0]["status"] == "deferred"
+
+
+def test_decision_point_patch_requires_suspension(monkeypatch) -> None:
+    mtg = _meeting(phase="debate", suspend=False)
+    point_id = store.upsert_decision_point(mtg.meeting_id, "D1", title="先做哪个平台",
+                                           status="open")
+    with _client(monkeypatch) as client:
+        response = client.patch(
+            f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/decision-points/{point_id}",
+            json={"status": "deferred"})
+    assert response.status_code == 400
+
+
+def test_meeting_of_another_run_is_404(monkeypatch) -> None:
+    mtg = _meeting()
+    other = _meeting()
+    with _client(monkeypatch) as client:
+        response = client.get(f"/api/runs/{other.run_id}/meetings/{mtg.meeting_id}")
+    assert response.status_code == 404
+
+
+def test_intervention_queue_has_a_limit(monkeypatch) -> None:
+    mtg = _meeting(phase="debate", suspend=False)
+    for _ in range(20):
+        store.queue_intervention(mtg.meeting_id, content="一直说")
+    with _client(monkeypatch) as client:
+        response = client.post(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/intervene",
+                               json={"content": "第二十一条"})
+    assert response.status_code == 400
 
 
 def test_intervene_queues_request(monkeypatch) -> None:

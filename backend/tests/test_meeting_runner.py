@@ -12,8 +12,9 @@ from app.engine.orchestrator import orchestrator
 from app.engine.runners import NodeContext, NodeFailure
 from app.engine.templates import seed_defaults
 from app.meeting import store
-from app.meeting.protocols.base import (MeetingProtocol, advance, done, register_protocol,
-                                        reroute_or_escalate, suspend)
+from app.meeting.calls import CallOutputError
+from app.meeting.protocols.base import (MeetingProtocol, StepResult, advance, done,
+                                        register_protocol, reroute_or_escalate, suspend)
 from app.meeting.runner import run_meeting
 
 _counter = iter(range(1, 1000))
@@ -60,6 +61,26 @@ class LoopProtocol(MeetingProtocol):
         if result is None:
             return done("人接受了现状")
         return result
+
+
+@register_protocol
+class BadRerouteProtocol(MeetingProtocol):
+    """回流的契约写坏了：要求回流却没有指令。"""
+
+    name = "bad_reroute"
+    steps = ("go",)
+
+    async def step_go(self, mtg):
+        return StepResult(action="reroute")
+
+
+@register_protocol
+class OutputErrorProtocol(MeetingProtocol):
+    name = "output_error"
+    steps = ("go",)
+
+    async def step_go(self, mtg):
+        raise CallOutputError("缺少 must 字段")
 
 
 def _run(protocol: str = "toy", **config) -> tuple[str, int]:
@@ -283,3 +304,28 @@ def test_orchestrator_parks_the_run_at_a_checkpoint_and_resumes_after_the_decisi
         events = [e.type for e in s.query(Event).filter(Event.run_id == run_id).all()]
     assert events.index("meeting_started") < events.index("meeting_suspended") < events.index(
         "meeting_resumed") < events.index("meeting_finished") < events.index("run_finished")
+
+
+def test_reroute_self_note_reaches_the_protocol() -> None:
+    """回流写给下一轮的自我提示也是一条待处理反馈，协议在入口取得到。"""
+    run_id, node_id = _run()
+    first = asyncio.run(run_meeting(_ctx(run_id, node_id)))      # 先挂起一次
+    store.update_meeting(first["meeting_id"], status="waiting_rework")
+    asyncio.run(run_meeting(_ctx(run_id, node_id, feedback="下一轮复核 D3 的处理结果",
+                                 feedback_kind="reroute_self", feedback_seq=2)))
+    assert store.get_state(first["meeting_id"])["feedbacks"] == ["下一轮复核 D3 的处理结果"]
+
+
+def test_protocol_reroute_without_instruction_is_fatal() -> None:
+    run_id, node_id = _run("bad_reroute")
+    with pytest.raises(NodeFailure) as caught:
+        asyncio.run(run_meeting(_ctx(run_id, node_id, "bad_reroute")))
+    assert caught.value.fatal is True
+
+
+def test_call_output_error_becomes_a_retryable_node_failure() -> None:
+    run_id, node_id = _run("output_error")
+    with pytest.raises(NodeFailure) as caught:
+        asyncio.run(run_meeting(_ctx(run_id, node_id, "output_error")))
+    assert caught.value.fatal is False
+    assert "模型输出不符合要求" in str(caught.value)

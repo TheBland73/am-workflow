@@ -16,7 +16,8 @@ from app.engine.templates import seed_defaults
 from app.meeting import calls, store
 from app.meeting.calls import CallOutputError, speak, speak_many
 from app.meeting.session import MeetingSession
-from tests.meeting_fakes import install
+from app.models.types import Usage
+from tests.meeting_fakes import MODEL, install
 
 _counter = iter(range(1, 1000))
 
@@ -133,6 +134,7 @@ def test_intervention_is_injected_and_acknowledged(monkeypatch) -> None:
     types = [e["type"] for e in load_events(mtg.run_id)]
     assert "meeting_intervention_injected" in types
 
+
 def test_shared_charter_comes_before_persona(monkeypatch) -> None:
     """章程排在人设之前：它和系统提示在全体角色之间是同一段前缀。"""
     seen: list[dict] = []
@@ -185,3 +187,81 @@ def test_speak_compacts_old_turns_at_threshold(monkeypatch) -> None:
     assert 0 < seen[-1]["text"].count("字" * 150) <= 6
     assert "context_compacted" in [e["type"] for e in load_events(mtg.run_id)]
     assert len(store.list_turns(mtg.meeting_id)) == 1          # 做摘要不算一次发言
+
+
+def test_summarization_failure_falls_back_to_uncompressed(monkeypatch) -> None:
+    """摘要调用失败时按原视图继续：压缩只是优化，不该让这次发言作废。"""
+    install(monkeypatch, {"position": "立场"})
+    small = SimpleNamespace(id=1, model_name="mock-small", display_name="Mock Small",
+                            context_window=1600, max_output_tokens=256, cap_tools=True)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: small)
+    mtg, (_, speaker) = _meeting()
+    old = [Segment("append", "字" * 150, name=f"发言{index}") for index in range(10)]
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("摘要服务挂了")
+
+    monkeypatch.setattr(calls, "compact_messages", broken)
+    result = _speak(mtg, speaker, segments=[Segment("frozen", "章程", name="章程"), *old],
+                    instruction="请写立场")
+    assert result["content"] == "立场"
+    logs = [e for e in load_events(mtg.run_id) if e["type"] == "node_log"]
+    assert any("压缩失败" in e["payload"].get("message", "") for e in logs)
+
+
+def test_resumed_turn_keeps_data_shape(monkeypatch) -> None:
+    install(monkeypatch, {"position": '{"must": ["可验证"]}'})
+    mtg, (_, speaker) = _meeting()
+    _speak(mtg, speaker, segments=[], instruction="请写立场",
+           structured=_is_list_of_strings)
+    call = {"kind": "position", "turn_kind": "position", "segments": [], "instruction": "请写立场"}
+    results = asyncio.run(speak_many(mtg, [{**call, "participant": speaker}]))
+    assert results[0]["data"] == {"must": ["可验证"]}
+
+
+def test_resumed_turn_without_structure_has_data_none(monkeypatch) -> None:
+    install(monkeypatch, {"position": "立场"})
+    mtg, (_, speaker) = _meeting()
+    _speak(mtg, speaker, segments=[], instruction="请写立场")
+    call = {"kind": "position", "turn_kind": "position", "segments": [], "instruction": "请写立场"}
+    results = asyncio.run(speak_many(mtg, [{**call, "participant": speaker}]))
+    assert results[0]["data"] is None
+
+
+def test_speak_many_preserves_request_order(monkeypatch) -> None:
+    install(monkeypatch, {"position": lambda text: "甲" if "架构师" in text else "乙"})
+    mtg, (_, speaker) = _meeting()
+    other_id = store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试",
+                                     mode="participant", system_prompt="你是测试")
+    other = next(p for p in store.list_participants(mtg.meeting_id) if p["id"] == other_id)
+    call = {"kind": "position", "turn_kind": "position", "segments": [], "instruction": "请写立场"}
+    results = asyncio.run(speak_many(mtg, [{**call, "participant": other},
+                                           {**call, "participant": speaker}]))
+    assert [r["content"] for r in results] == ["乙", "甲"]
+
+
+def test_speak_many_cancels_siblings_on_failure(monkeypatch) -> None:
+    """一名发言者失败时不留下同组的孤儿调用，重试时不会写出重复发言。"""
+    mtg, (_, speaker) = _meeting()
+    other_id = store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试",
+                                     mode="participant", system_prompt="你是测试")
+    other = next(p for p in store.list_participants(mtg.meeting_id) if p["id"] == other_id)
+    finished: list[str] = []
+
+    async def fake_run_agent(**kwargs):
+        text = "\n".join(m.content for m in kwargs.get("extra_messages") or [])
+        if "架构师" in text:
+            raise CallOutputError("模型输出不符合要求")
+        await asyncio.sleep(0.05)
+        finished.append("测试")
+        return SimpleNamespace(content="立场", usage=Usage(10, 5, 0), steps=1,
+                               stopped_by="final")
+
+    monkeypatch.setattr(calls, "run_agent", fake_run_agent)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: MODEL)
+    call = {"kind": "position", "turn_kind": "position", "segments": [], "instruction": "请写立场"}
+    with pytest.raises(CallOutputError):
+        asyncio.run(speak_many(mtg, [{**call, "participant": speaker},
+                                     {**call, "participant": other}]))
+    assert finished == []                                     # 同组任务已在后台被取消
+    assert all(t["content"] == "" for t in store.list_turns(mtg.meeting_id))

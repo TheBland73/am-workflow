@@ -195,7 +195,8 @@ def test_extra_messages_skip_the_compaction_hook(monkeypatch) -> None:
     assert seen[-1][1].content == "字" * 900                  # 原始上下文原样还在
 
 
-def test_budget_exhausted_during_summarization_still_stops_the_run(monkeypatch) -> None:    # 预算耗尽是例外：那是必须由人处理的事，照常上抛
+def test_budget_exhausted_during_summarization_still_stops_the_run(monkeypatch) -> None:
+    # 预算耗尽是例外：那是必须由人处理的事，照常上抛
     node_id, attempt_id = _setup("hook-i")
     toolbox = Toolbox(workspace_dir("hook-i"), allow_shell=False)
     _install_fake_stream(monkeypatch, [], tool_calls=5)

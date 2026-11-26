@@ -116,6 +116,34 @@ def list_participants(meeting_id: int, active_only: bool = True) -> list[dict]:
         return [_participant_dict(r) for r in query.order_by(MeetingParticipant.position.asc()).all()]
 
 
+def replace_participants(meeting_id: int, participants: list[dict],
+                         editable_modes: tuple[str, ...]) -> None:
+    """把可编辑模式的参会者整体换成 participants，同一个事务里完成。
+
+    主持人、需求方代理、主席等不可编辑的模式原样保留；被替换的行标为 removed 供审计。
+    任何一条写入失败都整体回滚，不会留下半套名单。
+    """
+    with session_scope() as s:
+        rows = (
+            s.query(MeetingParticipant)
+            .filter(MeetingParticipant.meeting_id == meeting_id)
+            .order_by(MeetingParticipant.position.asc())
+            .all()
+        )
+        position = max((row.position for row in rows), default=0)
+        for row in rows:
+            if row.status == "active" and row.mode in editable_modes:
+                row.status = "removed"
+        for item in participants:
+            position += 1
+            s.add(MeetingParticipant(
+                meeting_id=meeting_id, role_key=item.get("role_key"),
+                display_name=item["display_name"], mode=item["mode"],
+                system_prompt=item.get("system_prompt") or "",
+                model_id=item.get("model_id"), source="user",
+                expertise_json=[], position=position))
+
+
 def update_participant(participant_id: int, **fields) -> None:
     with session_scope() as s:
         row = _require(s, MeetingParticipant, participant_id, "参会者")
@@ -294,4 +322,5 @@ def find_turn(meeting_id: int, *, phase: str, round: int, kind: str,
         )
         if row is None:
             return None
-        return {"turn_id": row.id, "content": row.content, "data": dict(row.structured_json or {})}
+        return {"turn_id": row.id, "content": row.content,
+                "data": dict(row.structured_json) if row.structured_json else None}

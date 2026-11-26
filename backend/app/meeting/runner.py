@@ -4,6 +4,7 @@
 - 该节点还没有会议 → 新建；
 - 节点带着要复议的反馈（人工驳回、定点回流、用户带反馈的重试）→ 续开，反馈存进会议状态，
   由协议在入口处取走；每条反馈只处理一次。失败后的自动重试也带反馈，但只原地续开；
+- 节点带着回流时写给下一轮的自我提示（reroute_self）→ 同样作为待处理反馈交给协议；
 - 没有反馈：会议在进行中或等待返工 → 从当前步骤续开；
   会议在挂起且确认点已有决定 → 读取决定后续开；
   会议在挂起、确认点还开着 → 什么都不做，继续等这个决定；
@@ -72,7 +73,9 @@ def _enter(ctx: NodeContext, protocol: str) -> tuple[int, str]:
         return new()
     feedback = str(config.get("feedback") or "").strip()
     seq = config.get("feedback_seq")
-    reopen = (bool(feedback) and config.get("feedback_kind") in REOPEN_KINDS
+    # 要复议的来路，以及发起回流的节点写给下一轮的自我提示
+    reopen = (bool(feedback)
+              and config.get("feedback_kind") in (*REOPEN_KINDS, "reroute_self")
               and seq != existing["state"].get("handled_feedback_seq"))
     if reopen:
         store.update_meeting(
@@ -116,6 +119,10 @@ async def run_meeting(ctx: NodeContext) -> dict:
     except CallOutputError as exc:
         # 结构化输出不合格：按普通节点失败处理，编排器会带反馈重试；重入时从当前步骤续开
         raise NodeFailure(f"模型输出不符合要求：{exc}") from exc
+    if result.action == "reroute" and not result.reroute:
+        raise NodeFailure("协议要求回流但没有给出回流指令", fatal=True)
+    if result.action not in ("suspend", "reroute", "done"):
+        raise NodeFailure(f"协议返回了未知动作：{result.action}", fatal=True)
     if result.action == "suspend":
         return {"suspended": True, "meeting_id": meeting_id, "checkpoint": result.checkpoint,
                 "summary": result.summary}

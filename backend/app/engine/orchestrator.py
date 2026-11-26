@@ -279,8 +279,11 @@ class Orchestrator:
         评审会议不会被调度。extra_round 为真表示人已同意再评一轮：轮次和上限一起加一。
         """
         config = dict(node["config"] or {})
-        round_no = int(config.get("round") or 1)
-        max_rounds = max(1, int(config.get("max_rounds") or 3))
+        try:
+            round_no = max(1, int(config.get("round") or 1))
+            max_rounds = max(1, int(config.get("max_rounds") or 3))
+        except (TypeError, ValueError):
+            round_no, max_rounds = 1, 3
         targets = [str(key) for key in (instruction.get("targets") or [])]
         feedback = str(instruction.get("feedback") or "")
         extra_round = bool(instruction.get("extra_round"))
@@ -328,6 +331,11 @@ class Orchestrator:
         await emit(run_id, "node_rerouted", node["id"], {
             "from": node["node_key"], "targets": reset, "round": round_no + 1,
             "max_rounds": bump.get("max_rounds", max_rounds), "escalated": False})
+        skipped = [key for key in targets if key not in reset]
+        if skipped:
+            await emit(run_id, "node_log", node["id"], {
+                "level": "warn",
+                "message": f"回流目标未重置（正在运行或不存在）：{'、'.join(skipped)}"})
 
     # ---------- 评审回流 ----------
     async def _handle_review_block(self, run_id: str, node: dict, attempt_id: int,

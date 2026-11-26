@@ -113,3 +113,32 @@ def test_extra_round_allows_one_more_round() -> None:
     assert node["status"] == "pending"
     assert (node["config"]["round"], node["config"]["max_rounds"]) == (3, 3)
     assert load_events(run_id)[0]["payload"]["escalated"] is False
+
+
+def test_unknown_target_is_reported() -> None:
+    run_id = _graph(round_no=1)
+    orchestrator = Orchestrator()
+    _reroute(run_id, orchestrator, targets=["target", "nope"], self_feedback=None)
+    _, nodes = orchestrator._load(run_id)
+    by_key = {n["node_key"]: n for n in nodes}
+    assert by_key["target"]["status"] == "pending"
+    events = load_events(run_id)
+    assert [e["type"] for e in events] == ["node_rerouted", "node_log"]
+    assert "nope" in events[1]["payload"]["message"]
+
+
+def test_run_attempt_dispatches_reroute(monkeypatch) -> None:
+    run_id = _graph(round_no=1)
+    orchestrator = Orchestrator()
+    captured: dict = {}
+
+    async def fake_execute(ctx):
+        return {"reroute": {"targets": ["target"], "feedback": "D3 需要复议"}}
+
+    async def fake_handle(run_id_: str, node: dict, instruction: dict) -> None:
+        captured.update(instruction)
+
+    monkeypatch.setattr("app.engine.orchestrator.execute_node", fake_execute)
+    monkeypatch.setattr(orchestrator, "_handle_reroute", fake_handle)
+    asyncio.run(orchestrator._run_attempt(run_id, _self_node(orchestrator, run_id)))
+    assert captured["targets"] == ["target"]
