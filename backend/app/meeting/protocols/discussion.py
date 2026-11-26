@@ -29,7 +29,7 @@ from app.engine.events import emit
 from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_template
 from app.engine.validate import validate_artifact
-from app.meeting import minutes, render, store
+from app.meeting import minutes, proposal, render, store
 from app.meeting.calls import speak, speak_many
 from app.meeting.checkpoints import record_auto_decision
 from app.meeting.protocols.base import MeetingProtocol, advance, done, register_protocol, suspend
@@ -579,29 +579,6 @@ def _consensus_description(mtg, open_points: list[dict], reason: str) -> str:
     lines += [f"{number}. {option['label']}：{option['description']}"
               for number, option in enumerate(CONSENSUS_OPTIONS, start=1)]
     return "\n".join(lines)
-
-
-def _index_section(points: list[dict]) -> str:
-    lines = ["## 决策点索引", "", "| 编号 | 状态 | 结论 |", "|---|---|---|"]
-    lines += [f"| {point['index']} | {render.STATUS_NAMES.get(point['status'], point['status'])} | "
-              f"{point.get('conclusion') or '—'} |" for point in points]
-    return "\n".join(lines) + "\n"
-
-
-def _pending_section(mtg, points: list[dict]) -> str:
-    """待确认问题由程序生成：待定的决策点带着各方理由，没有出处的澄清结果按假设列出。"""
-    items = []
-    for point in points:
-        if point["status"] != DEFERRED:
-            continue
-        reasons = "；".join(f"{stance.get('name')}：{stance.get('reason')}"
-                           for stance in (point.get("stances") or {}).values()
-                           if stance.get("reason"))
-        items.append(f"- [ ] {point['index']} {point['title']}：{reasons or '各方未达成一致'}")
-    for item in mtg.state().get("clarifications") or []:
-        if item["source"] == "assumption":
-            items.append(f"- [ ] 假设：{item['question']}——{item['answer']}")
-    return "\n".join(["## 待确认问题"] + (items or ["（无）"])) + "\n"
 
 
 @register_protocol
@@ -1182,8 +1159,8 @@ class DiscussionProtocol(MeetingProtocol):
         if issues:
             raise NodeFailure("建设方案正文校验未通过：" + "；".join(issues))
         points = _points(mtg)
-        body = (draft + "\n\n" + _index_section(points) + "\n"
-                + _pending_section(mtg, points))
+        body = proposal.compose(draft, points=points,
+                                clarifications=mtg.state().get("clarifications") or [])
         issues = validate_artifact("proposal", body)
         if issues:
             raise NodeFailure("建设方案校验未通过：" + "；".join(issues))
