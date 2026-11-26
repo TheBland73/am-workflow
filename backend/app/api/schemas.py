@@ -59,11 +59,24 @@ class ModelPatch(BaseModel):
 
 
 class TemplatePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
     system_prompt: str | None = None
     tools_json: list[str] | None = None
     default_model_id: int | None = None
     max_steps: int | None = None
     stop_condition: list[str] | None = None
+    meta: dict | None = None
+
+
+class TemplateCreate(BaseModel):
+    role_key: str = Field(min_length=2, max_length=40, pattern=r"^[a-z][a-z0-9_]+$")
+    name: str = Field(min_length=1, max_length=120)
+    system_prompt: str = Field(min_length=1)
+    tools_json: list[str] = Field(default_factory=list)
+    memory_scope: str = "agent"
+    max_steps: int = Field(default=3, ge=1, le=64)
+    default_model_id: int | None = None
+    meta: dict = Field(default_factory=dict)
 
 
 class RunIn(BaseModel):

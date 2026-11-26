@@ -22,7 +22,11 @@ BUILTIN_FIELDS = (
     "memory_scope",
     "max_steps",
     "stop_condition",
+    "meta_json",
 )
+
+# 不再内置的角色：启动时清理没被用户改过的；改过的和旧库里没有指纹的保留为自定义角色
+RETIRED_ROLES = ("discuss_pro", "discuss_con", "discuss_mod", "proposal")
 
 
 def load_definition(template_key: str = "sdlc_v1") -> dict:
@@ -41,7 +45,7 @@ def _canonical_json(data: dict) -> str:
 
 
 def builtin_fingerprint(fields: dict) -> str:
-    """六个可编辑字段的 sha256 指纹（规范化 JSON 的 UTF-8 字节）。"""
+    """七个可编辑字段的 sha256 指纹（规范化 JSON 的 UTF-8 字节）。"""
     return hashlib.sha256(_canonical_json(fields).encode("utf-8")).hexdigest()
 
 
@@ -54,11 +58,12 @@ def role_fields(role: dict) -> dict:
         "memory_scope": role.get("memory_scope", "agent"),
         "max_steps": int(role.get("max_steps") or 3),
         "stop_condition": list(role.get("stop_condition") or []),
+        "meta_json": dict(role.get("meta") or {}),
     }
 
 
 def template_fields(row: AgentTemplate) -> dict:
-    """DB 行 → 同样的六个字段（JSON 列已反序列化为 Python 对象，可直接哈希）。"""
+    """DB 行 → 同样的七个字段（JSON 列已反序列化为 Python 对象，可直接哈希）。"""
     return {
         "name": row.name,
         "system_prompt": row.system_prompt,
@@ -66,6 +71,7 @@ def template_fields(row: AgentTemplate) -> dict:
         "memory_scope": row.memory_scope,
         "max_steps": int(row.max_steps or 0),
         "stop_condition": list(row.stop_condition or []),
+        "meta_json": dict(row.meta_json or {}),
     }
 
 
@@ -87,7 +93,7 @@ def _sync_builtin_row(row: AgentTemplate, role: dict) -> None:
     """把已有行升级到当前内置定义，三种判定（幂等）：
 
     a) ``builtin_hash is None``：旧库（本列引入前落库）无法区分「用户改动」与
-       「旧内置定义」，只能接受一次性覆盖——刷新六字段并写入当前指纹；
+       「旧内置定义」，只能接受一次性覆盖——刷新七字段并写入当前指纹；
     b) ``template_fingerprint(row) == row.builtin_hash``：用户没改过，内置定义
        变了就刷新字段并更新指纹；
     c) 其余：用户经 PATCH 改过，完全不动（含 system_prompt 与 builtin_hash）。
@@ -122,6 +128,17 @@ def seed_defaults() -> None:
         else:
             row.name = definition.get("name", row.name)
             row.definition_json = definition
+        for role_key in RETIRED_ROLES:
+            retired = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
+            if retired is None:
+                continue
+            unmodified = (retired.builtin_hash
+                          and template_fingerprint(retired) == retired.builtin_hash)
+            if unmodified:
+                s.delete(retired)                # 没改过：清理
+                continue
+            retired.builtin_hash = None          # 改过，或旧库没有指纹：保留为自定义角色，之后不再触碰
+        s.flush()
         existing = {r.role_key: r for r in s.query(AgentTemplate).all()}
         for role in ROLES:
             template = existing.get(role["role_key"])
