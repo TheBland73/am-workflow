@@ -234,7 +234,8 @@ class Orchestrator:
             extra: dict = {"retry_count": attempt_no}
             if delay > 0:
                 extra["retry_at"] = (_now() + timedelta(seconds=delay)).isoformat()
-            self._update_node(node["id"], status="pending", feedback=message, extra=extra)
+            self._update_node(node["id"], status="pending", feedback=message,
+                              extra={**extra, "feedback_kind": "auto_retry"})
             await emit(run_id, "node_log", node["id"], {
                 "level": "warn",
                 "message": (
@@ -390,7 +391,8 @@ class Orchestrator:
     # ---------- 门决策入口（供 API 调用） ----------
     async def decide_gate(self, *, gate_id: int, action: str, feedback: str | None = None,
                           target_node: str | None = None, decided_by: str = "human",
-                          artifact_kind: str | None = None, artifact_body: str | None = None) -> dict:
+                          artifact_kind: str | None = None, artifact_body: str | None = None,
+                          data: dict | None = None) -> dict:
         result: dict = {}
         edited: dict | None = None
         if artifact_kind and artifact_body:
@@ -401,7 +403,7 @@ class Orchestrator:
                 created_by=decided_by, status="approved",
             )
         result = _decide_gate(gate_id=gate_id, action=action, feedback=feedback,
-                              target_node=target_node, decided_by=decided_by)
+                              target_node=target_node, decided_by=decided_by, data=data)
         if edited:
             result["edited_artifact"] = edited
         await emit(result["run_id"], "gate_decided", None, result)

@@ -15,6 +15,7 @@ from app.artifacts.store import parse_front_matter
 from app.config import settings
 from app.db.base import session_scope
 from app.db.models import Artifact, Gate, Node, Run
+from app.engine.feedback import with_feedback
 
 PENDING_SECTION = "未决项"
 PENDING_TITLE = "讨论未决项（需人工拍板）"
@@ -173,8 +174,10 @@ def _reset(node: Node) -> None:
 
 
 def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
-                target_node: str | None = None, decided_by: str = "human") -> dict:
-    """执行门决策。reject 时必须提供 feedback 与 target_node（节点 key）。"""
+                target_node: str | None = None, decided_by: str = "human",
+                data: dict | None = None) -> dict:
+    """执行门决策。工件确认点驳回时必须提供 feedback 与 target_node；
+    会议内确认点的通过和驳回都只是把决定记在门上，让会议续开。"""
     if action not in ("approve", "reject"):
         raise GateError("action 只能是 approve 或 reject")
     with session_scope() as s:
@@ -194,6 +197,19 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
         gate.decided_by = decided_by
         gate.decided_at = now
         reset_keys: list[str] = []
+
+        if gate_node.type == "MEETING":
+            # 会议内确认点：决定存在门上，节点回到待调度；驳回不需要目标节点
+            gate.status = "approved" if action == "approve" else "rejected"
+            gate.decision_json = {"action": action, "feedback": feedback or "", "data": data or {}}
+            gate_node.status = "pending"
+            if run:
+                run.status = "running"
+                run.error = None
+            s.flush()
+            return {"gate_id": gate.id, "run_id": run_id, "status": gate.status, "action": action,
+                    "feedback": feedback, "target_node": None, "reset_nodes": [],
+                    "checkpoint": True}
 
         if action == "approve":
             gate.status = "approved"
@@ -225,7 +241,7 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
             gate.status = "rejected"
             gate_node.status = "pending"
             target.status = "pending"
-            target.config_json = {**(target.config_json or {}), "feedback": feedback}
+            target.config_json = with_feedback(target.config_json, feedback, "reject")
             reset_keys.append(target.node_key)
             for downstream in _downstream(target.id, nodes):
                 if downstream.id == gate_node.id:

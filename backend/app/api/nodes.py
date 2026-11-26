@@ -7,6 +7,7 @@ from app.api.schemas import RetryIn
 from app.db.base import session_scope
 from app.db.models import Gate, Message, Node, NodeAttempt, Run
 from app.engine.events import emit
+from app.engine.feedback import with_feedback
 from app.engine.orchestrator import orchestrator
 
 router = APIRouter(tags=["nodes"])
@@ -71,12 +72,8 @@ async def retry_node(node_id: int, payload: RetryIn | None = None) -> dict:
             gate.status = "approved"
             gate.decided_by = "human-retry"
             gate.feedback = feedback or "人工重试"
-        config = dict(node.config_json or {})
+        config = with_feedback(dict(node.config_json or {}), feedback or None, "user")
         config.pop("escalation", None)
-        if feedback:
-            config["feedback"] = feedback
-        else:
-            config.pop("feedback", None)
         node.config_json = config
         node.status = "pending"
         run.status = "running"

@@ -83,6 +83,7 @@ class GateDecision(BaseModel):
     decided_by: str = "human"
     artifact_body: str | None = None
     artifact_kind: str | None = None
+    data: dict | None = None
 
 
 class TaskIn(BaseModel):

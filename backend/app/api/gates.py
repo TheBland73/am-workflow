@@ -16,6 +16,7 @@ async def _decide(gate_id: int, action: str, payload: GateDecision) -> dict:
             gate_id=gate_id, action=action, feedback=payload.feedback,
             target_node=payload.target_node, decided_by=payload.decided_by or "human",
             artifact_kind=payload.artifact_kind, artifact_body=payload.artifact_body,
+            data=payload.data,
         )
     except GateError as exc:
         raise HTTPException(400, str(exc)) from exc
