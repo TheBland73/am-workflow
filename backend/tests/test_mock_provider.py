@@ -66,6 +66,18 @@ def test_untagged_document_nodes_still_route_by_keywords() -> None:
     assert "## 非需求类决策" in text
 
 
+def test_export_requirement_is_a_valid_ears_sentence() -> None:
+    """含「导出」时追加的 R6 必须通过机械核对里的 EARS 句式检查。"""
+    from app.meeting.confirm_rules import mechanical_check
+
+    messages = [{"role": "system", "content": "你是需求分析师。条目使用 EARS 句式。"},
+                {"role": "user", "content": "想法：支持导出周报。\n" + LEDGER}]
+    text, call = _pick(messages, None)
+    assert call is None and "### R6 周报导出" in text
+    points = [{"index": "D1", "status": "agreed"}, {"index": "D2", "status": "agreed"}]
+    assert mechanical_check(text, points) == []
+
+
 def test_ledger_rows_keep_the_latest_status_of_each_point() -> None:
     later = "\n（之后的纪要）\n| D2 | 已一致 | 首版是否需要登录 | 需要 / 不需要 | 需要 |\n"
     rows = _ledger_rows(LEDGER + later)
