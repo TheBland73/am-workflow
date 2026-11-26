@@ -15,6 +15,9 @@ from app.engine.orchestrator import orchestrator
 
 router = APIRouter(tags=["gates"])
 
+# 后台判定任务要持有强引用，避免被垃圾回收；进程退出时随事件循环取消
+_background_tasks: set[asyncio.Task] = set()
+
 
 async def _decide(gate_id: int, action: str, payload: GateDecision) -> dict:
     try:
@@ -69,18 +72,23 @@ async def _delegate_checkpoint(gate: dict) -> None:
     """会议内的确认点：不调裁决模型，按仅兜底等级下的做法落一个决定。"""
     kind = str(gate.get("kind") or "")
     decision: dict = {"action": "approve", "decided_by": "user-delegated"}
+    data: dict = {}
     if kind == "clarify":
         decision["answers"] = []              # 未答的记为假设
+        data["answers"] = []
     elif kind == "consensus":
         decision["option"] = "delegate"       # 授权主持人裁决
+        data["option"] = "delegate"
     elif kind == "escalation":
         decision["option"] = "accept"         # 接受现状
+        data["option"] = "accept"
     with session_scope() as s:
         row = s.get(Gate, gate["id"])
         row.status = "approved"
         row.decided_by = "user-delegated"
         row.decided_at = datetime.now(timezone.utc)
-        row.decision_json = {**decision, "feedback": ""}
+        # 会议从 decision_json["data"] 读决定的内容（与人工路径一致）
+        row.decision_json = {"action": "approve", "feedback": "", "data": data}
         node = s.get(Node, gate["node_id"])
         if node is not None:
             node.status = "pending"
@@ -103,9 +111,9 @@ async def _judge_in_background(gate_id: int) -> None:
         return
     try:
         await orchestrator._judge_gate(gate["run_id"], node)
-    except Exception as exc:                  # 判定失败留在开着的门上，原因写进日志
-        await emit(gate["run_id"], "node_log", node["id"], {
-            "level": "error", "message": f"把确认点交给模型判定失败：{exc}"[:300]})
+    except Exception as exc:                  # 判定失败留在开着的门上，原因可见
+        await orchestrator._gate_to_human(
+            gate["run_id"], node, f"把确认点交给模型判定失败：{exc}")
 
 
 @router.post("/gates/{gate_id}/delegate", status_code=202)
@@ -124,5 +132,7 @@ async def delegate_gate(gate_id: int) -> dict:
         await _delegate_checkpoint(gate)
         orchestrator.kick(gate["run_id"])
         return {"delegated": True, "gate_id": gate_id, "to": "program"}
-    asyncio.create_task(_judge_in_background(gate_id))
+    task = asyncio.create_task(_judge_in_background(gate_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return {"delegated": True, "gate_id": gate_id, "to": "model"}

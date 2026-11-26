@@ -154,12 +154,15 @@ def _mark(mtg, step: str) -> None:
     mtg.set_state(done=done_map)
 
 
+def _finish_step(mtg, step: str, **changes) -> None:
+    """产物与完成标记一次写完：崩溃重试不会把同一批条目写两遍。"""
+    done_map = dict(mtg.state().get("done") or {})
+    done_map[step] = _flow(mtg)
+    mtg.set_state(done=done_map, **changes)
+
+
 def _items(mtg) -> list[dict]:
     return list(mtg.state().get("items") or [])
-
-
-def _set_items(mtg, items: list[dict]) -> None:
-    mtg.set_state(items=items)
 
 
 def _chair(mtg) -> dict:
@@ -277,14 +280,15 @@ def _last_items_text(mtg) -> str:
     return "\n".join(lines)
 
 
-def _charter(mtg) -> list[Segment]:
+def _charter_dict(mtg, *, include_spec: bool = True) -> dict:
     state = mtg.state()
-    sections: list[dict] = [
-        {"title": "需求规格（当前版本）", "text": _spec_text(mtg)},
-        {"title": "决策点账本",
-         "text": render.ledger_text(_ledger_points(mtg), round_no=_flow(mtg),
-                                    budget=10 ** 9).rstrip()},
-    ]
+    sections: list[dict] = []
+    if include_spec:                                  # 写预期时只看账本
+        sections.append({"title": "需求规格（当前版本）", "text": _spec_text(mtg)})
+    sections.append({
+        "title": "决策点账本",
+        "text": render.ledger_text(_ledger_points(mtg), round_no=_flow(mtg),
+                                   budget=10 ** 9).rstrip()})
     if _flow(mtg) > 1:
         sections.append({"title": "上一轮的核对清单与处理情况", "text": _last_items_text(mtg)})
         sections.append({
@@ -296,8 +300,11 @@ def _charter(mtg) -> list[Segment]:
         "text": "\n".join(f"- {row['display_name']}（{MODE_NAMES.get(row['mode'], row['mode'])}）"
                           for row in mtg.participants()) or "（无）"})
     materials, _truncated = mtg.materials()
-    charter = {"title": "需求确认会议章程", "sections": sections, "materials": materials}
-    return render.charter_segments(charter)
+    return {"title": "需求确认会议章程", "sections": sections, "materials": materials}
+
+
+def _charter(mtg, *, include_spec: bool = True) -> list[Segment]:
+    return render.charter_segments(_charter_dict(mtg, include_spec=include_spec))
 
 
 # ---------------- 程序生成的清单 ----------------
@@ -337,15 +344,15 @@ def _program_items(mtg) -> list[dict]:
     rows: list[dict] = []
     for finding in state.get("mechanical") or []:
         rows.append({"kind": "mechanical", "requirement": "", "index": "",
-                     "severity": "", "problem": str(finding), "suggestion": ""})
+                     "severity": "blocker", "problem": str(finding), "suggestion": ""})
     for row in state.get("fidelity") or []:
         if row.get("result") in ("distorted", "missing"):
             rows.append({"kind": row["result"], "requirement": "",
-                         "index": str(row.get("index") or ""), "severity": "",
+                         "index": str(row.get("index") or ""), "severity": "blocker",
                          "problem": str(row.get("reason") or ""), "suggestion": ""})
     for row in state.get("added") or []:
         rows.append({"kind": "added", "requirement": str(row.get("requirement") or ""),
-                     "index": "", "severity": "",
+                     "index": "", "severity": "blocker",
                      "problem": str(row.get("reason") or ""), "suggestion": ""})
     for row in state.get("quality_issues") or []:
         severity = row.get("severity") or "minor"
@@ -420,14 +427,12 @@ class ConfirmProtocol(MeetingProtocol):
                 "id": f"C{number}", "kind": kind,
                 "requirement": str(raw.get("requirement") or "").strip(),
                 "index": str(raw.get("index") or "").strip(),
-                "severity": severity if kind == "quality" else "",
+                "severity": severity if kind == "quality" else "blocker",
                 "problem": str(raw.get("problem") or "").strip(),
                 "suggestion": str(raw.get("suggestion") or "").strip(),
                 "origin": "user", "round": _flow(mtg)})
             number += 1
-        _set_items(mtg, items)
-        mtg.set_state(intake_feedback="")
-        _mark(mtg, "intake")
+        _finish_step(mtg, "intake", items=items, intake_feedback="")
         return advance("prepare")
 
     # ---------- 准备 ----------
@@ -454,7 +459,7 @@ class ConfirmProtocol(MeetingProtocol):
             changes["changed"] = confirm_rules.changed_requirements(previous, bodies)
             changes["last_spec"] = previous
         mtg.set_state(**changes)
-        store.update_meeting(mtg.meeting_id, charter=_charter(mtg))
+        store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
         mtg.reset_builder()
         await emit(mtg.run_id, "review_round_started", mtg.node_id, {
             "meeting_id": mtg.meeting_id, "round": flow, "protocol": "confirm",
@@ -509,6 +514,7 @@ class ConfirmProtocol(MeetingProtocol):
         library = {row["role_key"]: row for row in role_library()}
         spec = (mtg.run_config().get("rosters") or {}).get("reviewers") or {}
         configured = [str(key) for key in (spec.get("role_keys") or [])]
+        count = int(spec.get("count") or 0)
         if configured:
             missing = [key for key in configured if key not in library]
             if missing:
@@ -519,12 +525,13 @@ class ConfirmProtocol(MeetingProtocol):
                     for key in configured]
         reviewers = [row for row in base if row["mode"] == "participant"]
         if reviewers:
-            return reviewers
+            return reviewers[:count] if count else reviewers
         suitable = [row for row in library.values()
                     if "review" in ((row.get("meta") or {}).get("meeting_roles") or [])]
+        picked = suitable[:count] if count else suitable[:3]
         return [{"role_key": row["role_key"], "display_name": row["name"],
                  "system_prompt": row["system_prompt"], "model_id": None}
-                for row in suitable[:3]]
+                for row in picked]
 
     # ---------- 写预期 ----------
     async def step_expect(self, mtg):
@@ -543,7 +550,7 @@ class ConfirmProtocol(MeetingProtocol):
         if not indexes:
             _mark(mtg, "expect")
             return advance("fidelity")
-        charter = _charter(mtg)
+        charter = _charter(mtg, include_spec=False)     # 只读账本，不看需求规格
         checkers = _checkers(mtg)
         results = await speak_many(mtg, [
             {"participant": checker, "kind": "expect", "turn_kind": "expect",
@@ -554,8 +561,7 @@ class ConfirmProtocol(MeetingProtocol):
         expected = dict(state.get("expected") or {})
         for checker, result in zip(checkers, results):
             expected[str(checker["id"])] = list(result["data"]["expected"])
-        mtg.set_state(expected=expected)
-        _mark(mtg, "expect")
+        _finish_step(mtg, "expect", expected=expected)
         return advance("fidelity")
 
     # ---------- 忠实性核对与质量评审 ----------
@@ -572,8 +578,7 @@ class ConfirmProtocol(MeetingProtocol):
             assignments = self._incremental_assignments(mtg, assignments)
         active = [checker for checker in checkers if assignments.get(checker["id"])]
         if not active:
-            mtg.set_state(fidelity=[], added=[])
-            _mark(mtg, "fidelity")
+            _finish_step(mtg, "fidelity", fidelity=[], added=[])
             return advance("quality")
         expected = dict(mtg.state().get("expected") or {})
         charter = _charter(mtg)
@@ -604,10 +609,8 @@ class ConfirmProtocol(MeetingProtocol):
                 added.append({"requirement": str(item.get("requirement")),
                               "reason": str(item.get("reason")),
                               "checker": checker["display_name"]})
-        mtg.set_state(fidelity=rows, added=added)
-        _mark(mtg, "fidelity")
+        _finish_step(mtg, "fidelity", fidelity=rows, added=added)
         return advance("quality")
-
     def _assignments(self, mtg, checkers: list[dict], points: list[dict],
                      coverage: str) -> dict[int, list[str]]:
         """每个核对者本轮要核对的决策点。
@@ -669,8 +672,7 @@ class ConfirmProtocol(MeetingProtocol):
             wanted = marked | set(state.get("changed") or [])
             allowed = [requirement for requirement in requirement_ids if requirement in wanted]
             if not allowed:
-                mtg.set_state(quality_issues=[])
-                _mark(mtg, "quality")
+                _finish_step(mtg, "quality", quality_issues=[])
                 return advance("merge")
         reviewers = _quality_reviewers(mtg)
         instruction = QUALITY_INSTRUCTION
@@ -700,8 +702,7 @@ class ConfirmProtocol(MeetingProtocol):
                 seen.add(key)
                 normalized["criterion"] = str(raw.get("criterion") or "")
                 issues.append(normalized)
-        mtg.set_state(quality_issues=issues)
-        _mark(mtg, "quality")
+        _finish_step(mtg, "quality", quality_issues=issues)
         return advance("merge")
 
     # ---------- 汇总与裁决 ----------
@@ -742,8 +743,7 @@ class ConfirmProtocol(MeetingProtocol):
             item["origin"] = "program"
             item["round"] = flow
             number += 1
-        _set_items(mtg, list(intake_items) + program)
-        _mark(mtg, "merge")
+        _finish_step(mtg, "merge", items=list(intake_items) + program)
         return advance("verdict")
 
     async def step_verdict(self, mtg):
@@ -752,11 +752,13 @@ class ConfirmProtocol(MeetingProtocol):
         line = str(mtg.params().get("min_blocking_severity") or "major")
         items = _items(mtg)
         verdict = confirm_rules.confirm_verdict(items, blocking_line=line)
-        mtg.set_state(verdict=verdict)
-        await emit(mtg.run_id, "review_verdict", mtg.node_id, {
-            "meeting_id": mtg.meeting_id, "round": _flow(mtg), "protocol": "confirm",
-            "verdict": verdict, "blocking": len(_blocking(items, line)),
-            "issues": len(items)})
+        already = int(mtg.state().get("verdict_round") or 0) == _flow(mtg)
+        mtg.set_state(verdict=verdict, verdict_round=_flow(mtg))
+        if not already:                               # 升级确认点恢复时不再重复发事件
+            await emit(mtg.run_id, "review_verdict", mtg.node_id, {
+                "meeting_id": mtg.meeting_id, "round": _flow(mtg), "protocol": "confirm",
+                "verdict": verdict, "blocking": len(_blocking(items, line)),
+                "issues": len(items)})
         if verdict == "pass":
             _mark(mtg, "verdict")
             return advance("report")
@@ -782,6 +784,7 @@ class ConfirmProtocol(MeetingProtocol):
         verdict = str(state.get("verdict") or "")
         accepted_by_user = bool(state.get("accepted_by_user"))
         precheck_ok, precheck_reason = self._precheck(verdict, accepted_by_user)
+        mtg.set_state(precheck_ok=precheck_ok, precheck_reason=precheck_reason)
         report = self._write_report(mtg, items, verdict, accepted_by_user)
         line = str(mtg.params().get("min_blocking_severity") or "major")
         blocking = _blocking(items, line)

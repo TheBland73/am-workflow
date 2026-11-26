@@ -7,6 +7,10 @@ from __future__ import annotations
 from app.meeting import render
 from app.meeting.rules import DEFERRED
 
+# 模型写的正文必须有的六节：修订与初稿用同一份校验
+PROPOSAL_SECTIONS = ("## 目标与成功标准", "## 范围", "## 总体方案", "## 关键流程",
+                     "## 里程碑与验收", "## 风险与缓解")
+
 
 def index_section(points: list[dict]) -> str:
     lines = ["## 决策点索引", "", "| 编号 | 状态 | 结论 |", "|---|---|---|"]

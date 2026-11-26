@@ -17,7 +17,7 @@ from app.engine.events import emit
 from app.engine.gates import request_gate
 from app.engine.params import decider_for, definition_of, effective_params, run_of
 from app.meeting.prompts import call_tag
-from app.models.budget import truncate_to_tokens
+from app.models.budget import estimate_tokens, truncate_to_tokens
 from app.models.pool import ModelInfo, pool
 
 # 模型名 → 家族。认不出的家族就是模型名本身（详设 §5.3）。
@@ -311,7 +311,12 @@ def _artifact_excerpt(run_id: str, kind: str, limit_tokens: int = 6000) -> str:
     if not raw:
         return "（没有找到工件）"
     _meta, body = parse_front_matter(raw)
-    return truncate_to_tokens(body.strip(), limit_tokens)
+    body = body.strip()
+    if estimate_tokens(body) <= limit_tokens:
+        return body
+    # 超预算时显式标注，不把截断伪装成全文
+    return (truncate_to_tokens(body, limit_tokens)
+            + "\n\n（工件超出判定预算，后面部分被截断）")
 
 
 def _upstream_text(run_id: str, node: dict) -> str:

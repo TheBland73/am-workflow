@@ -281,9 +281,12 @@ class Orchestrator:
         deps = [item for item in nodes if item["node_key"] in (node.get("deps") or [])]
         try:
             result = await judge.judge_gate(run_id, node, deps, attempt_id)
-        except BaseException:
-            self._fail_attempt(attempt_id, "模型判定中断")
+        except asyncio.CancelledError:
+            self._fail_attempt(attempt_id, "模型判定被取消")
             raise
+        except Exception as exc:                      # 判不了就留给人，不拖垮整场运行
+            self._fail_attempt(attempt_id, f"模型判定失败：{exc}"[:2000])
+            return await self._gate_to_human(run_id, node, f"模型判定失败：{exc}")
         self._finish_attempt(attempt_id)
         await emit(run_id, "node_log", node["id"], {
             "level": "warn" if result["action"] == "open" else "info",
@@ -299,6 +302,31 @@ class Orchestrator:
                     **body, "reason": result.get("reason") or "模型判定无效，转人工"})
             self._set_run(run_id, status="waiting_human")
         return result["action"]
+
+    async def _gate_to_human(self, run_id: str, node: dict, reason: str) -> str:
+        """判不了就留给人：已有决定的不动，否则保证有一扇开着的门，原因写进 hint。"""
+        with session_scope() as s:
+            latest = (s.query(Gate).filter(Gate.node_id == node["id"])
+                      .order_by(Gate.id.desc()).first())
+            action = str((latest.decision_json or {}).get("action") or "") if latest else ""
+            is_open = latest is not None and latest.status == "open"
+        if action in ("approve", "reject"):
+            return action
+        self._update_node(node["id"], status="waiting_human", extra={"hint": reason})
+        if not is_open:
+            from app.engine.gates import request_gate
+            request_gate(run_id, node["id"])
+        with session_scope() as s:
+            gate = (s.query(Gate)
+                    .filter(Gate.node_id == node["id"], Gate.status == "open")
+                    .order_by(Gate.id.desc()).first())
+            body = gate_payload(s, gate) if gate is not None else None
+        if body is not None:
+            await emit(run_id, "gate_requested", node["id"], {**body, "reason": reason})
+        self._set_run(run_id, status="waiting_human")
+        await emit(run_id, "node_log", node["id"], {
+            "level": "error", "message": reason[:300]})
+        return "open"
 
     # ---------- 失败回流 ----------
     async def _handle_failure(self, run_id: str, node: dict, attempt_id: int,

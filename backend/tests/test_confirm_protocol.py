@@ -199,12 +199,19 @@ def test_faithful_spec_passes(monkeypatch) -> None:
 
     assert result["done"] is True
     assert result["verdict"] == "pass" and result["precheck_ok"] is True
+    assert _state(node_id)["precheck_ok"] is True
+    assert any(section["title"] == "需求规格（当前版本）"
+               for section in _meeting(node_id)["charter"].get("sections") or [])
     assert _items(node_id) == []
     report = parse_front_matter(read_artifact(run_id, "review"))[1]
     assert "结论：通过。" in report and "全部通过" in report
     kinds = Counter(call["kind"] for call in seen)
     assert kinds["expect"] == 1 and kinds["fidelity"] == 1 and kinds["quality"] == 1
     assert kinds["confirm_intake"] == 0 and kinds["confirm_merge"] == 0
+    # 写预期只看账本：提示里不能出现需求规格正文
+    expect_prompts = [call["text"] for call in seen if call["kind"] == "expect"]
+    assert expect_prompts and all("WHEN 团队成员提交反馈" not in text
+                                  for text in expect_prompts)
 
 
 def test_mechanical_failure_skips_model_checks_and_reroutes(monkeypatch) -> None:
@@ -339,6 +346,7 @@ def test_rounds_used_up_escalates_and_human_acceptance_passes(monkeypatch) -> No
     assert asked == ["escalation"]
     assert result["done"] is True and result["verdict"] == "fail"
     assert result["accepted_by_user"] is True and result["precheck_ok"] is True
+    assert _state(node_id)["precheck_ok"] is True
     report = parse_front_matter(read_artifact(run_id, "review"))[1]
     assert "结论：不通过。" in report and "接受了现状" in report
 

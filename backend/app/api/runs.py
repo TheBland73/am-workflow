@@ -404,7 +404,7 @@ def run_metrics(run_id: str) -> dict:
         meeting_turns = int(
             s.query(func.count(MeetingTurn.id))
             .join(Meeting, Meeting.id == MeetingTurn.meeting_id)
-            .filter(Meeting.run_id == run_id).scalar() or 0)
+            .filter(Meeting.run_id == run_id, MeetingTurn.content != "").scalar() or 0)
         run_created, run_finished, run_status = run.created_at, run.finished_at, run.status
 
     by_node: dict[int, list[NodeAttempt]] = {}

@@ -315,7 +315,7 @@ def _round_issues(mtg) -> list[dict]:
     return [issue for issue in _issues(mtg) if int(issue.get("round") or 0) < _flow(mtg)]
 
 
-def _charter(mtg, *, include_proposal: bool = True) -> list[Segment]:
+def _charter_dict(mtg, *, include_proposal: bool = True) -> dict:
     state = mtg.state()
     sections: list[dict] = []
     if include_proposal:
@@ -346,17 +346,39 @@ def _charter(mtg, *, include_proposal: bool = True) -> list[Segment]:
         "text": "\n".join(f"- {row['display_name']}（{MODE_NAMES.get(row['mode'], row['mode'])}）"
                           for row in mtg.participants()) or "（无）"})
     materials, _truncated = mtg.materials()
-    charter = {"title": "评审会议章程", "sections": sections, "materials": materials}
-    return render.charter_segments(charter)
+    return {"title": "评审会议章程", "sections": sections, "materials": materials}
 
 
-def _add_issues(mtg, rows: list[dict], *, origin: str, round_no: int) -> list[str]:
-    """把一批原始意见规范化、编号、入库；返回新增的编号。"""
+def _charter(mtg, *, include_proposal: bool = True) -> list[Segment]:
+    return render.charter_segments(_charter_dict(mtg, include_proposal=include_proposal))
+
+
+def _idea_segments(mtg) -> list[Segment]:
+    """先写要点时用的想法与简报：这次调用读它们与账本，不读方案。"""
+    segments = []
+    idea = (mtg.ctx.idea or "").strip()
+    if idea:
+        segments.append(Segment("append", f"## 想法原文\n{idea}", name="想法"))
+    discussion = _discussion(mtg)
+    brief = str((discussion["state"] if discussion else {}).get("brief") or "").strip()
+    if brief:
+        segments.append(Segment("append", f"## 想法简报\n{brief}", name="简报"))
+    return segments
+
+
+def _finish_step(mtg, step: str, **changes) -> None:
+    """把这一步的产物与完成标记一次写完：崩溃重试不会把同一批意见写两遍。"""
+    done_map = dict(mtg.state().get("done") or {})
+    done_map[step] = _flow(mtg)
+    mtg.set_state(done=done_map, **changes)
+
+
+def _add_issues(mtg, rows: list[dict], *, origin: str, round_no: int) -> list[dict]:
+    """把一批原始意见规范化、编号；返回写完的整份列表，由调用方与完成标记一起落盘。"""
     issues = _issues(mtg)
     numbers = [int(issue["id"][1:]) for issue in issues
                if str(issue.get("id", "")).startswith("I") and str(issue.get("id"))[1:].isdigit()]
     number = max(numbers, default=0) + 1
-    added: list[str] = []
     for raw in rows:
         normalized = review_rules.normalize_issue(raw)
         issue_id = f"I{number}"
@@ -367,9 +389,7 @@ def _add_issues(mtg, rows: list[dict], *, origin: str, round_no: int) -> list[st
             "disputed": bool(raw.get("disputed")),
             "standing": True, "accepted": None, "response": "", "disposition": "",
             "origin": origin, "round": round_no, "dissent": ""})
-        added.append(issue_id)
-    _set_issues(mtg, issues)
-    return added
+    return issues
 
 
 def _update_issue(mtg, issue_id: str, **fields) -> None:
@@ -395,7 +415,7 @@ def _speaker_for(mtg, issue: dict) -> dict | None:
 
 
 def _patch_round(mtg, step: str) -> None:
-    """把一步的产物一次性写进会议状态并标记完成（顺序：先落盘，后标记）。"""
+    """这一步没有状态产物，只记完成标记。"""
     _mark(mtg, step)
 
 
@@ -427,8 +447,8 @@ class ReviewProtocol(MeetingProtocol):
         if state.get("rework_pending"):
             flow = _flow(mtg) + 1
             store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
-                **state, "rework_pending": False, "reviewed_round": None, "verdict": None,
-                "accepted_by_user": False, "unfixed": [], "discussed": [],
+                **state, "rework_pending": False, "awaiting_rework": False, "reviewed_round": None,
+                "verdict": None, "accepted_by_user": False, "unfixed": [], "discussed": [],
                 "verify_retry_done": False, "review_batch": []})
             mtg.reset_builder()
 
@@ -451,14 +471,11 @@ class ReviewProtocol(MeetingProtocol):
             segments=[Segment("append", f"## 用户的反馈\n{text}", name="反馈")],
             instruction=REVIEW_INTAKE_INSTRUCTION, structured=_validate_intake,
             turn_round=_flow(mtg)))["data"]
-        _add_issues(mtg, data["issues"], origin="user", round_no=_flow(mtg))
-        issues = _issues(mtg)
-        for issue in issues:
+        _add_issues_done = _add_issues(mtg, data["issues"], origin="user", round_no=_flow(mtg))
+        for issue in _add_issues_done:
             if issue["origin"] == "user" and not issue.get("raised_by"):
                 issue["raised_by"] = ["用户"]
-        _set_issues(mtg, issues)
-        mtg.set_state(intake_feedback="")
-        _patch_round(mtg, "intake")
+        _finish_step(mtg, "intake", issues=_add_issues_done, intake_feedback="")
         return advance("respond")
 
     # ---------- 准备 ----------
@@ -474,10 +491,10 @@ class ReviewProtocol(MeetingProtocol):
                                     kind="review_brief", speaker_id=_chair(mtg)["id"])
             data = found["data"] if found else (await speak(
                 mtg, _chair(mtg), kind="review_brief", turn_kind="review_brief",
-                segments=[], instruction=REVIEW_BRIEF_INSTRUCTION,
+                charter=_charter(mtg), segments=[], instruction=REVIEW_BRIEF_INSTRUCTION,
                 structured=_validate_checklist, turn_round=_flow(mtg)))["data"]
             mtg.set_state(checklist=list(data["checklist"]))
-        store.update_meeting(mtg.meeting_id, charter=_charter(mtg))
+        store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
         mtg.reset_builder()
         await emit(mtg.run_id, "review_round_started", mtg.node_id, {
             "meeting_id": mtg.meeting_id, "round": _flow(mtg),
@@ -531,6 +548,9 @@ class ReviewProtocol(MeetingProtocol):
                           "model_id": row["model_id"]}
                          for row in base if row["mode"] == "participant"]
         limit = int(mtg.params().get("reviewers_max") or 0)     # 0 表示不限制
+        count = int(spec.get("count") or 0)                     # 运行级配置的固定人数
+        if count:
+            reviewers = reviewers[:count]
         if limit:
             reviewers = reviewers[:limit]
         if not reviewers:
@@ -539,6 +559,8 @@ class ReviewProtocol(MeetingProtocol):
             reviewers = [{"role_key": row["role_key"], "display_name": row["name"],
                           "mode": "reviewer", "system_prompt": row["system_prompt"],
                           "model_id": None} for row in suitable[:3]]
+            if count:
+                reviewers = reviewers[:count]
         minimum = int(mtg.params().get("reviewers_min") or 0)
         if len(reviewers) < max(1, minimum):
             raise NodeFailure(f"评审者人数不足：需要至少 {max(1, minimum)} 名，"
@@ -570,9 +592,10 @@ class ReviewProtocol(MeetingProtocol):
             _patch_round(mtg, "points")
             return advance("review")
         charter = _charter(mtg, include_proposal=False)
+        context = _idea_segments(mtg)
         await speak_many(mtg, [
             {"participant": reviewer, "kind": "review_points", "turn_kind": "review_points",
-             "charter": charter, "segments": [], "instruction": REVIEW_POINTS_INSTRUCTION,
+             "charter": charter, "segments": context, "instruction": REVIEW_POINTS_INSTRUCTION,
              "structured": _validate_focus, "turn_round": _flow(mtg)}
             for reviewer in _reviewers(mtg)])
         _patch_round(mtg, "points")
@@ -615,8 +638,7 @@ class ReviewProtocol(MeetingProtocol):
                 _update_issue(mtg, issue_id, standing=not handled,
                               disposition="已处理" + (f"：{note}" if note else "")
                               if handled else "未处理")
-        mtg.set_state(strengths=strengths, review_batch=batch)
-        _patch_round(mtg, "review")
+        _finish_step(mtg, "review", strengths=strengths, review_batch=batch)
         return advance("merge")
 
     # ---------- 汇总、回应、讨论 ----------
@@ -639,9 +661,8 @@ class ReviewProtocol(MeetingProtocol):
             segments=[Segment("append", f"## 待汇总的评审意见\n{listing}", name="意见清单")],
             instruction=REVIEW_MERGE_INSTRUCTION, structured=_validate_merge,
             turn_round=_flow(mtg)))["data"]
-        _add_issues(mtg, data["issues"], origin="reviewer", round_no=_flow(mtg))
-        mtg.set_state(review_batch=[])
-        _patch_round(mtg, "merge")
+        issues = _add_issues(mtg, data["issues"], origin="reviewer", round_no=_flow(mtg))
+        _finish_step(mtg, "merge", issues=issues, review_batch=[])
         return advance("respond")
 
     async def step_respond(self, mtg):
@@ -772,10 +793,12 @@ class ReviewProtocol(MeetingProtocol):
         issues = _issues(mtg)
         verdict = review_rules.verdict(issues, blocking_line=line)
         blocking = review_rules.blocking(issues, line=line)
-        mtg.set_state(verdict=verdict)
-        await emit(mtg.run_id, "review_verdict", mtg.node_id, {
-            "meeting_id": mtg.meeting_id, "round": _flow(mtg), "verdict": verdict,
-            "blocking": len(blocking), "issues": len(issues)})
+        already = int(mtg.state().get("verdict_round") or 0) == _flow(mtg)
+        mtg.set_state(verdict=verdict, verdict_round=_flow(mtg))
+        if not already:                               # 升级确认点恢复时不再重复发事件
+            await emit(mtg.run_id, "review_verdict", mtg.node_id, {
+                "meeting_id": mtg.meeting_id, "round": _flow(mtg), "verdict": verdict,
+                "blocking": len(blocking), "issues": len(issues)})
         if verdict != "return":
             _patch_round(mtg, "verdict")
             return advance("revise")
@@ -806,7 +829,7 @@ class ReviewProtocol(MeetingProtocol):
         targets = _targets(mtg, lambda issue: issue.get("standing", True)
                            and issue.get("accepted") is True
                            and issue.get("category") == "wording"
-                           and issue.get("disposition") != "已修订并验证")
+                           and issue.get("disposition") not in ("已修订并验证", "已修订，待验证"))
         if not targets:
             _patch_round(mtg, "revise")
             return advance("verify")
@@ -826,6 +849,9 @@ class ReviewProtocol(MeetingProtocol):
             instruction=AUTHOR_REVISE_INSTRUCTION, turn_round=_flow(mtg))
         draft = strip_outer_fence(result["content"]).strip()
         issues = validate_artifact("proposal", draft)
+        missing = [title for title in proposal.PROPOSAL_SECTIONS if title not in draft]
+        if missing:
+            issues.append("方案缺少这些章节：" + "、".join(missing))
         if "## 修改说明" not in draft:
             issues.append("修订版缺少「## 修改说明」一节")
         if issues:
@@ -838,7 +864,7 @@ class ReviewProtocol(MeetingProtocol):
                        inputs=["discussion"], status="draft")
         for issue_id in ids:
             _update_issue(mtg, issue_id, disposition="已修订，待验证", revised_round=_flow(mtg))
-        store.update_meeting(mtg.meeting_id, charter=_charter(mtg))
+        store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
         mtg.reset_builder()
 
     async def step_verify(self, mtg):
@@ -883,6 +909,7 @@ class ReviewProtocol(MeetingProtocol):
         accepted_by_user = bool(mtg.state().get("accepted_by_user"))
         unfixed = list(mtg.state().get("unfixed") or [])
         precheck_ok, precheck_reason = self._precheck(verdict, accepted_by_user, unfixed)
+        mtg.set_state(precheck_ok=precheck_ok, precheck_reason=precheck_reason)
         report = self._write_report(mtg, issues, verdict, accepted_by_user, unfixed)
         blocking = review_rules.blocking(
             issues, line=str(mtg.params().get("min_blocking_severity") or "major"))

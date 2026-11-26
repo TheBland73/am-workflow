@@ -137,8 +137,7 @@ REOPEN_INSTRUCTION = (
     "反馈涉及账本里没有的问题时新建，给出 title、question、options。至少处理出一个决策点。"
     "只输出一个 JSON 对象：\n"
     '{"points": [{"index": "D2", "title": "", "question": "", "options": []}], "note": "你对反馈的理解"}')
-PROPOSAL_SECTIONS = ("## 目标与成功标准", "## 范围", "## 总体方案", "## 关键流程",
-                     "## 里程碑与验收", "## 风险与缓解")
+PROPOSAL_SECTIONS = proposal.PROPOSAL_SECTIONS
 
 
 # ---------------- 校验模型的结构化输出 ----------------

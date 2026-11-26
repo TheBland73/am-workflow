@@ -157,6 +157,11 @@ def test_review_without_issues_accepts(monkeypatch) -> None:
 
     assert result["done"] is True
     assert result["verdict"] == "accept" and result["precheck_ok"] is True
+    # 前置检查的结论要写进会议状态：裁决模型（F1）从这里读
+    state = _meeting(node_id)["state"]
+    assert state["precheck_ok"] is True
+    assert any(section["title"] == "被评审的建设方案"
+               for section in _meeting(node_id)["charter"].get("sections") or [])
     kinds = Counter(call["kind"] for call in seen)
     assert "author_response" not in kinds and "author_revise" not in kinds
     report = parse_front_matter(read_artifact(run_id, "review"))[1]
@@ -273,6 +278,8 @@ def test_revision_that_is_never_fixed_blocks_the_precheck(monkeypatch) -> None:
 
     assert result["done"] is True and result["verdict"] == "conditional"
     assert result["precheck_ok"] is False and "没有改好" in result["precheck_reason"]
+    state = _meeting(node_id)["state"]
+    assert state["precheck_ok"] is False and "没有改好" in state["precheck_reason"]
     assert Counter(call["kind"] for call in seen)["author_revise"] == 2
     assert _issues(node_id)[0]["disposition"] == "未改好"
 
@@ -336,3 +343,18 @@ def test_author_can_ask_the_requester_proxy(monkeypatch) -> None:
     assert kinds["answer"] == 1 and kinds["author_response"] == 2
     answer_prompts = [call["text"] for call in seen if call["kind"] == "answer"]
     assert all("需求方代理" in text for text in answer_prompts)
+
+
+def test_reviewers_count_in_run_config_limits_the_panel(monkeypatch) -> None:
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run({"rosters": {"reviewers": {"count": 1}}})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = _meeting(node_id)["id"]
+    reviewers = [row for row in store.list_participants(meeting_id)
+                 if row["mode"] == "reviewer"]
+    assert len(reviewers) == 1                    # 讨论会议留下两名参会者，按配置只请一名
+    assert Counter(call["kind"] for call in seen)["review"] == 1

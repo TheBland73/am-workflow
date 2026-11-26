@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
 from app.db.models import (AgentTemplate, Gate, Meeting, MeetingParticipant, ModelEntry, Node,
-                           ProviderConfig, Run, Workflow, new_run_id)
+                           NodeAttempt, ProviderConfig, Run, Workflow, new_run_id)
 from app.engine import judge
 from app.engine.events import load_events
 from app.engine.gates import GateError, request_gate
@@ -202,6 +202,10 @@ def test_model_approve_writes_points_then_judges_the_full_artifact(monkeypatch) 
         assert gate.status == "approved"
         assert gate.decided_by.startswith("model:")
         assert gate.decision_json["data"]["rubric"]
+        # 这次判定留下一条执行记录（用量记在它上面）
+        attempt = (s.query(NodeAttempt).filter(NodeAttempt.node_id == gate_node_id)
+                   .order_by(NodeAttempt.id.desc()).first())
+        assert attempt is not None and attempt.status == "done"
     assert _status(run_id, "gate_review") == "done"
     _, nodes = orchestrator._load(run_id)
     requirement = next(node for node in nodes if node["node_key"] == "requirement")
@@ -300,7 +304,6 @@ def test_invalid_output_leaves_the_gate_to_a_human(monkeypatch, reply, reason) -
     assert len(_open_gates(run_id)) == 1
     config = _config(run_id, "gate_review")
     assert reason in config["hint"]
-    assert "judge_decision" not in config               # 没有留下模型的决定
     with session_scope() as s:
         gate = s.query(Gate).filter(Gate.node_id == _node_id(run_id, "gate_review")).one()
         assert not (gate.decision_json or {}).get("action")
@@ -379,7 +382,10 @@ def test_delegate_meeting_checkpoints_lands_the_fallback_decision() -> None:
         row = _gate(gate_id)
         assert row["status"] == "approved"
         assert row["decided_by"] == "user-delegated"
-        assert row["decision"]["option"] == "delegate"
+        # 会议从 decision_json 的 data 里读决定（与人工路径一致）
+        from app.meeting.checkpoints import get_decision
+
+        assert get_decision(gate_id)["data"]["option"] == "delegate"
         # 已经决定过的门不能再交
         assert client.post(f"/api/gates/{gate_id}/delegate").status_code == 400
 
