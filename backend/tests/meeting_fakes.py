@@ -33,6 +33,12 @@ def install(monkeypatch, replies: dict, calls: list | None = None):
 
     monkeypatch.setattr(calls_module, "run_agent", fake_run_agent)
     monkeypatch.setattr(calls_module, "_model_for", lambda participant: MODEL)
+    try:
+        from app.engine import judge as judge_module
+    except ModuleNotFoundError:                 # 判定模块还没实现时（任务初期）忽略
+        judge_module = None
+    if judge_module is not None:
+        monkeypatch.setattr(judge_module, "run_agent", fake_run_agent)
 
 
 def drive(run_id: str, node_id: int, answer, *, idea: str = "") -> dict:

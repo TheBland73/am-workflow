@@ -334,6 +334,12 @@ def _meeting_reply(kind: str, text: str) -> str:
             "kind": "quality", "requirement": "R1", "criterion": "无歧义",
             "severity": "major", "problem": "用户认为需求写得不够清楚",
             "suggestion": "把验收标准写成可核对的条件"}]}, ensure_ascii=False)
+    if kind == "gate_points":
+        return json.dumps({"points": ["目标与成功标准是否明确", "范围与不做什么是否写明",
+                                      "每个决策点是否有结论与依据"]}, ensure_ascii=False)
+    if kind == "gate_verdict":
+        return json.dumps({"verdict": "approve", "reasons": ["逐条符合判据"],
+                           "concerns": [], "feedback": ""}, ensure_ascii=False)
     if kind == "review_brief":
         return json.dumps({"checklist": ["范围是否完整", "验收标准是否可核对",
                                          "风险是否都有缓解"]}, ensure_ascii=False)

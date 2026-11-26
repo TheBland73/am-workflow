@@ -14,9 +14,10 @@ from app.db.base import session_scope
 from app.db.models import Gate, Node, NodeAttempt, Run, Task, Workflow
 from app.engine.events import emit
 from app.engine.feedback import with_feedback
-from app.engine.gates import GateError, decide_gate as _decide_gate
+from app.engine.gates import GateError, decide_gate as _decide_gate, gate_payload
 from app.engine.runners import NodeContext, NodeFailure, classify_failure, execute_node, lesson_for
 from app.engine.templates import phase_names
+from app.engine import judge
 
 TERMINAL = {"finished", "failed", "stopped"}
 
@@ -128,7 +129,14 @@ class Orchestrator:
     async def _run_node(self, run_id: str, node: dict,
                         slots: asyncio.Semaphore | None = None) -> None:
         if node["type"] == "HUMAN_GATE":
-            await self._open_human_gate(run_id, node)
+            decider = judge.gate_decider(run_id, dict(node.get("config") or {}),
+                                         node["node_key"])
+            if decider == "auto":
+                await self._auto_pass_gate(run_id, node)
+            elif decider == "model":
+                await self._judge_gate(run_id, node)
+            else:
+                await self._open_human_gate(run_id, node)
             return
         # 闸门放在建 attempt 之前：排队中的节点不应显示 running，也不应吃掉超时预算。
         async with (slots or self._slots()):
@@ -219,10 +227,78 @@ class Orchestrator:
     async def _open_human_gate(self, run_id: str, node: dict) -> None:
         from app.engine.gates import request_gate
 
-        self._update_node(node["id"], status="waiting_human")
+        hint = ""
+        if dict(node.get("config") or {}).get("check"):
+            try:
+                hint = judge.hint_for_gate(run_id, node)
+            except Exception:
+                hint = ""
+        self._update_node(node["id"], status="waiting_human",
+                          extra={"hint": hint} if hint else None,
+                          drop=None if hint else ["hint"])
         gate = request_gate(run_id, node["id"])
         self._set_run(run_id, status="waiting_human")
         await emit(run_id, "gate_requested", node["id"], gate)
+
+    async def _auto_pass_gate(self, run_id: str, node: dict) -> None:
+        """判定者是"自动"：不调模型、也不开门，直接完成并批准工件（详设 §5.3）。"""
+        config = dict(node.get("config") or {})
+        key = judge.checkpoint_key(config, node["node_key"])
+        with session_scope() as s:
+            gate = Gate(run_id=run_id, node_id=node["id"], status="approved", kind=key,
+                        payload_json={"title": config.get("title") or node["name"]},
+                        decision_json={"action": "approve", "option": "auto"},
+                        decided_by="program", decided_at=_now())
+            s.add(gate)
+            s.flush()
+            gate_id = gate.id
+            row = s.get(Node, node["id"])
+            if row is not None:
+                row.status = "done"
+            run = s.get(Run, run_id)
+            if run is not None:
+                run.status = "running"
+                run.error = None
+        artifact = config.get("artifact")
+        if artifact:
+            from app.artifacts.store import set_status
+
+            set_status(run_id, artifact, "approved")
+        decision = {"action": "approve", "option": "auto"}
+        await emit(run_id, "checkpoint_decided", node["id"], {
+            "gate_id": gate_id, "kind": key, "decided_by": "program", "decision": decision})
+        await emit(run_id, "gate_decided", node["id"], {
+            "gate_id": gate_id, "run_id": run_id, "status": "approved", "action": "approve",
+            "feedback": None, "target_node": None, "reset_nodes": [],
+            "decided_by": "program"})
+
+    async def _judge_gate(self, run_id: str, node: dict) -> str:
+        """判定者是"模型"：为这次判定建一条执行记录，调用裁决模型；判不了就留给人。"""
+        attempt_no = self._next_attempt_no(node["id"])
+        attempt_id = self._create_attempt(node["id"], attempt_no)
+        self._update_node(node["id"], status="running", drop=["retry_at"])
+        _, nodes = self._load(run_id)
+        deps = [item for item in nodes if item["node_key"] in (node.get("deps") or [])]
+        try:
+            result = await judge.judge_gate(run_id, node, deps, attempt_id)
+        except BaseException:
+            self._fail_attempt(attempt_id, "模型判定中断")
+            raise
+        self._finish_attempt(attempt_id)
+        await emit(run_id, "node_log", node["id"], {
+            "level": "warn" if result["action"] == "open" else "info",
+            "message": f"确认点判定：{result['action']}——{result.get('reason') or ''}"[:300]})
+        if result["action"] == "open":
+            with session_scope() as s:
+                gate = (s.query(Gate)
+                        .filter(Gate.node_id == node["id"], Gate.status == "open")
+                        .order_by(Gate.id.desc()).first())
+                body = gate_payload(s, gate) if gate is not None else None
+            if body is not None:
+                await emit(run_id, "gate_requested", node["id"], {
+                    **body, "reason": result.get("reason") or "模型判定无效，转人工"})
+            self._set_run(run_id, status="waiting_human")
+        return result["action"]
 
     # ---------- 失败回流 ----------
     async def _handle_failure(self, run_id: str, node: dict, attempt_id: int,
@@ -464,6 +540,8 @@ class Orchestrator:
                           target_node: str | None = None, decided_by: str = "human",
                           artifact_kind: str | None = None, artifact_body: str | None = None,
                           data: dict | None = None) -> dict:
+        route = str((data or {}).get("route") or "").strip()
+        route_spec = self._route_spec(gate_id, route) if action == "approve" and route else None
         result: dict = {}
         edited: dict | None = None
         if artifact_kind and artifact_body:
@@ -477,12 +555,45 @@ class Orchestrator:
                               target_node=target_node, decided_by=decided_by, data=data)
         if edited:
             result["edited_artifact"] = edited
+        if route_spec is not None:
+            result["skipped_nodes"] = await self._skip_route_nodes(
+                result["run_id"], route_spec, route)
         await emit(result["run_id"], "gate_decided", None, result)
         if action == "reject" and result.get("reset_nodes"):
             await emit(result["run_id"], "nodes_reset", None,
                        {"nodes": result["reset_nodes"], "target": target_node})
         self.kick(result["run_id"])
         return result
+
+    def _route_spec(self, gate_id: int, route: str) -> dict:
+        """通过时选择去向：必须在落决定之前校验，未知的去向让门保持开着。"""
+        with session_scope() as s:
+            gate = s.get(Gate, gate_id)
+            if gate is None:
+                raise GateError("门不存在")
+            node = s.get(Node, gate.node_id)
+            config = dict(node.config_json or {}) if node is not None else {}
+        for item in config.get("routes") or []:
+            if str(item.get("key") or "") == route:
+                return dict(item)
+        raise GateError("未知的去向")
+
+    async def _skip_route_nodes(self, run_id: str, spec: dict, route: str) -> list[str]:
+        """把去向里的节点逐个置为 skipped，各发一条带去向的 node_finished。"""
+        skipped: list[tuple[int, str]] = []
+        with session_scope() as s:
+            rows = {row.node_key: row
+                    for row in s.query(Node).filter(Node.run_id == run_id).all()}
+            for key in [str(item) for item in spec.get("nodes") or []]:
+                row = rows.get(key)
+                if row is None or row.status in ("done", "skipped", "running"):
+                    continue
+                row.status = "skipped"
+                skipped.append((row.id, key))
+        for node_id, key in skipped:
+            await emit(run_id, "node_finished", node_id, {
+                "node_key": key, "skipped": True, "route": route})
+        return [key for _, key in skipped]
 
     # ---------- 恢复 ----------
     async def recover(self) -> None:

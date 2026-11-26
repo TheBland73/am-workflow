@@ -8,12 +8,21 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
+from app.artifacts.store import parse_front_matter
+from app.config import settings
 from app.db.base import session_scope
-from app.db.models import DecisionPoint, Gate, Meeting, Node, Run
+from app.db.models import Artifact, DecisionPoint, Gate, Meeting, Node, Run
 from app.engine.feedback import with_feedback
+from app.models.budget import truncate_to_tokens
 
 PENDING_TITLE = "待确认问题（需要你决定）"
+_MEETING_LABELS = {"discussion": "讨论会议", "review": "评审会议", "confirm": "需求确认会议"}
+_REPORT_KINDS = {"discussion": "discussion", "review": "review", "confirm": "review"}
+_VERDICT_NAMES = {"accept": "接受", "conditional": "有条件接受", "return": "退回",
+                  "pass": "通过", "fail": "不通过"}
+_RANK = {"blocker": 0, "major": 1, "minor": 2}
 
 
 class GateError(ValueError):
@@ -41,6 +50,84 @@ def _pending_questions(s, run_id: str) -> list[str]:
             for row in rows]
 
 
+def _artifact_body_in_session(s, run_id: str, kind: str, limit: int = 2000) -> str:
+    """在同一会话里读工件正文（连接池 size=1，不能在这里再开 session）。"""
+    row = (
+        s.query(Artifact)
+        .filter(Artifact.run_id == run_id, Artifact.kind == kind)
+        .order_by(Artifact.version.desc())
+        .first()
+    )
+    if row is None:
+        return ""
+    path = Path(row.path)
+    if not path.is_absolute():
+        path = settings.base_dir / path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    _meta, body = parse_front_matter(text)
+    return truncate_to_tokens(body.strip(), limit)
+
+
+def _blocking_lines(meeting: Meeting) -> list[str]:
+    state = dict(meeting.state_json or {})
+    params = dict((meeting.config_json or {}).get("params") or {})
+    if meeting.protocol == "review":
+        line = str(params.get("min_blocking_severity") or "major")
+        limit = _RANK.get(line, _RANK["major"])
+        rows = [issue for issue in state.get("issues") or []
+                if issue.get("standing", True)
+                and _RANK.get(issue.get("severity"), _RANK["minor"]) <= limit]
+    elif meeting.protocol == "confirm":
+        rows = list(state.get("items") or [])
+    else:
+        rows = []
+    lines = []
+    for row in rows[:5]:
+        location = row.get("location") or row.get("requirement") or row.get("index") or "—"
+        lines.append(f"- {row.get('id', '')} [{location}] {row.get('problem') or ''}")
+    return lines
+
+
+def _upstream_lines(s, node: Node | None, run_id: str) -> list[str]:
+    """上游会议的结论、轮次、前置检查，以及仍然成立的阻塞意见与报告要点。"""
+    if node is None:
+        return []
+    by_key = {row.node_key: row for row in s.query(Node).filter(Node.run_id == run_id).all()}
+    lines: list[str] = []
+    for dep_key in node.deps_json or []:
+        dep = by_key.get(dep_key)
+        if dep is None or dep.type != "MEETING":
+            continue
+        meeting = (s.query(Meeting).filter(Meeting.node_id == dep.id)
+                   .order_by(Meeting.id.desc()).first())
+        if meeting is None:
+            continue
+        state = dict(meeting.state_json or {})
+        label = _MEETING_LABELS.get(meeting.protocol, meeting.protocol)
+        pieces = [f"{label}（第 {meeting.round or 1} 轮）"]
+        verdict = str(state.get("verdict") or "")
+        if verdict:
+            pieces.append(f"结论：{_VERDICT_NAMES.get(verdict, verdict)}")
+        if "precheck_ok" in state:
+            pieces.append("前置检查通过" if state.get("precheck_ok")
+                          else f"前置检查未通过：{state.get('precheck_reason') or ''}")
+        lines.append("上游会议：" + "，".join(pieces) + "。")
+        blocking = _blocking_lines(meeting)
+        if blocking:
+            lines.append("仍然成立且达到阻塞线的前五条意见：")
+            lines.extend(blocking)
+        report_kind = _REPORT_KINDS.get(meeting.protocol)
+        if report_kind:
+            excerpt = _artifact_body_in_session(s, run_id, report_kind)
+            if excerpt:
+                lines.append("报告要点：")
+                lines.append(excerpt)
+    return lines
+
+
 def gate_payload(s, gate: Gate) -> dict:
     """门对外 payload：request_gate / get_gate / run 快照共用同一份字段。
 
@@ -57,6 +144,13 @@ def gate_payload(s, gate: Gate) -> dict:
         pending = _pending_questions(s, gate.run_id)
         if pending:
             description += f"\n\n{PENDING_TITLE}：\n" + "\n".join(pending)
+    if config.get("check") and not gate.kind:
+        upstream = _upstream_lines(s, node, gate.run_id)
+        if upstream:
+            description += "\n\n" + "\n".join(upstream)
+    hint = str(config.get("hint") or "").strip()
+    if hint:
+        description = (description.rstrip() + "\n\n" + hint).strip()
     title = (payload.get("title") if gate.kind else None) or config.get("title")
     return {
         "id": gate.id,
@@ -153,6 +247,12 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
         gate_node = s.get(Node, gate.node_id)
         if gate_node is None:
             raise GateError("门节点不存在")
+        if not str(decided_by or "").startswith("model:"):
+            # 人做出任何决定：模型连续驳回的计数清零
+            config = dict(gate_node.config_json or {})
+            if "auto_rejects" in config:
+                config.pop("auto_rejects", None)
+                gate_node.config_json = config
         run = s.get(Run, gate.run_id)
         run_id = gate.run_id
         approve_artifact: str | None = None
@@ -178,6 +278,8 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
 
         if action == "approve":
             gate.status = "approved"
+            gate.decision_json = {"action": "approve", "feedback": feedback or "",
+                                  "data": data or {}}
             config = with_feedback(dict(gate_node.config_json or {}), None)
             if config.get("escalation"):
                 # 失败转人工：人工确认后重试该节点，而不是把失败节点标记为完成
@@ -203,6 +305,8 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
             if target.id == gate_node.id:
                 raise GateError("目标节点不能是人工门自身")
             gate.status = "rejected"
+            gate.decision_json = {"action": "reject", "feedback": feedback or "",
+                                  "data": data or {}}
             gate_node.status = "pending"
             target.status = "pending"
             target.config_json = with_feedback(target.config_json, feedback, "reject")
