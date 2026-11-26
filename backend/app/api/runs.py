@@ -17,8 +17,8 @@ from app.config import settings
 from app.conversation.policy import reset_policy_cache
 from app.db.base import session_scope
 from app.db.models import (
-    AgentTemplate, Artifact, Event, Gate, ModelEntry, Node, NodeAttempt, Run, Task, Workflow,
-    new_run_id,
+    AgentTemplate, Artifact, Event, Gate, Meeting, MeetingTurn, ModelEntry, Node, NodeAttempt,
+    Run, Task, Workflow, new_run_id,
 )
 from app.engine.events import bus, emit, load_events, sse_format
 from app.engine.gates import GateError, gate_payload
@@ -393,6 +393,18 @@ def run_metrics(run_id: str) -> dict:
             row.id: (float(row.price_in or 0), float(row.price_out or 0))
             for row in s.query(ModelEntry).all()
         }
+        compactions = int(
+            s.query(func.count(Event.id))
+            .filter(Event.run_id == run_id, Event.type == "context_compacted").scalar() or 0)
+        cached_tokens = int(
+            s.query(func.coalesce(func.sum(NodeAttempt.cached_tokens), 0))
+            .filter(NodeAttempt.node_id.in_(node_ids)).scalar() or 0) if node_ids else 0
+        meeting_total = int(
+            s.query(func.count(Meeting.id)).filter(Meeting.run_id == run_id).scalar() or 0)
+        meeting_turns = int(
+            s.query(func.count(MeetingTurn.id))
+            .join(Meeting, Meeting.id == MeetingTurn.meeting_id)
+            .filter(Meeting.run_id == run_id).scalar() or 0)
         run_created, run_finished, run_status = run.created_at, run.finished_at, run.status
 
     by_node: dict[int, list[NodeAttempt]] = {}
@@ -448,6 +460,18 @@ def run_metrics(run_id: str) -> dict:
     gate_counts = {"total": len(gates), "open": 0, "approved": 0, "rejected": 0}
     for g in gates:
         gate_counts[g.status] = gate_counts.get(g.status, 0) + 1
+    # 确认点按判定者分：模型以 model: 前缀认，程序是 program/proxy，其余算人工，没决定的是开着
+    checkpoints = {"human": 0, "program": 0, "model": 0, "open": 0}
+    for gate in gates:
+        decided_by = str(gate.decided_by or "")
+        if gate.status == "open":
+            checkpoints["open"] += 1
+        elif decided_by.startswith("model:"):
+            checkpoints["model"] += 1
+        elif decided_by in ("program", "proxy"):
+            checkpoints["program"] += 1
+        else:
+            checkpoints["human"] += 1
 
     # 评审指标：轮次、一次通过、阻塞/问题分布、评审耗时。
     severities = {"blocker": 0, "major": 0, "minor": 0}
@@ -509,6 +533,16 @@ def run_metrics(run_id: str) -> dict:
             **gate_counts,
             "avg_decision_ms": int(sum(decision_ms) / len(decision_ms)) if decision_ms else 0,
             "open_wait_ms": sum(open_wait_ms),
+        },
+        "context": {
+            "compactions": compactions,
+            "cached_tokens": cached_tokens,
+            "cache_hit_rate": round(cached_tokens / tokens_in, 4) if tokens_in else 0,
+        },
+        "meetings": {
+            "total": meeting_total,
+            "turns": meeting_turns,
+            "checkpoints": checkpoints,
         },
         "events": events,
         "review": {

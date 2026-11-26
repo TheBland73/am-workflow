@@ -5,9 +5,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 
+from app.artifacts.store import latest_artifact, parse_front_matter, read_artifact
 from app.db.base import session_scope
 from app.db.models import (MEETING_ABANDONED, MEETING_COMPLETED, AgentTemplate, Gate, Meeting,
-                           MeetingIntervention, ModelEntry, Node)
+                           MeetingIntervention, ModelEntry, Node, Run)
 from app.engine.events import emit
 from app.engine.gates import gate_payload
 from app.meeting import store
@@ -35,6 +36,10 @@ class RosterIn(BaseModel):
 class PointPatch(BaseModel):
     status: str | None = None
     conclusion: str | None = Field(default=None, max_length=4000)
+
+
+class IssuePatch(BaseModel):
+    accepted: bool
 
 
 class InterveneIn(BaseModel):
@@ -147,6 +152,43 @@ def patch_decision_point(run_id: str, meeting_id: int, point_id: int,
     if changes:
         store.update_decision_point(point_id, **changes)
     return next(p for p in store.list_decision_points(meeting_id) if p["id"] == point_id)
+
+
+@router.patch("/runs/{run_id}/meetings/{meeting_id}/issues/{issue_id}")
+async def patch_issue(run_id: str, meeting_id: int, issue_id: str,
+                      payload: IssuePatch) -> dict:
+    """用户改判评审意见：只改执笔者的采纳与否，不改意见本身是否成立。"""
+    meeting = _meeting_or_404(run_id, meeting_id)
+    with session_scope() as s:
+        run = s.get(Run, run_id)
+        if run is None or run.status != "waiting_human":
+            raise HTTPException(400, "只有等待人工处理的运行才能改判评审意见")
+    state = meeting["state"]
+    issues = list(state.get("issues") or [])
+    issue = next((item for item in issues if str(item.get("id")) == issue_id), None)
+    if issue is None:
+        raise HTTPException(404, "评审意见不存在")
+    issue["accepted"] = bool(payload.accepted)
+    issue["disposition"] = "用户改判：采纳" if payload.accepted else "用户改判：不采纳"
+    state["issues"] = issues
+    store.set_state(meeting_id, state)
+    await emit(run_id, "meeting_issue_updated", meeting["node_id"], {
+        "meeting_id": meeting_id, "issue_id": issue_id, "accepted": issue["accepted"],
+        "disposition": issue["disposition"]})
+    return issue
+
+
+@router.get("/runs/{run_id}/meetings/{meeting_id}/minutes")
+def meeting_minutes(run_id: str, meeting_id: int) -> dict:
+    """这场会议的纪要：讨论会议取 discussion，评审与确认会议取 review。"""
+    meeting = _meeting_or_404(run_id, meeting_id)
+    kind = "discussion" if meeting["protocol"] == "discussion" else "review"
+    record = latest_artifact(run_id, kind)
+    raw = read_artifact(run_id, kind)
+    if not record or not raw:
+        raise HTTPException(404, "这场会议还没有纪要")
+    _meta, body = parse_front_matter(raw)
+    return {"kind": kind, "version": record["version"], "body": body.strip()}
 
 
 @router.post("/runs/{run_id}/meetings/{meeting_id}/intervene", status_code=201)
