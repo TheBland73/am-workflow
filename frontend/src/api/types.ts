@@ -11,6 +11,7 @@ export interface Run {
   finished_at: string | null;
   budget_tokens: number;
   error: string | null;
+  config: Record<string, unknown>;
   nodes_total?: number;
   nodes_done?: number;
 }
@@ -86,6 +87,9 @@ export interface Gate {
   decided_at: string | null;
   title?: string | null;
   description?: string | null;
+  kind: string;
+  payload: Record<string, unknown>;
+  decision: Record<string, unknown>;
 }
 
 export interface ArtifactRecord {
@@ -297,6 +301,133 @@ export interface AgentTemplate {
   memory_scope: string;
   default_model_id: number | null;
   max_steps: number;
+  builtin: boolean;
+  meta: { description?: string; tags?: string[]; meeting_roles?: string[] };
+}
+
+/* ---------- 会议式前半段：会议、确认点、参数表 ---------- */
+
+export interface MeetingSummary {
+  id: number;
+  run_id: string;
+  node_id: number;
+  node_key: string;
+  protocol: string;
+  status: string;
+  phase: string;
+  round: number;
+}
+
+export interface Participant {
+  id: number;
+  meeting_id: number;
+  role_key: string | null;
+  display_name: string;
+  mode: string;
+  system_prompt: string;
+  model_id: number | null;
+  source: string;
+  expertise: string[];
+  status: string;
+  position: number;
+}
+
+export interface ParticipantIn {
+  role_key?: string | null;
+  display_name: string;
+  persona?: string;
+  model_id?: number | null;
+  mode?: string;
+}
+
+export interface MeetingTurn {
+  id: number;
+  seq: number;
+  round: number;
+  phase: string;
+  speaker_id: number | null;
+  speaker_name: string;
+  kind: string;
+  decision_point_id: number | null;
+  content: string;
+  structured: Record<string, unknown>;
+  reply_to: number | null;
+  tokens_in: number;
+  tokens_out: number;
+  cached_tokens: number;
+}
+
+export interface DecisionPoint {
+  id: number;
+  meeting_id: number;
+  index: number;
+  title: string;
+  question: string;
+  options: string[];
+  raised_by: string | null;
+  status: string;
+  conclusion: string | null;
+  rationale: string | null;
+  exchange_summary: string | null;
+  stances: Record<string, unknown>;
+  origin_round: number | null;
+  closed_round: number | null;
+  superseded_by: number | null;
+}
+
+export interface MeetingDetail {
+  meeting: MeetingSummary;
+  participants: Participant[];
+  decision_points: DecisionPoint[];
+  checkpoints: Gate[];
+  turn_count: number;
+  node_status: string | null;
+}
+
+export interface ParamSpec {
+  type: "int" | "float" | "bool" | "str";
+  default: number | string | boolean;
+  min?: number;
+  max?: number;
+  choices?: string[];
+  title: string;
+  recommend?: string;
+  hint?: string;
+}
+
+export interface TemplateNode {
+  key: string;
+  type: string;
+  name?: string;
+  phase?: string;
+  deps?: string[];
+  config?: Record<string, unknown>;
+}
+
+export interface TemplateDefinition {
+  key: string;
+  name: string;
+  phases: Array<{ key: string; name: string }>;
+  params: Record<string, Record<string, ParamSpec>>;
+  automation_levels: Record<string, Record<string, string>>;
+  rubrics: Record<string, string>;
+  nodes: TemplateNode[];
+}
+
+export interface RunConfig {
+  automation?: { level?: string; checkpoints?: Record<string, string> };
+  params?: Record<string, Record<string, unknown>>;
+  rosters?: Record<string, { role_keys?: string[]; count?: number }>;
+}
+
+export interface MaterialIn {
+  name?: string;
+  content: string;
+}
+
+export interface MaterialRecord {
+  name: string;
+  chars: number;
 }
 
 export interface Preset {

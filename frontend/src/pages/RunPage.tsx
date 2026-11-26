@@ -13,7 +13,7 @@ import ExecutionMap from "../canvas/ExecutionMap";
 import GateConsole from "../panels/GateConsole";
 
 const ARTIFACT_LABELS: Record<string, string> = {
-  idea: "想法", discussion: "讨论", proposal: "方案", review: "评审",
+  idea: "想法", discussion: "会议纪要", proposal: "方案", review: "评审与确认报告",
   requirement: "需求", design: "设计", task: "任务", test: "测试", changelog: "交付日志",
 };
 const ARTIFACT_KINDS = Object.keys(ARTIFACT_LABELS);

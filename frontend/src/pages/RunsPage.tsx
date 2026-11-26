@@ -21,6 +21,7 @@ const PHASE_LABELS: Record<string, string> = {
   idea: "想法",
   discussion: "讨论",
   proposal: "方案",
+  review: "多方评价",
   requirement: "需求",
   design: "设计",
   tasks: "任务分解",
