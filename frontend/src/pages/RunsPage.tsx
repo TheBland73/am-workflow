@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert, Button, Collapse, Divider, Empty, Form, Input, InputNumber, Modal, Progress, Radio,
-  Select, Space, Switch, Table, Tag, message,
+  Select, Space, Switch, Table, message,
 } from "antd";
 import { DeleteOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -126,6 +126,8 @@ export default function RunsPage() {
   const [createErrors, setCreateErrors] = useState<string[]>([]);
   const [form] = Form.useForm<CreateValues>();
   const [messageApi, contextHolder] = message.useMessage();
+  // 默认值只在一次"新建"开始时写一遍：模板定义加载完成前用户先点的等级不被覆盖
+  const initialized = useRef(false);
 
   const runs = useQuery({ queryKey: ["runs"], queryFn: api.listRuns, refetchInterval: 4000 });
 
@@ -145,13 +147,18 @@ export default function RunsPage() {
   });
 
   useEffect(() => {
-    if (!open || !definition.data) return;
+    if (!open) {
+      initialized.current = false;
+      return;
+    }
+    if (initialized.current || !definition.data) return;
     form.setFieldsValue({
       budget: 1200000,
       level: "L2",
       rosterMode: "none",
       ...paramValues(definition.data),
     });
+    initialized.current = true;
   }, [open, definition.data, form]);
 
   const materials = Form.useWatch("materials", form) ?? [];
@@ -254,7 +261,11 @@ export default function RunsPage() {
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <Button icon={<ReloadOutlined />} onClick={() => runs.refetch()}>刷新</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setCreateErrors([]); setOpen(true); }}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => {
+            form.resetFields();
+            setCreateErrors([]);
+            setOpen(true);
+          }}>
             新建运行
           </Button>
         </div>
@@ -314,7 +325,7 @@ export default function RunsPage() {
           </Form.Item>
 
           <Form.Item name="level" label="自动化等级">
-            <Radio.Group>
+            <Radio.Group disabled={!def}>
               {Object.keys(def?.automation_levels ?? { L1: {}, L2: {}, L3: {} }).map((key) => (
                 <Radio key={key} value={key}>
                   <div>{LEVEL_NAME[key] ?? key}</div>
@@ -483,6 +494,22 @@ function buildConfig(values: CreateValues, definition: TemplateDefinition | unde
     }
   }
   if (Object.keys(params).length) config.params = params;
+
+  // 固定人数要把人数范围同步成同一个值：名单替换按 params 的 min/max 校验，
+  // 不合并的话"固定 1 人"的运行一改名单就会被 3–5 的默认范围拒绝。
+  if (values.rosterMode === "count") {
+    const count = Number(values.rosterCount);
+    if (count > 0) {
+      config.params = {
+        ...(config.params ?? {}),
+        discussion: {
+          ...(config.params?.discussion ?? {}),
+          participants_min: count,
+          participants_max: count,
+        },
+      };
+    }
+  }
 
   if (values.rosterMode === "count" && values.rosterCount) {
     config.rosters = { participants: { count: Number(values.rosterCount) } };

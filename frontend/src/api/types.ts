@@ -92,6 +92,16 @@ export interface Gate {
   decision: Record<string, unknown>;
 }
 
+/** `/gates?run_id=` 的精简列表项（与快照里的门不是同一份形状）。 */
+export interface GateListItem {
+  id: number;
+  run_id: string;
+  node_id: number;
+  status: string;
+  feedback: string | null;
+  decided_by: string | null;
+}
+
 export interface ArtifactRecord {
   kind: string;
   version: number;

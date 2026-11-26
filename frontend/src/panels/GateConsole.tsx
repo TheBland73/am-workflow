@@ -23,6 +23,9 @@ function asRows(value: unknown): Array<Record<string, unknown>> {
     : [];
 }
 
+/** 名单里主持人提的临时角色：只在本场有效，没有角色键。 */
+type TempRole = { key: string; display_name: string; persona: string };
+
 export default function GateConsole({
   snapshot, gate, heldCount, onDecided,
 }: {
@@ -42,6 +45,8 @@ export default function GateConsole({
   const [answers, setAnswers] = useState<string[]>([]);
   const [roles, setRoles] = useState<string[]>([]);
   const [initialRoles, setInitialRoles] = useState<string[]>([]);
+  const [tempRoles, setTempRoles] = useState<TempRole[]>([]);
+  const [initialTempRoles, setInitialTempRoles] = useState<TempRole[]>([]);
 
   const node = useMemo(
     () => snapshot.nodes.find((item) => item.id === gate?.node_id),
@@ -80,6 +85,8 @@ export default function GateConsole({
       setAnswers([]);
       setRoles([]);
       setInitialRoles([]);
+      setTempRoles([]);
+      setInitialTempRoles([]);
       return;
     }
     const rejectTarget = String(node?.config?.reject_target ?? "");
@@ -87,11 +94,21 @@ export default function GateConsole({
     const kind = gate.kind ?? "";
     const data = gate.payload ?? {};
     setAnswers(Array.isArray(data.questions) ? data.questions.map(() => "") : []);
-    const keys = asRows(data.proposed)
+    const rows = asRows(data.proposed);
+    const keys = rows
       .map((row) => String(row.role_key ?? ""))
       .filter(Boolean);
+    const temporary = rows
+      .filter((row) => !row.role_key)
+      .map((row, index) => ({
+        key: `tmp:${index}`,
+        display_name: String(row.display_name ?? "").trim() || `临时角色 ${index + 1}`,
+        persona: String(row.persona ?? ""),
+      }));
     setRoles(keys);
     setInitialRoles(keys);
+    setTempRoles(temporary);
+    setInitialTempRoles(temporary);
     const artifact = kind ? "" : String(node?.config?.artifact ?? "");
     if (!artifact) {
       setBody("");
@@ -116,7 +133,14 @@ export default function GateConsole({
   const waited = gate?.created_at
     ? (Date.now() - new Date(gate.created_at).getTime()) / 1000
     : 0;
-  const rosterChanged = roles.join("\u0000") !== initialRoles.join("\u0000");
+  const rosterChanged = roles.join("\u0000") !== initialRoles.join("\u0000")
+    || JSON.stringify(tempRoles) !== JSON.stringify(initialTempRoles);
+  const rosterBounds = {
+    min: Number(payload.min) || 0,
+    max: Number(payload.max) || 0,
+    fixed: Number(payload.fixed) || 0,
+  };
+  const rosterCount = roles.length + tempRoles.length;
 
   const refresh = () => {
     onDecided();
@@ -130,9 +154,21 @@ export default function GateConsole({
       messageApi.warning("请先写下意见");
       return;
     }
-    if (checkpointKind === "roster" && action === "approve" && roles.length === 0) {
-      messageApi.warning("名单不能为空，请至少选一名参会角色");
-      return;
+    if (checkpointKind === "roster" && action === "approve") {
+      if (rosterCount === 0) {
+        messageApi.warning("名单不能为空，请至少保留一名参会者");
+        return;
+      }
+      if (rosterBounds.fixed > 0 && rosterCount !== rosterBounds.fixed) {
+        messageApi.warning(`固定人数是 ${rosterBounds.fixed} 名，当前 ${rosterCount} 名`);
+        return;
+      }
+      if (rosterBounds.fixed === 0
+        && (rosterCount < rosterBounds.min || rosterCount > rosterBounds.max)) {
+        messageApi.warning(
+          `参会人数须在 ${rosterBounds.min} 到 ${rosterBounds.max} 名之间，当前 ${rosterCount} 名`);
+        return;
+      }
     }
     setBusy(true);
     try {
@@ -141,16 +177,24 @@ export default function GateConsole({
         const meeting = [...items].reverse()
           .find((item) => item.node_id === gate.node_id);
         if (!meeting) throw new Error("找不到这场会议的记录，无法改名单");
-        await api.replaceParticipants(snapshot.run.id, meeting.id, roles.map((key) => {
-          const template = (templates.data?.items ?? [])
-            .find((item) => item.role_key === key);
-          return {
-            role_key: key,
-            display_name: template?.name ?? key,
+        // 不传 model_id：模板绑定的模型可能已禁用，让会议按角色默认/第一个可用模型回落
+        await api.replaceParticipants(snapshot.run.id, meeting.id, [
+          ...roles.map((key) => {
+            const template = (templates.data?.items ?? [])
+              .find((item) => item.role_key === key);
+            return {
+              role_key: key,
+              display_name: template?.name ?? key,
+              mode: "participant",
+            };
+          }),
+          ...tempRoles.map((row) => ({
+            role_key: null,
+            display_name: row.display_name,
+            persona: row.persona,
             mode: "participant",
-            model_id: template?.default_model_id ?? null,
-          };
-        }));
+          })),
+        ]);
       }
       const data: Record<string, unknown> = {};
       if (option) data.option = option;
@@ -339,6 +383,7 @@ export default function GateConsole({
               {proposed.map((row, index) => (
                 <li key={`${String(row.role_key ?? "")}-${index}`}>
                   {String(row.display_name ?? row.role_key ?? "")}
+                  {row.role_key ? "" : "（临时角色）"}
                   {row.reason ? `：${String(row.reason)}` : ""}
                 </li>
               ))}
@@ -356,13 +401,35 @@ export default function GateConsole({
               loading={templates.isLoading}
             />
           </label>
+          {tempRoles.length > 0 && (
+            <div style={{ marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: "var(--ef-ink-2)", marginRight: 8 }}>
+                主持人提的临时角色（原样保留）
+              </span>
+              {tempRoles.map((row) => (
+                <Tag
+                  key={row.key}
+                  closable
+                  onClose={() => setTempRoles((previous) =>
+                    previous.filter((item) => item.key !== row.key))}
+                >
+                  {row.display_name}
+                </Tag>
+              ))}
+            </div>
+          )}
+          <p style={{ fontSize: 12, color: "var(--ef-ink-2)", margin: "0 0 8px" }}>
+            {rosterBounds.fixed > 0
+              ? `固定 ${rosterBounds.fixed} 名，当前 ${rosterCount} 名。`
+              : `人数要求 ${rosterBounds.min} 到 ${rosterBounds.max} 名，当前 ${rosterCount} 名。`}
+          </p>
           {rosterChanged && <Tag color="gold">名单已改动，通过时先替换参会者</Tag>}
           {feedbackField("驳回时写意见；通过可留空。")}
           <p className="ef-actions">
             <Button
               type="primary"
               loading={busy}
-              disabled={roles.length === 0}
+              disabled={rosterCount === 0}
               onClick={() => decideCheckpoint("approve")}
             >
               通过名单

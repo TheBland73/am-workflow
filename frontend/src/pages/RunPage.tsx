@@ -34,6 +34,13 @@ const MEETING_STATUS_LABEL: Record<string, string> = {
   completed: "已完成", abandoned: "已放弃",
 };
 
+/** 这些事件会改变会议详情（步骤、发言、确认点状态），收到后失效会议查询。 */
+const MEETING_EVENTS = new Set([
+  "meeting_started", "meeting_phase", "meeting_turn_finished", "meeting_ledger_updated",
+  "meeting_suspended", "meeting_resumed", "meeting_finished",
+  "meeting_intervention_injected", "checkpoint_decided", "gate_decided",
+]);
+
 function statusLabel(status: string) {
   return STATUS_LABELS[status] ?? status;
 }
@@ -197,8 +204,12 @@ export default function RunPage() {
   });
   const meetingTurnsQuery = useQuery({
     queryKey: ["meeting-turns", runId, meetingRef?.meetingId],
-    queryFn: () => api.meetingTurns(runId, meetingRef!.meetingId, 0, 500),
-    enabled: Boolean(meetingRef),
+    // 后端按序号升序取"前 N 条"：要最近的 50 条，从总条数倒推起点
+    queryFn: () => api.meetingTurns(
+      runId, meetingRef!.meetingId,
+      Math.max(0, (meetingDetailQuery.data?.turn_count ?? 0) - 50), 50,
+    ),
+    enabled: Boolean(meetingRef) && meetingDetailQuery.isSuccess,
     refetchInterval: (query) => {
       const status = meetingDetailQuery.data?.meeting.status;
       return query.state.data && (status === "active" || status === "waiting_rework")
@@ -249,6 +260,10 @@ export default function RunPage() {
         client.invalidateQueries({ queryKey: ["snapshot", runId] });
         client.invalidateQueries({ queryKey: ["metrics", runId] });
         client.invalidateQueries({ queryKey: ["review", runId] });
+        if (MEETING_EVENTS.has(event.type)) {
+          client.invalidateQueries({ queryKey: ["meeting", runId] });
+          client.invalidateQueries({ queryKey: ["meeting-turns", runId] });
+        }
       }
     }, 0);
     return unsubscribe;
@@ -774,7 +789,7 @@ export default function RunPage() {
 
               <h4>参会者</h4>
               <ul className="ef-facts" style={{ display: "block" }}>
-                {detail.participants.map((item) => (
+                {detail.participants.filter((item) => item.status === "active").map((item) => (
                   <li key={item.id}>
                     {item.display_name}
                     <span style={{ color: "var(--ef-ink-2)" }}>
@@ -784,7 +799,9 @@ export default function RunPage() {
                     </span>
                   </li>
                 ))}
-                {detail.participants.length === 0 && <li>（还没有参会者）</li>}
+                {detail.participants.filter((item) => item.status === "active").length === 0 && (
+                  <li>（还没有参会者）</li>
+                )}
               </ul>
 
               <h4>决策点账本</h4>

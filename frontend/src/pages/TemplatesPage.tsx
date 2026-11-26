@@ -294,9 +294,11 @@ export default function TemplatesPage() {
 
 /** 新建角色时提交的元数据：一句话简介、专长标签、适合的会议角色。 */
 function modalMeta(values: Record<string, unknown>) {
+  const meetingRoles = (values.meeting_roles as string[] | undefined) ?? [];
   return {
     description: String(values.description ?? "").trim(),
     tags: (values.tags as string[] | undefined) ?? [],
-    meeting_roles: (values.meeting_roles as string[] | undefined) ?? [],
+    // 一个都没勾时省略该键：后端把"没有标会议角色"当成不限制，空数组则意味着哪个会都不能参加
+    ...(meetingRoles.length ? { meeting_roles: meetingRoles } : {}),
   };
 }

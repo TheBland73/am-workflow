@@ -1,8 +1,9 @@
 import type {
-  AgentTemplate, ArtifactRecord, DecisionPoint, Gate, MaterialIn, MaterialRecord, MeetingDetail,
-  MeetingSummary, MeetingTurn, ModelEntry, Participant, ParticipantIn, PlanActivity, PlanDetail,
-  PlanEvent, PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider, RemoteModel, Run,
-  RunConfig, RunMetrics, RunReview, Snapshot, StreamEvent, Task, TemplateDefinition, TestResult,
+  AgentTemplate, ArtifactRecord, DecisionPoint, GateListItem, MaterialIn, MaterialRecord,
+  MeetingDetail, MeetingSummary, MeetingTurn, ModelEntry, Participant, ParticipantIn, PlanActivity,
+  PlanDetail, PlanEvent, PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider,
+  RemoteModel, Run, RunConfig, RunMetrics, RunReview, Snapshot, StreamEvent, Task,
+  TemplateDefinition, TestResult,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -86,7 +87,7 @@ export const api = {
     request<{ delegated: boolean; gate_id: number; to: string }>(`/gates/${gateId}/delegate`, {
       method: "POST",
     }),
-  gates: (runId: string) => request<{ items: Gate[] }>(`/gates?run_id=${runId}`),
+  gates: (runId: string) => request<{ items: GateListItem[] }>(`/gates?run_id=${runId}`),
 
   /* ---------- 会议、确认点、运行级配置、背景材料、自定义角色 ---------- */
   templateDefinition: (key: string) => request<TemplateDefinition>(`/templates/${key}`),
