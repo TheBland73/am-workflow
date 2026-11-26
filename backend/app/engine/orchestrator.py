@@ -231,11 +231,12 @@ class Orchestrator:
         })
         if retry:
             delay = self._retry_delay(attempt_no)
-            extra: dict = {"retry_count": attempt_no}
+            seq = int((node["config"] or {}).get("feedback_seq") or 0)
+            extra: dict = {"retry_count": attempt_no, "feedback_kind": "auto_retry",
+                           "feedback_seq": seq + 1}
             if delay > 0:
                 extra["retry_at"] = (_now() + timedelta(seconds=delay)).isoformat()
-            self._update_node(node["id"], status="pending", feedback=message,
-                              extra={**extra, "feedback_kind": "auto_retry"})
+            self._update_node(node["id"], status="pending", feedback=message, extra=extra)
             await emit(run_id, "node_log", node["id"], {
                 "level": "warn",
                 "message": (
@@ -253,7 +254,7 @@ class Orchestrator:
         from app.engine.gates import request_gate
 
         self._update_node(node["id"], status="waiting_human", feedback=message,
-                          drop=["retry_at"],
+                          drop=["retry_at", "feedback_kind"],
                           extra={"escalation": True, "escalation_reason": message})
         gate = request_gate(run_id, node["id"], feedback=message)
         self._set_run(run_id, status="waiting_human")

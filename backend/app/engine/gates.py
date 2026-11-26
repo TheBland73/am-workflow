@@ -198,8 +198,9 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
         gate.decided_at = now
         reset_keys: list[str] = []
 
-        if gate_node.type == "MEETING":
-            # 会议内确认点：决定存在门上，节点回到待调度；驳回不需要目标节点
+        if gate_node.type == "MEETING" and gate.kind:
+            # 会议内确认点（门上带类型）：决定存在门上，节点回到待调度；驳回不需要目标节点。
+            # 会议节点上的失败转人工门、恢复时补开的门没有类型，仍走下面工件门的规则。
             gate.status = "approved" if action == "approve" else "rejected"
             gate.decision_json = {"action": action, "feedback": feedback or "", "data": data or {}}
             gate_node.status = "pending"
@@ -213,15 +214,14 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
 
         if action == "approve":
             gate.status = "approved"
-            config = dict(gate_node.config_json or {})
+            config = with_feedback(dict(gate_node.config_json or {}), None)
             if config.get("escalation"):
                 # 失败转人工：人工确认后重试该节点，而不是把失败节点标记为完成
                 gate_node.status = "pending"
-                for key in ("feedback", "escalation", "escalation_reason"):
+                for key in ("escalation", "escalation_reason"):
                     config.pop(key, None)
             else:
                 gate_node.status = "done"
-                config.pop("feedback", None)
                 approve_artifact = config.get("artifact")
             gate_node.config_json = config
             if run:

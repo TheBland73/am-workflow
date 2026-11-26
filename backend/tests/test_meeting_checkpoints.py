@@ -85,10 +85,27 @@ def test_reject_needs_no_target_and_lets_meeting_resume() -> None:
     assert result["checkpoint"] is True and result["status"] == "rejected"
     with session_scope() as s:
         assert s.get(Node, mtg.node_id).status == "pending"
+        assert s.get(Run, mtg.run_id).status == "running"
         assert s.get(Gate, gate_id).decision_json == {
             "action": "reject", "feedback": "给 D2 再多一轮", "data": {}}
     # 会议本身的挂起状态由运行器在续开时改，决定路径不动它
     assert store.get_meeting(mtg.meeting_id)["status"] == "suspended"
+
+
+def test_checkpoint_reject_needs_no_feedback() -> None:
+    mtg = _open_checkpoint()
+    gate_id = store.get_state(mtg.meeting_id)["awaiting_gate_id"]
+    result = decide_gate(gate_id=gate_id, action="reject")
+    assert result["checkpoint"] is True and result["status"] == "rejected"
+    assert get_gate(gate_id)["decision"]["feedback"] == ""
+
+
+def test_checkpoint_gate_cannot_be_decided_twice() -> None:
+    mtg = _open_checkpoint()
+    gate_id = store.get_state(mtg.meeting_id)["awaiting_gate_id"]
+    decide_gate(gate_id=gate_id, action="approve")
+    with pytest.raises(GateError):
+        decide_gate(gate_id=gate_id, action="approve")
 
 
 def test_approve_carries_data_and_decider() -> None:
@@ -97,8 +114,20 @@ def test_approve_carries_data_and_decider() -> None:
     decide_gate(gate_id=gate_id, action="approve", decided_by="model:mock",
                 data={"option": "proceed"})
     gate = get_gate(gate_id)
+    assert gate["status"] == "approved"
     assert gate["decision"]["data"] == {"option": "proceed"}
     assert gate["decided_by"] == "model:mock"
+
+
+def test_api_approve_passes_data_through(monkeypatch) -> None:
+    mtg = _open_checkpoint()
+    gate_id = store.get_state(mtg.meeting_id)["awaiting_gate_id"]
+    monkeypatch.setattr(orchestrator, "kick", lambda run_id: None)
+    with TestClient(app) as client:
+        response = client.post(f"/api/gates/{gate_id}/approve",
+                               json={"data": {"option": "proceed"}})
+    assert response.status_code == 200, response.text
+    assert get_gate(gate_id)["decision"]["data"] == {"option": "proceed"}
 
 
 def test_artifact_gate_reject_still_requires_target() -> None:
@@ -106,7 +135,32 @@ def test_artifact_gate_reject_still_requires_target() -> None:
     gate = request_gate(run_id, gate_node_id)
     with pytest.raises(GateError):
         decide_gate(gate_id=gate["id"], action="reject", feedback="重做")
-    assert get_gate(gate["id"])["kind"] == ""
+    after = get_gate(gate["id"])
+    assert after["status"] == "open" and after["feedback"] is None
+
+
+def test_safety_net_gate_on_meeting_node_keeps_gate_semantics() -> None:
+    """会议节点上的失败转人工门没有确认点类型，不能当成会议内确认点：通过后要清掉升级标记。"""
+    run_id, node_id = _new_run(dict(node_key="discuss", type="MEETING", name="讨论会议",
+                                    config_json={"protocol": "discussion", "escalation": True,
+                                                 "escalation_reason": "模型连续失败"}))
+    gate = request_gate(run_id, node_id)
+    result = decide_gate(gate_id=gate["id"], action="approve")
+    assert not result.get("checkpoint")
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        assert node.status == "pending"
+        assert "escalation" not in node.config_json
+        assert "escalation_reason" not in node.config_json
+
+
+def test_safety_net_gate_on_meeting_node_reject_still_requires_target() -> None:
+    run_id, node_id = _new_run(dict(node_key="discuss", type="MEETING", name="讨论会议",
+                                    config_json={"protocol": "discussion"}))
+    gate = request_gate(run_id, node_id)
+    with pytest.raises(GateError):
+        decide_gate(gate_id=gate["id"], action="reject", feedback="重做")
+    assert get_gate(gate["id"])["status"] == "open"
 
 
 def test_reject_marks_feedback_with_kind_and_sequence() -> None:
@@ -161,6 +215,7 @@ def test_with_feedback_does_not_mutate_input() -> None:
 
 def test_auto_retry_feedback_has_its_own_kind(monkeypatch) -> None:
     """失败后的自动重试不继承旧的来路，否则会议会把它当成要复议的意见。"""
+    init_db()
     captured: dict = {}
     monkeypatch.setattr(orchestrator, "_update_node",
                         lambda node_id, **kwargs: captured.update(kwargs))
@@ -177,3 +232,25 @@ def test_auto_retry_feedback_has_its_own_kind(monkeypatch) -> None:
     assert captured["status"] == "pending"
     assert captured["feedback"] == "模型输出不符合要求"
     assert captured["extra"]["feedback_kind"] == "auto_retry"
+    assert captured["extra"]["feedback_seq"] == 4
+
+
+def test_escalation_clears_stale_feedback_kind(monkeypatch) -> None:
+    """失败转人工时不能留着上一次驳回的来路，否则人工通过后会被会议当成未处理的意见。"""
+    run_id, node_id = _new_run(dict(
+        node_key="discuss", type="MEETING", name="讨论会议",
+        config_json={"protocol": "discussion", "feedback": "未消费的驳回",
+                     "feedback_kind": "reject", "feedback_seq": 5}))
+
+    async def no_emit(*args, **kwargs) -> None:
+        return None
+
+    monkeypatch.setattr("app.engine.orchestrator.emit", no_emit)
+    _, nodes = orchestrator._load(run_id)
+    node = next(n for n in nodes if n["id"] == node_id)
+    asyncio.run(orchestrator._handle_failure(run_id, node, 0, 1, "连续失败", True))
+    with session_scope() as s:
+        config = s.get(Node, node_id).config_json
+    assert config["feedback"] == "连续失败"
+    assert "feedback_kind" not in config
+    assert config["escalation"] is True
