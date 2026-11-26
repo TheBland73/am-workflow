@@ -13,6 +13,7 @@ from app.config import settings
 from app.db.base import session_scope
 from app.db.models import Gate, Node, NodeAttempt, Run, Task, Workflow
 from app.engine.events import emit
+from app.engine.feedback import with_feedback
 from app.engine.gates import GateError, decide_gate as _decide_gate
 from app.engine.runners import NodeContext, NodeFailure, classify_failure, execute_node, lesson_for
 from app.engine.templates import phase_names
@@ -202,6 +203,9 @@ class Orchestrator:
                 "meeting_id": result.get("meeting_id"), "gate_id": checkpoint.get("id"),
                 "kind": checkpoint.get("kind")})
             return
+        if result.get("reroute"):
+            await self._handle_reroute(run_id, node, result["reroute"])
+            return
         if node["type"] == "REVIEW" and result.get("verdict") == "block":
             await self._handle_review_block(run_id, node, attempt_id, attempt_no, result)
             return
@@ -266,6 +270,64 @@ class Orchestrator:
         await emit(run_id, "gate_requested", node["id"], {
             **gate, "reason": "达到最大重试次数，转人工", "escalation": True,
         })
+
+    # ---------- 定点回流 ----------
+    async def _handle_reroute(self, run_id: str, node: dict, instruction: dict) -> None:
+        """把指令里的节点定点重开并带反馈（不级联），当前节点轮次加一；轮次用尽转人工。
+
+        评审、确认这类循环靠它承载：评审会议依赖讨论会议，所以讨论会议重跑完成之前，
+        评审会议不会被调度。extra_round 为真表示人已同意再评一轮：轮次和上限一起加一。
+        """
+        config = dict(node["config"] or {})
+        round_no = int(config.get("round") or 1)
+        max_rounds = max(1, int(config.get("max_rounds") or 3))
+        targets = [str(key) for key in (instruction.get("targets") or [])]
+        feedback = str(instruction.get("feedback") or "")
+        extra_round = bool(instruction.get("extra_round"))
+
+        if round_no >= max_rounds and not extra_round:
+            reason = f"回流已达 {max_rounds} 轮：{feedback[:500]}"
+            self._update_node(node["id"], status="waiting_human", feedback=reason,
+                              drop=["retry_at", "feedback_kind"],
+                              extra={"escalation": True, "escalation_reason": reason})
+            from app.engine.gates import request_gate
+
+            gate = request_gate(run_id, node["id"], feedback=reason)
+            self._set_run(run_id, status="waiting_human")
+            await emit(run_id, "node_rerouted", node["id"], {
+                "from": node["node_key"], "targets": targets, "round": round_no,
+                "max_rounds": max_rounds, "escalated": True})
+            await emit(run_id, "gate_requested", node["id"],
+                       {**gate, "reason": "回流轮次用尽，转人工", "escalation": True})
+            return
+
+        bump = {"round": round_no + 1}
+        if extra_round:
+            bump["max_rounds"] = max(max_rounds, round_no + 1)
+        self_feedback = str(instruction.get("self_feedback") or "").strip()
+        if self_feedback:
+            updated = with_feedback(config, self_feedback, "reroute_self")
+            self._update_node(node["id"], status="pending", drop=["retry_at"], extra={
+                **bump, "feedback": updated["feedback"],
+                "feedback_kind": updated["feedback_kind"],
+                "feedback_seq": updated["feedback_seq"]})
+        else:
+            self._update_node(node["id"], status="pending", extra=bump,
+                              drop=["retry_at", "feedback", "feedback_kind"])
+        _, nodes = self._load(run_id)
+        reset: list[str] = []
+        for other in nodes:
+            if other["node_key"] in targets and other["status"] != "running":
+                updated = with_feedback(other["config"], feedback, "reroute")
+                self._update_node(other["id"], status="pending",
+                                  extra={"feedback": updated["feedback"],
+                                         "feedback_kind": updated["feedback_kind"],
+                                         "feedback_seq": updated["feedback_seq"]},
+                                  drop=["retry_at", "retry_count"])
+                reset.append(other["node_key"])
+        await emit(run_id, "node_rerouted", node["id"], {
+            "from": node["node_key"], "targets": reset, "round": round_no + 1,
+            "max_rounds": bump.get("max_rounds", max_rounds), "escalated": False})
 
     # ---------- 评审回流 ----------
     async def _handle_review_block(self, run_id: str, node: dict, attempt_id: int,
