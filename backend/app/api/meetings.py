@@ -95,6 +95,8 @@ async def replace_participants(run_id: str, meeting_id: int, payload: RosterIn) 
     # 先把请求全部校验完，再一次事务替换：任何一条不合法都不动库
     prompts: list[str] = []
     with session_scope() as s:
+        node = s.get(Node, meeting["node_id"])
+        params = dict((node.config_json or {}).get("params") or {}) if node else {}
         for item in payload.participants:
             if item.mode not in EDITABLE_MODES:
                 raise HTTPException(400, f"不能指定模式为 {item.mode} 的角色")
@@ -110,6 +112,13 @@ async def replace_participants(run_id: str, meeting_id: int, payload: RosterIn) 
                     raise HTTPException(400, f"角色模板不存在：{item.role_key}")
                 prompt = template.system_prompt
             prompts.append(prompt)
+    count = sum(1 for item in payload.participants if item.mode == "participant")
+    low, high = params.get("participants_min"), params.get("participants_max")
+    if low is not None or high is not None:                # 运行里配了人数范围才约束
+        low = max(1, int(low or 1))
+        high = max(low, int(high if high is not None else low))
+        if not low <= count <= high:
+            raise HTTPException(400, f"参会人数须在 {low} 到 {high} 名之间")
     store.replace_participants(meeting_id, [
         {"role_key": item.role_key, "display_name": item.display_name, "mode": item.mode,
          "system_prompt": prompt, "model_id": item.model_id}

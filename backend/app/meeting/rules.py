@@ -56,14 +56,16 @@ def to_rule(points: list[dict], exchanges: dict[str, int], exchanges_per_point: 
 
 
 def relax(points: list[dict], voters: list[int]) -> dict:
-    """全自动模式下的退让：先按"无反对即可"了结，仍不行的记为待定。只计算，不落盘。"""
+    """全自动模式下的退让：先按"无反对即可"了结，仍不行的记为待定。只计算，不落盘。
+
+    与 point_agreed 同一口径：缺表态不算"无人反对"，该点记为待定而不是自动关闭。
+    """
     agreed: list[str] = []
     deferred: list[str] = []
     for point in points:
         if point["status"] not in OPEN_STATUSES:
             continue
-        levels = [level_of(point, voter) for voter in voters]
-        if voters and all(level not in (NEED_INFO, OPPOSE) for level in levels):
+        if point_agreed(point, "no_objection", voters):
             agreed.append(point["index"])
         else:
             deferred.append(point["index"])

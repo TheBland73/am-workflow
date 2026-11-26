@@ -103,9 +103,12 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
         policy = policy_for_run(mtg.run_id)
     except Exception:
         policy = DEFAULT_POLICY
+    # 上一版方案不能压缩也不能截短：修订必须在看到全文的前提下进行（与 C2 的预算口径一致）
+    previous = [s for s in segments if s.name == "上一版方案"]
+    append = [s for s in segments if s.kind == "append" and s.name != "上一版方案"]
     fixed = estimate_tokens(BASE_SYSTEM_PROMPT) + sum(
         estimate_tokens(s.text) for s in segments if s.kind == "frozen")
-    append = [s for s in segments if s.kind == "append"]
+    fixed += sum(estimate_tokens(s.text) for s in previous)
     size = fixed + sum(estimate_tokens(s.text) for s in append) + _TAIL_RESERVE
     if size < policy.compact_at * input_budget:
         return segments
@@ -126,9 +129,11 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
     await record_compaction(
         run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id, scope="meeting",
         summary=compacted[1].content, before_tokens=before + fixed, after_tokens=after + fixed)
-    return [s for s in segments if s.kind == "frozen"] + [
-        Segment("append", m.content, role=m.role, name="交锋摘要" if index == 0 else "较早发言")
-        for index, m in enumerate(compacted[1:])]
+    return ([s for s in segments if s.kind == "frozen"]
+            + [Segment("append", m.content, role=m.role,
+                       name="交锋摘要" if index == 0 else "较早发言")
+               for index, m in enumerate(compacted[1:])]
+            + previous)
 
 
 async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind: str,
@@ -155,6 +160,9 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
     built = mtg.builder.build(segments + [tail], system=BASE_SYSTEM_PROMPT,
                               input_budget=budget.input_budget)
     if built.truncated:
+        # 上一版方案被截短意味着修订会丢掉后半篇：宁可失败，也不静默写回残缺内容
+        if any("上一版方案" in name for name in built.truncated):
+            raise NodeFailure("上一版建设方案超出上下文预算，无法在保留全文的前提下修订", fatal=True)
         await emit(mtg.run_id, "node_log", mtg.node_id, {
             "level": "warn",
             "message": f"上下文超出预算，已截短：{'、'.join(built.truncated)}"[:300]})
@@ -240,22 +248,45 @@ async def speak_many(mtg: MeetingSession, calls: list[dict], *,
 
 
 async def drain_interventions(mtg: MeetingSession) -> bool:
-    """取出排队中的插话，写成用户发言，并让主持人回应一次。返回是否有插话。"""
+    """取出排队中的插话，写成用户发言，并让主持人回应一次。返回是否有插话。
+
+    状态改为"已注入"要等主持人回应成功之后：回应失败时插话仍在队列里，
+    下次重试会复用已经写下的那条用户发言，不会重复，也不会出现"标了已注入却没回应"。
+    """
     queued = store.take_queued_interventions(mtg.meeting_id)
-    for item in queued:
-        turn_id = store.add_turn(
-            mtg.meeting_id, round=mtg.round_no(), phase=_phase(mtg), speaker_id=None,
-            speaker_name="用户", kind="user_intervention", content=item["content"])
-        store.attach_intervention_turn(item["id"], turn_id)
-        await emit(mtg.run_id, "meeting_intervention_injected", mtg.node_id,
-                   {"meeting_id": mtg.meeting_id, "intervention_id": item["id"], "turn_id": turn_id})
     if not queued:
         return False
+    phase = _phase(mtg)
+    round_no = mtg.round_no()
+    existing = {turn["content"]: turn["id"] for turn in store.round_turns(
+        mtg.meeting_id, round=round_no, kinds=["user_intervention"])}
+    pairs: list[tuple[int, int]] = []
+    for item in queued:
+        turn_id = existing.get(item["content"])
+        if turn_id is None:
+            turn_id = store.add_turn(
+                mtg.meeting_id, round=round_no, phase=phase, speaker_id=None,
+                speaker_name="用户", kind="user_intervention", content=item["content"])
+            existing[item["content"]] = turn_id
+        pairs.append((item["id"], turn_id))
+    for item_id, turn_id in pairs:
+        await emit(mtg.run_id, "meeting_intervention_injected", mtg.node_id,
+                   {"meeting_id": mtg.meeting_id, "intervention_id": item_id,
+                    "turn_id": turn_id})
     facilitator = next(iter(mtg.participants("facilitator")), None)
     if facilitator is not None:
         text = "\n".join(f"- {item['content']}" for item in queued)
+        from app.meeting import render  # 延迟导入：避免与 render → rules 的导入顺序纠缠
+
+        charter = render.charter_segments(mtg.meeting().get("charter") or {})
+        ledger = render.ledger_segment(store.list_decision_points(mtg.meeting_id),
+                                       round_no=mtg.meeting_round())
         await speak(mtg, facilitator, kind="intervention_ack", turn_kind="facilitator_note",
-                    segments=[Segment("append", f"## 用户在会议进行中插话\n{text}", name="插话")],
+                    charter=charter,
+                    segments=[ledger, Segment("append", f"## 用户在会议进行中插话\n{text}",
+                                              name="插话")],
                     instruction="逐条回应用户的插话：你理解它要求什么，接下来怎么安排。只写一段话。",
                     drain=False)
+    for item_id, turn_id in pairs:
+        store.attach_intervention_turn(item_id, turn_id)
     return True

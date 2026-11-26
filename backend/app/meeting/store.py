@@ -342,12 +342,25 @@ def round_turns(meeting_id: int, *, round: int, kinds: list[str] | None = None) 
         return [_turn_dict(r) for r in rows]
 
 
+def turns_upto(meeting_id: int, *, upto_round: int, kinds: list[str]) -> list[dict]:
+    """截至某一轮（含）的指定类型发言，按序号升序。用一条查询取跨多轮的反馈/插话。"""
+    with session_scope() as s:
+        rows = (
+            s.query(MeetingTurn)
+            .filter(MeetingTurn.meeting_id == meeting_id, MeetingTurn.round <= upto_round,
+                    MeetingTurn.content != "", MeetingTurn.kind.in_(kinds))
+            .order_by(MeetingTurn.seq.asc())
+            .all()
+        )
+        return [_turn_dict(r) for r in rows]
+
+
 def set_stance(point_id: int, participant_id: int, stance: dict) -> None:
     """写入某个参会者在某个决策点上的最新表态；上一轮的等级与理由留进 history。"""
     with session_scope() as s:
         row = s.get(DecisionPoint, point_id)
         if row is None:
-            return
+            raise LookupError(f"决策点不存在：{point_id}")
         stances = dict(row.stances_json or {})
         previous = dict(stances.get(str(participant_id)) or {})
         history = list(previous.get("history") or [])

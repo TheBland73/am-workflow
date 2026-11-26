@@ -265,3 +265,39 @@ def test_speak_many_cancels_siblings_on_failure(monkeypatch) -> None:
                                      {**call, "participant": other}]))
     assert finished == []                                     # 同组任务已在后台被取消
     assert all(t["content"] == "" for t in store.list_turns(mtg.meeting_id))
+
+
+# ---------------- 断点评审的回归用例 ----------------
+def test_intervention_ack_failure_keeps_it_queued(monkeypatch) -> None:
+    """主持人回应失败时插话仍在队列里；重试复用同一条用户发言，不重复也不假标已注入。"""
+    install(monkeypatch, {"position": "立场"})                 # 没有准备 intervention_ack
+    mtg, (_, speaker) = _meeting()
+    store.queue_intervention(mtg.meeting_id, content="注意成本")
+    with pytest.raises(AssertionError):
+        _speak(mtg, speaker, segments=[], instruction="请写立场")
+
+    assert [item["content"] for item in store.take_queued_interventions(mtg.meeting_id)] == [
+        "注意成本"]
+
+    install(monkeypatch, {"position": "立场", "intervention_ack": "收到，先核对成本。"})
+    assert asyncio.run(calls.drain_interventions(mtg)) is True
+    assert store.take_queued_interventions(mtg.meeting_id) == []
+    user_turns = [t for t in store.list_turns(mtg.meeting_id)
+                  if t["kind"] == "user_intervention"]
+    assert len(user_turns) == 1                               # 重试没有写出第二遍
+
+
+def test_a_too_large_previous_proposal_fails_instead_of_being_truncated(monkeypatch) -> None:
+    """修订要看到上一版全文：放不下时致命失败，不能截短后当作全文写回。"""
+    from app.engine.runners import NodeFailure
+
+    install(monkeypatch, {"position": "立场"})
+    small = SimpleNamespace(id=1, model_name="mock-small", display_name="Mock Small",
+                            context_window=1600, max_output_tokens=256, cap_tools=True)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: small)
+    mtg, (_, speaker) = _meeting()
+    previous = Segment("append", "方案正文" * 2000, name="上一版方案")
+
+    with pytest.raises(NodeFailure, match="上一版建设方案"):
+        _speak(mtg, speaker,
+               segments=[Segment("frozen", "章程", name="章程"), previous], instruction="修订")

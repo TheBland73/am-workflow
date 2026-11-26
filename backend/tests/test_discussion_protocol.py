@@ -207,6 +207,7 @@ def test_meeting_reaches_a_proposal_with_two_human_checkpoints(monkeypatch) -> N
     assert kinds["position"] == 2 and kinds["claim"] == 4 and kinds["exchange_summary"] == 2
     types = [event["type"] for event in load_events(run_id)]
     assert "meeting_ledger_updated" in types and "meeting_turn_finished" in types
+    assert "context_prefix_changed" not in types        # 账本的正常更新不该报冻结段被改
 
 
 def test_full_automation_falls_back_at_a_stall_without_asking_anyone(monkeypatch) -> None:
@@ -319,7 +320,9 @@ def test_feedback_reopens_points_and_produces_a_new_version(monkeypatch) -> None
     assert ledger["D3"]["raised_by"] == "评审意见"            # 反馈带出了账本里没有的问题
     meta, body = _proposal(run_id)
     assert meta["version"] == 2 and "## 修改说明" in body
-    prompts = [call["text"] for call in seen if call["kind"] == "proposal"]
+    prompts = [call["text"] for call in seen if call["kind"] in ("proposal", "proposal_revise")]
+    kinds = [call["kind"] for call in seen if call["kind"] in ("proposal", "proposal_revise")]
+    assert kinds == ["proposal", "proposal_revise"]               # 修订用单独的调用标识
     assert len(prompts) == 2 and "上一版建设方案" in prompts[1]
     notes = [t for t in store.list_turns(first["id"]) if t["kind"] == "user_feedback"]
     assert [t["content"] for t in notes] == ["评审认为登录方案需要复议"]
@@ -384,3 +387,170 @@ def test_unresolved_check_notes_are_recorded_instead_of_looping_forever(monkeypa
     assert result["done"] is True
     assert _proposal(run_id)[0]["version"] == 2               # 复核轮次上限是 2
     assert "## 复核遗留意见" in parse_front_matter(read_artifact(run_id, "discussion"))[1]
+
+
+# ---------------- 断点评审的回归用例 ----------------
+def _run_once(run_id: str, node_id: int, *, idea: str = IDEA) -> dict:
+    """执行一次会议节点，不自动回答确认点；用于模拟"停在某个确认点上"。"""
+    import asyncio
+
+    from app.engine.runners import NodeContext
+    from app.meeting.runner import run_meeting
+
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        ctx = NodeContext(
+            run_id=run_id, node_id=node_id, node_key=node.node_key, type=node.type,
+            name=node.name, phase=node.phase, config=dict(node.config_json or {}),
+            assignee=dict(node.assignee_json or {}), attempt_id=0, attempt_no=1,
+            feedback=(node.config_json or {}).get("feedback"), idea=idea)
+    return asyncio.run(run_meeting(ctx))
+
+
+def _set_feedback(node_id: int, text: str, kind: str = "reroute") -> None:
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        node.config_json = with_feedback(node.config_json, text, kind)
+
+
+def test_feedback_before_the_roster_does_not_skip_the_meeting(monkeypatch) -> None:
+    """澄清阶段带反馈重试：名单、立场、议题照常执行，不能空着就成稿。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run()
+    first = _run_once(run_id, node_id)
+    assert first["suspended"] is True and first["checkpoint"]["kind"] == "clarify"
+
+    _set_feedback(node_id, "补充成本约束：两周内必须上线", "user")
+
+    def answer(checkpoint: dict) -> tuple:
+        data = {"answers": ["Markdown 即可"]} if checkpoint["kind"] == "clarify" else {}
+        return "approve", data, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True and result["decision_points"] == 2
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["roster"] == 1 and kinds["position"] == 2 and kinds["agenda"] == 1
+    meeting = store.latest_meeting_for_node(node_id)
+    participants = [row for row in store.list_participants(meeting["id"])
+                    if row["mode"] == "participant"]
+    assert len(participants) == 2
+    assert _charter(node_id)["想法原文"]
+    assert any("补充成本约束" in call["text"] for call in seen if call["kind"] == "position")
+
+
+def test_reopen_requires_fresh_stances_instead_of_reusing_old_ones(monkeypatch) -> None:
+    """复议重开的点必须有复议轮的新表态；漏答不能沿用旧等级判为已一致。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)))
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    assert _ledger(node_id)["D2"]["status"] == "agreed"
+    _set_feedback(node_id, "评审认为登录方案需要复议", "reroute")
+
+    def omit_reopened(text: str) -> str:
+        return '{"stances": [{"index": "D3", "level": 1, "reason": "支持"}]}'
+
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree), stance=omit_reopened))
+    with pytest.raises(NodeFailure, match="缺少这些未了结决策点的表态"):
+        drive(run_id, node_id, _approve, idea=IDEA)
+    assert _ledger(node_id)["D2"]["status"] == "reopened"
+
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)))
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    point = _ledger(node_id)["D2"]
+    assert point["status"] == "agreed" and point["closed_round"] == 2
+    architect = next(stance for stance in point["stances"].values()
+                     if stance["name"] == "架构师")
+    assert architect["round"] == 2                   # 结算用的是复议轮的表态
+
+
+def test_a_decided_consensus_is_not_put_back_after_a_step_failure(monkeypatch) -> None:
+    """人已经做出的决定在后续步骤失败后仍然有效，不会被重新开一扇门。"""
+    install(monkeypatch, _replies(restance=_split, ruling="{不是合法的 JSON"))
+    run_id, node_id = _meeting_run({"automation": {"level": "L1"}})
+
+    def answer(checkpoint: dict) -> tuple:
+        if checkpoint["kind"] == "consensus":
+            return "approve", {"option": "delegate"}, ""
+        return "approve", {}, ""
+
+    with pytest.raises(NodeFailure, match="模型输出不符合要求"):
+        drive(run_id, node_id, answer, idea=IDEA)
+
+    install(monkeypatch, _replies(restance=_split))
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True and _ledger(node_id)["D2"]["status"] == "ruled"
+
+
+def test_more_exchanges_than_participants_do_not_crash(monkeypatch) -> None:
+    install(monkeypatch, _replies())
+    run_id, node_id = _meeting_run({"params": {"discussion": {"exchanges_per_point": 3}}})
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+
+
+def test_reopen_feedback_reaches_the_participants(monkeypatch) -> None:
+    """复议反馈与第 1 轮立场要出现在复议轮的每一次发言里，不能只让主持人看见。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)))
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    _set_feedback(node_id, "评审认为登录方案需要复议", "reroute")
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)), seen)
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    for kind in ("stance", "claim", "challenge", "respond", "restance"):
+        texts = [call["text"] for call in seen if call["kind"] == kind]
+        assert texts, kind
+        assert all("评审认为登录方案需要复议" in text for text in texts), kind
+    stances = [call["text"] for call in seen if call["kind"] == "stance"]
+    assert all("必须保证" in text for text in stances)          # 复议轮仍看得到原始立场
+
+
+def test_continue_at_an_all_closed_consensus_finishes(monkeypatch) -> None:
+    """全部了结时人仍选了"继续讨论"：忽略它直接成稿，不能卡死在空交锋/空表态。"""
+    install(monkeypatch, _replies(restance=_agree))
+    run_id, node_id = _meeting_run({"automation": {"level": "L1"}})
+    asked: list[str] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint["kind"])
+        if checkpoint["kind"] == "consensus":
+            assert checkpoint["payload"]["reason"] == "all_closed"
+            return "reject", {"option": "continue"}, "继续讨论也没有未决点了"
+        return "approve", {}, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True and result["deferred"] == 0
+    assert asked == ["clarify", "roster", "consensus"]
+
+
+def test_a_proposal_missing_required_sections_is_rejected(monkeypatch) -> None:
+    install(monkeypatch, _replies(proposal="## 目标与成功标准\n\n两句话。"))
+    run_id, node_id = _meeting_run({"automation": {"level": "L3"}})
+
+    with pytest.raises(NodeFailure, match="方案缺少这些章节"):
+        drive(run_id, node_id, _never, idea=IDEA)
+
+
+def test_structured_output_validators_reject_bad_shapes() -> None:
+    from app.meeting.protocols.discussion import (_validate_agenda, _validate_stances,
+                                                  _validate_summaries)
+
+    assert _validate_summaries(["D1"])({
+        "summaries": [{"index": "D1", "summary": "x"}, "junk"]})
+    assert _validate_agenda({"points": [{"title": 5, "options": 3}]})
+    issues = _validate_stances(["D2"])({
+        "stances": [{"index": "D3", "level": 1}],
+        "new_points": [{"title": "x", "level": "high", "options": 3}]})
+    assert any("缺少这些未了结决策点的表态" in issue for issue in issues)
+    assert any("level" in issue for issue in issues)
+    assert any("options" in issue for issue in issues)

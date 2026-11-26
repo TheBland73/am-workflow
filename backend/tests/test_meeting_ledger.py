@@ -169,3 +169,40 @@ def test_write_minutes_writes_artifact_and_ledger_json() -> None:
     assert "## 决策点账本" in body
     ledger = json.loads((artifacts_dir(run_id) / "discussion.ledger.json").read_text(encoding="utf-8"))
     assert [point["index"] for point in ledger] == ["D1", "D2"]
+
+
+# ---------------- 断点评审的回归用例 ----------------
+def test_relax_defers_points_someone_has_not_answered() -> None:
+    """缺表态不是"没人反对"：全自动退让也只关闭全员表过态且无反对的点。"""
+    voters = [1, 2]
+    point = _point("D1", {1: SUPPORT})                  # 2 号没有表态
+    assert relax([point], voters) == {"agreed": [], "deferred": ["D1"]}
+
+
+def test_slim_ledger_keeps_open_exchange_summaries() -> None:
+    """预算不够时降级：已了结点的理由与摘要可以丢，未决点的交锋摘要必须留。"""
+    closed = _point("D1", {1: SUPPORT, 2: SUPPORT}, status="agreed")
+    closed.update(conclusion="选甲", rationale="很长" * 2000, exchange_summary="很长" * 500)
+    open_point = _point("D2", {1: OPPOSE, 2: SUPPORT})
+    open_point.update(exchange_summary="未决点的交锋摘要")
+
+    slim = render.ledger_text([closed, open_point], round_no=2, budget=600)
+
+    assert "未决点的交锋摘要" in slim
+    assert "很长" not in slim
+
+
+def test_minutes_render_position_as_readable_text() -> None:
+    fixture = _fixture()
+    fixture["turns"] = [{
+        "seq": 1, "kind": "position", "speaker_name": "架构",
+        "content": '{"must": ["每一步可验证"], "risks": [], "route": "先做最小闭环", "questions": []}',
+        "structured": {"must": ["每一步可验证"], "risks": [], "route": "先做最小闭环",
+                       "questions": []},
+        "decision_point": None}]
+
+    body = minutes.minutes_markdown(**fixture)
+
+    assert '{"must"' not in body
+    assert "必须保证：每一步可验证" in body
+    assert "建议路线：先做最小闭环" in body

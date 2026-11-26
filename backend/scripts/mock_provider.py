@@ -481,9 +481,10 @@ def _pick(messages: list[dict], tools: list[dict] | None) -> tuple[str, dict | N
     if tools:
         return "", _dev_tool_call(messages)
     text = "\n".join(str(m.get("content") or "") for m in messages)
-    tagged = _CALL_TAG.search(text)
-    if tagged:                                   # 会议里的调用：只按调用标识路由
-        return _meeting_reply(tagged.group(1), text), None
+    # 调用标识总是在提示末尾；取最后一个，前面的发言里即使复述过标识也不会劫持路由
+    tagged = list(_CALL_TAG.finditer(text))
+    if tagged:
+        return _meeting_reply(tagged[-1].group(1), text), None
     system = next((m.get("content") or "" for m in messages if m.get("role") == "system"), "")
     if "计划分解器" in system or "只输出一个 JSON 对象" in system:
         return _pm_plan(messages), None

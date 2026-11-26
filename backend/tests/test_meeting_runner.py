@@ -41,6 +41,7 @@ class ToyProtocol(MeetingProtocol):
             return suspend(await mtg.open_checkpoint(
                 "consensus", title="请确认", description="玩具确认点", payload={"q": 1}))
         mtg.set_state(answer=decision["action"])
+        mtg.ack_decision(decision)                    # 决定按它做完事了：标记为已处理
         return advance()
 
     async def step_last(self, mtg):

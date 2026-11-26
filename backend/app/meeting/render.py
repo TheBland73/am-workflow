@@ -19,7 +19,8 @@ STATUS_NAMES = {"open": "讨论中", "reopened": "复议中", "agreed": "已一�
 TURN_LABELS = {"position": "立场", "stance": "表态", "restance": "重新表态", "claim": "主张",
                "challenge": "质疑", "respond": "回应", "exchange_summary": "交锋摘要",
                "question": "提问", "answer": "回答", "facilitator_note": "主持人",
-               "user_intervention": "用户插话", "ruling": "裁决"}
+               "user_intervention": "用户插话", "user_feedback": "用户反馈",
+               "user_guidance": "用户指导", "ruling": "裁决"}
 
 
 def _cell(value) -> str:
@@ -44,7 +45,8 @@ def charter_segments(charter: dict) -> list[Segment]:
 
 def ledger_text(points: list[dict], *, round_no: int, budget: int = LEDGER_LIMIT) -> str:
     """账本快照（本轮开始时的状态）。超预算时分两级降级：
-    先去掉已了结决策点的理由和交锋摘要，再把进行中决策点的表态压成只剩等级。"""
+    先去已了结决策点的理由与交锋摘要，再把进行中决策点的表态压成只剩等级。
+    进行中决策点的交锋摘要保留——它正是下一轮表态最需要的内容。"""
     full = _ledger(points, round_no, reasons=True)
     if estimate_tokens(full) <= budget:
         return full
@@ -74,7 +76,7 @@ def _ledger(points: list[dict], round_no: int, *, reasons: bool,
     if working:
         lines += ["", "### 讨论中的决策点：各方最新的表态"]
         for point in working:
-            lines += ["", f"**{point['index']} {point.get('title') or ''}**".rstrip()]
+            lines += ["", f"**{_cell(str(point['index']) + ' ' + (point.get('title') or ''))}**"]
             stances = sorted((point.get("stances") or {}).items(), key=lambda item: int(item[0]))
             for pid, stance in stances:
                 level = LEVEL_NAMES.get((stance or {}).get("level"), "未表态")
@@ -83,11 +85,11 @@ def _ledger(points: list[dict], round_no: int, *, reasons: bool,
                     lines.append(f"- {(stance or {}).get('name') or f'参会者{pid}'}：{level}")
                 else:
                     lines.append(f"- {(stance or {}).get('name') or f'参会者{pid}'}：{level}——{reason}")
-    if reasons:
-        exchanged = [point for point in points if point.get("exchange_summary")]
-        if exchanged:
-            lines += ["", "### 各决策点的交锋摘要"]
-            lines += [f"- {point['index']}：{point['exchange_summary']}" for point in exchanged]
+    exchanged = [point for point in points if point.get("exchange_summary")
+                 and (reasons or point["status"] in OPEN_STATUSES)]
+    if exchanged:
+        lines += ["", "### 各决策点的交锋摘要"]
+        lines += [f"- {point['index']}：{point['exchange_summary']}" for point in exchanged]
     closed = [point for point in points if point["status"] in CLOSED_STATUSES]
     if closed:
         lines += ["", "### 已了结的决策点：结论与理由"]
@@ -100,7 +102,7 @@ def _ledger(points: list[dict], round_no: int, *, reasons: bool,
 
 
 def turn_text(turn: dict) -> str:
-    """一条发言的正文。结构化的发言（表态、交锋摘要）渲染成几行文字，不直接给 JSON。"""
+    """一条发言的正文。结构化的发言渲染成几行文字，不直接给 JSON。"""
     kind = turn.get("kind") or ""
     data = turn.get("structured") or {}
     if kind in ("stance", "restance") and data.get("stances"):
@@ -111,6 +113,15 @@ def turn_text(turn: dict) -> str:
         return "\n".join(lines)
     if kind == "exchange_summary" and data.get("summaries"):
         return "\n".join(f"{item.get('index')}：{item.get('summary')}" for item in data["summaries"])
+    if kind == "position":
+        lines = []
+        for label, key in (("必须保证", "must"), ("主要风险", "risks"),
+                           ("疑问", "questions")):
+            lines += [f"- {label}：{item}" for item in (data.get(key) or []) if str(item).strip()]
+        if str(data.get("route") or "").strip():
+            lines.append(f"- 建议路线：{data['route']}")
+        if lines:
+            return "\n".join(lines)
     return str(turn.get("content") or "")
 
 

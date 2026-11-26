@@ -40,6 +40,8 @@ def _coerce(key: str, spec: dict, raw) -> tuple[object | None, str | None]:
                 raise ValueError
             value: object = int(raw)
         elif kind == "float":
+            if isinstance(raw, bool):
+                raise ValueError
             value = float(raw)
         elif kind == "bool":
             value = (str(raw).strip().lower() in ("1", "true", "yes", "on")) if isinstance(raw, str) else bool(raw)
@@ -236,6 +238,8 @@ def validate_rosters(rosters: dict | None) -> list[str]:
             errors.append(f"{label}的具体角色须是非空的字符串数组")
         elif isinstance(keys, list) and len(keys) > 99:
             errors.append(f"{label}的具体角色不能超过 99 个")
+        elif isinstance(keys, list) and len(set(keys)) != len(keys):
+            errors.append(f"{label}的具体角色不能重复")
         if count is not None and (isinstance(count, bool) or not isinstance(count, int)
                                   or not 1 <= count <= 99):
             errors.append(f"{label}的固定人数须是 1 到 99 的整数")

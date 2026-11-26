@@ -17,8 +17,6 @@ from app.engine.gates import gate_payload
 if TYPE_CHECKING:
     from app.meeting.session import MeetingSession
 
-CHECKPOINT_KINDS = ("clarify", "roster", "consensus", "escalation")
-
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)

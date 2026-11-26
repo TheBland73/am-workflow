@@ -63,6 +63,10 @@ class MeetingSession:
         return phase if phase in steps else steps[0]
 
     async def advance(self, next_step: str | None, steps: tuple[str, ...]) -> None:
+        if next_step is not None and next_step not in steps:
+            from app.engine.runners import NodeFailure  # 延迟导入：会话模块不在导入期牵动引擎
+
+            raise NodeFailure(f"协议指定了不存在的下一步：{next_step}", fatal=True)
         index = steps.index(self.current_step(steps))
         if next_step is None and index + 1 >= len(steps):
             # 协议写错了：重试也不会好，所以按不可重试处理
@@ -89,15 +93,25 @@ class MeetingSession:
             return 3
 
     def consume_feedback(self) -> str | None:
-        """取出并清空带着反馈续开时存下的反馈，并记下它的序号：同一条反馈不再当作新反馈。"""
+        """取出带着反馈续开时存下的反馈，移到 reopen_feedback 并记下序号。
+
+        同一条反馈不再当作新反馈；reopen_feedback 在协议真正处理完它之后才清空。
+        "清空待处理反馈"与"把它交给协议"在同一个事务里完成：中途崩溃不会两头落空。
+        """
         state = self.state()
         feedback = str(state.get("pending_feedback") or "").strip()
-        if feedback:
-            self.set_state(pending_feedback="", handled_feedback_seq=state.get("seen_feedback_seq"))
-        return feedback or None
+        if not feedback:
+            return None
+        store.update_meeting(self.meeting_id, state_json={
+            **state, "pending_feedback": "", "reopen_feedback": feedback,
+            "handled_feedback_seq": state.get("seen_feedback_seq")})
+        return feedback
 
     def decision(self) -> dict | None:
-        """读取当前等待的确认点的决定，读到后标记为已处理。"""
+        """读取当前等待的确认点的决定。读到后不立即标记：由协议在步骤成功返回前调用 ack_decision。
+
+        这样同一步骤里"读到决定之后的动作"失败重试时，人的决定还在，不会被重新开一扇门。
+        """
         state = self.state()
         gate_id = state.get("awaiting_gate_id")
         if not gate_id or state.get("handled_gate_id") == gate_id:
@@ -105,8 +119,14 @@ class MeetingSession:
         decision = get_decision(gate_id)
         if decision is None:
             return None
-        self.set_state(handled_gate_id=gate_id)
         return decision
+
+    def ack_decision(self, decision: dict | None = None) -> None:
+        """确认这个确认点的决定已经被消费掉（步骤已经按它做完事）。"""
+        state = self.state()
+        gate_id = (decision or {}).get("gate_id") or state.get("awaiting_gate_id")
+        if gate_id and state.get("handled_gate_id") != gate_id:
+            self.set_state(handled_gate_id=gate_id)
 
     async def open_checkpoint(self, kind: str, *, title: str, description: str,
                               payload: dict | None = None) -> dict:

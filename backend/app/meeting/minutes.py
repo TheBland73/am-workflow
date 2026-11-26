@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from app.artifacts.store import artifacts_dir, write_artifact
 from app.meeting import render
@@ -13,7 +14,8 @@ from app.meeting.rules import DEFERRED
 
 PROTOCOL_NAMES = {"discussion": "讨论会议", "review": "评审会议", "confirm": "需求确认会议"}
 LEDGER_FIELDS = ("id", "index", "title", "question", "options", "status", "conclusion",
-                 "rationale", "exchange_summary", "stances", "origin_round", "closed_round")
+                 "rationale", "exchange_summary", "stances", "raised_by", "origin_round",
+                 "closed_round", "superseded_by")
 
 
 def _one_line(text: str, limit: int) -> str:
@@ -40,7 +42,7 @@ def minutes_markdown(*, meeting: dict, participants: list[dict], points: list[di
     if positions:
         lines += ["", "## 各角色立场摘要"]
         for turn in positions:
-            lines += [f"### {turn['speaker_name']}", "", str(turn["content"]).strip(), ""]
+            lines += [f"### {turn['speaker_name']}", "", render.turn_text(turn).strip(), ""]
     exchanged = [p for p in points if p.get("exchange_summary")]
     if exchanged:
         lines += ["", "## 各决策点的交锋记录摘要"]
@@ -65,5 +67,7 @@ def write_minutes(run_id: str, *, kind: str, created_by: str, inputs: list[str],
                             status="reviewed")
     ledger = [{field: point.get(field) for field in LEDGER_FIELDS} for point in points]
     path = artifacts_dir(run_id) / f"{kind}.ledger.json"
-    path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")       # 中断不会留下半个 JSON
+    tmp.write_text(json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
     return record

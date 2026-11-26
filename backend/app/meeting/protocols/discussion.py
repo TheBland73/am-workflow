@@ -67,7 +67,8 @@ CONSENSUS_TITLES = {
 MODE_NAMES = {"facilitator": "主持人", "participant": "参会者", "proxy": "需求方代理，只回答事实问题"}
 SOURCE_NAMES = {"user": "用户回答", "proxy": "需求方代理，依据背景材料或用户回答", "assumption": "假设"}
 _EXCHANGE_KINDS = ["claim", "challenge", "respond", "question", "answer"]
-_ROUND_KINDS = _EXCHANGE_KINDS + ["exchange_summary", "user_guidance"]
+_FEEDBACK_KINDS = ["user_feedback", "user_guidance", "user_intervention"]
+_ROUND_KINDS = _EXCHANGE_KINDS + ["exchange_summary"]
 
 BRIEF_INSTRUCTION = (
     "\n\n做会前准备。依据上面的想法原文与背景材料，写一份简报，并列出需要向需求方澄清的问题。"
@@ -136,6 +137,8 @@ REOPEN_INSTRUCTION = (
     "反馈涉及账本里没有的问题时新建，给出 title、question、options。至少处理出一个决策点。"
     "只输出一个 JSON 对象：\n"
     '{"points": [{"index": "D2", "title": "", "question": "", "options": []}], "note": "你对反馈的理解"}')
+PROPOSAL_SECTIONS = ("## 目标与成功标准", "## 范围", "## 总体方案", "## 关键流程",
+                     "## 里程碑与验收", "## 风险与缓解")
 
 
 # ---------------- 校验模型的结构化输出 ----------------
@@ -169,6 +172,10 @@ def _validate_roster(library: dict, low: int, high: int) -> Validator:
         if not isinstance(rows, list) or not rows:
             return ["participants 须是非空数组"]
         issues: list[str] = []
+        keys = [str(row.get("role_key") or "") for row in rows if isinstance(row, dict)]
+        keys = [key for key in keys if key]
+        if len(set(keys)) != len(keys):
+            issues.append("participants 里的 role_key 不能重复")
         for row in rows:
             if not isinstance(row, dict):
                 issues.append("participants 的每一项须是对象")
@@ -201,53 +208,102 @@ def _validate_agenda(data: dict) -> list[str]:
     rows = data.get("points")
     if not isinstance(rows, list) or not rows:
         return ["points 须是非空数组：至少提炼出一个决策点"]
-    return ["每个决策点须有 title" for row in rows
-            if not isinstance(row, dict) or not str(row.get("title") or "").strip()]
-
-
-def _validate_stances(data: dict) -> list[str]:
-    rows = data.get("stances")
-    if not isinstance(rows, list) or not rows:
-        return ["stances 须是非空数组"]
     issues: list[str] = []
-    required = {2: "顾虑", 3: "弃权的原因", 4: "缺什么信息", 5: "反对的理由和替代建议"}
     for row in rows:
-        if not isinstance(row, dict) or not str(row.get("index") or ""):
-            issues.append("stances 的每一项须有 index")
+        if not isinstance(row, dict):
+            issues.append("points 的每一项须是对象")
             continue
-        level = row.get("level")
-        if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 5:
-            issues.append(f"{row['index']}：level 须是 1 到 5 的整数")
-        elif level >= 2 and not str(row.get("reason") or "").strip():
-            issues.append(f"{row['index']}：{LEVEL_NAMES[level]}必须写明{required[level]}")
-    for extra in data.get("new_points") or []:
-        if not isinstance(extra, dict) or not str(extra.get("title") or "").strip():
-            issues.append("new_points 的每一项须有 title")
+        if not isinstance(row.get("title"), str) or not row["title"].strip():
+            issues.append("每个决策点须有 title")
+        if row.get("question") is not None and not isinstance(row["question"], str):
+            issues.append(f"{row.get('title') or '决策点'}：question 须是文本")
+        options = row.get("options")
+        if options is not None and (not isinstance(options, list)
+                                    or not all(isinstance(item, str) for item in options)):
+            issues.append(f"{row.get('title') or '决策点'}：options 须是字符串数组")
     return issues
+
+
+def _validate_stances(required: list[str] | None = None) -> Validator:
+    """表态的校验。required 给出时要求覆盖这些未了结决策点（复议后尤其重要）。"""
+    required_indexes = list(required or [])
+
+    def validate(data: dict) -> list[str]:
+        rows = data.get("stances")
+        if not isinstance(rows, list):
+            return ["stances 须是数组"]
+        if required_indexes and not rows:
+            return ["stances 须是非空数组"]
+        issues: list[str] = []
+        required_fields = {2: "顾虑", 3: "弃权的原因", 4: "缺什么信息", 5: "反对的理由和替代建议"}
+        covered: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                issues.append("stances 的每一项须是对象")
+                continue
+            index = str(row.get("index") or "").strip()
+            if not index:
+                issues.append("stances 的每一项须有 index")
+                continue
+            covered.add(index)
+            level = row.get("level")
+            if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 5:
+                issues.append(f"{index}：level 须是 1 到 5 的整数")
+            elif level >= 2 and not str(row.get("reason") or "").strip():
+                issues.append(f"{index}：{LEVEL_NAMES[level]}必须写明{required_fields[level]}")
+        missing = [index for index in required_indexes if index not in covered]
+        if missing:
+            issues.append("缺少这些未了结决策点的表态：" + "、".join(missing))
+        for extra in data.get("new_points") or []:
+            if not isinstance(extra, dict):
+                issues.append("new_points 的每一项须是对象")
+                continue
+            if not isinstance(extra.get("title"), str) or not extra["title"].strip():
+                issues.append("new_points 的每一项须有 title")
+            level = extra.get("level")
+            if level is not None and (isinstance(level, bool) or not isinstance(level, int)
+                                      or not 1 <= level <= 5):
+                issues.append("new_points 的 level 须是 1 到 5 的整数")
+            options = extra.get("options")
+            if options is not None and (not isinstance(options, list)
+                                        or not all(isinstance(item, str) for item in options)):
+                issues.append("new_points 的 options 须是字符串数组")
+        return issues
+
+    return validate
 
 
 def _validate_summaries(open_indexes: list[str]) -> Validator:
     def validate(data: dict) -> list[str]:
         rows = data.get("summaries")
-        rows = rows if isinstance(rows, list) else []
-        covered = {str(row.get("index")) for row in rows if isinstance(row, dict)}
+        if not isinstance(rows, list):
+            return [f"summaries 须恰好覆盖这些决策点：{open_indexes}"]
+        if any(not isinstance(row, dict) for row in rows):
+            return ["summaries 的每一项须是对象"]
+        covered = {str(row.get("index")) for row in rows}
         if covered != set(open_indexes):
             return [f"summaries 须恰好覆盖这些决策点：{open_indexes}"]
         return [f"{row['index']} 的 summary 不能为空" for row in rows
-                if not str(row.get("summary") or "").strip()]
+                if not isinstance(row.get("summary"), str) or not row["summary"].strip()]
     return validate
 
 
 def _validate_rulings(open_indexes: list[str]) -> Validator:
     def validate(data: dict) -> list[str]:
         rows = data.get("rulings")
-        rows = rows if isinstance(rows, list) else []
-        covered = {str(row.get("index")) for row in rows if isinstance(row, dict)}
+        if not isinstance(rows, list):
+            return [f"rulings 须恰好覆盖这些决策点：{open_indexes}"]
+        if any(not isinstance(row, dict) for row in rows):
+            return ["rulings 的每一项须是对象"]
+        covered = {str(row.get("index")) for row in rows}
         if covered != set(open_indexes):
             return [f"rulings 须恰好覆盖这些决策点：{open_indexes}"]
-        return [f"{row['index']} 的 {field} 不能为空" for row in rows
-                for field in ("conclusion", "rationale")
-                if not str(row.get(field) or "").strip()]
+        issues: list[str] = []
+        for row in rows:
+            for field in ("conclusion", "rationale"):
+                if not isinstance(row.get(field), str) or not row[field].strip():
+                    issues.append(f"{row['index']} 的 {field} 不能为空")
+        return issues
     return validate
 
 
@@ -260,16 +316,32 @@ def _validate_check(data: dict) -> list[str]:
     if not isinstance(rows, list) or not rows:
         return ["ok 为 false 时 issues 须列出至少一条意见"]
     return ["每条复核意见须有 problem" for row in rows
-            if not isinstance(row, dict) or not str(row.get("problem") or "").strip()]
+            if not isinstance(row, dict)
+            or not isinstance(row.get("problem"), str) or not row["problem"].strip()]
 
 
 def _validate_reopen(data: dict) -> list[str]:
     rows = data.get("points")
     if not isinstance(rows, list) or not rows:
         return ["points 须是非空数组：至少重开或新建一个决策点"]
-    return ["已有的决策点给 index；新的决策点给 title" for row in rows
-            if not isinstance(row, dict)
-            or not (str(row.get("index") or "").strip() or str(row.get("title") or "").strip())]
+    issues: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            issues.append("points 的每一项须是对象")
+            continue
+        index = row.get("index")
+        title = row.get("title")
+        if index is not None and not isinstance(index, str):
+            issues.append("index 须是文本")
+        if title is not None and not isinstance(title, str):
+            issues.append("title 须是文本")
+        if not (str(index or "").strip() or str(title or "").strip()):
+            issues.append("已有的决策点给 index；新的决策点给 title")
+        options = row.get("options")
+        if options is not None and (not isinstance(options, list)
+                                    or not all(isinstance(item, str) for item in options)):
+            issues.append("options 须是字符串数组")
+    return issues
 
 
 # ---------------- 读写账本与发言 ----------------
@@ -310,11 +382,38 @@ def _charter(mtg) -> list[Segment]:
     return render.charter_segments(mtg.meeting()["charter"])
 
 
+def _accounted_points(mtg) -> list[dict]:
+    """账本里当前还作数的表态：复议轮只认重开之后写下的表态。
+
+    旧表态留在 history 与 stances_json 里供人回看，但不再参与结算——
+    否则复议后模型漏答某个点，旧等级会把它直接判为"已一致"。
+    """
+    floors = {str(index): int(round_no)
+              for index, round_no in (mtg.state().get("reopen_rounds") or {}).items()}
+    accounted = []
+    for point in _points(mtg):
+        floor = floors.get(point["index"])
+        if floor:
+            point = {**point, "stances": {
+                pid: stance for pid, stance in (point.get("stances") or {}).items()
+                if int((stance or {}).get("round") or 0) >= floor}}
+        accounted.append(point)
+    return accounted
+
+
+def _feedback_segments(mtg) -> list[Segment]:
+    """用户反馈、指导语与插话：每一轮的角色都该看到，不随轮次过滤掉。"""
+    return [render.turn_segment(turn)
+            for turn in store.turns_upto(mtg.meeting_id, upto_round=mtg.meeting_round(),
+                                         kinds=_FEEDBACK_KINDS)]
+
+
 def _view(mtg, kinds: list[str] | None = None) -> list[Segment]:
-    """人设之后发给模型的段：账本快照在前，本轮的逐字发言在后。"""
+    """人设之后发给模型的段：账本快照在前，用户反馈/插话随后，本轮的逐字发言最后。"""
     points = _points(mtg)
     index_of = {point["id"]: point["index"] for point in points}
     segments = [render.ledger_segment(points, round_no=mtg.meeting_round())]
+    segments += _feedback_segments(mtg)
     for turn in store.round_turns(mtg.meeting_id, round=mtg.meeting_round(), kinds=kinds):
         turn["decision_point"] = index_of.get(turn["decision_point_id"])
         segments.append(render.turn_segment(turn))
@@ -324,6 +423,12 @@ def _view(mtg, kinds: list[str] | None = None) -> list[Segment]:
 def _positions(mtg) -> list[Segment]:
     return [render.turn_segment(turn)
             for turn in store.round_turns(mtg.meeting_id, round=1, kinds=["position"])]
+
+
+def _stance_view(mtg) -> list[Segment]:
+    """表态的上下文：账本 + 第 1 轮的全体立场 + 用户反馈（复议轮同样看得到原始立场）。"""
+    return ([render.ledger_segment(_points(mtg), round_no=mtg.meeting_round())]
+            + _positions(mtg) + _feedback_segments(mtg))
 
 
 async def _ledger_updated(mtg) -> None:
@@ -358,8 +463,11 @@ def _conclusion_of(point: dict) -> str:
 
 
 def _settle_round(mtg) -> dict:
-    """一轮表态之后结算：达成一致的落盘。返回结算结果（open、agreed、changed）。"""
-    points = _points(mtg)
+    """一轮表态之后结算：达成一致的落盘。返回结算结果（open、agreed、changed）。
+
+    复议轮只认重开之后写下的表态（_accounted_points），重开前的旧等级不参与结算。
+    """
+    points = _accounted_points(mtg)
     result = settle(points, rule=str(mtg.params().get("closure_rule") or "unanimous"),
                     voters=_voters(mtg), before=mtg.state().get("stance_snapshot"))
     by_index = {point["index"]: point for point in points}
@@ -503,10 +611,29 @@ class DiscussionProtocol(MeetingProtocol):
              "summary", "restance", "consensus", "reopen", "draft", "check")
 
     async def on_enter(self, mtg) -> None:
-        feedback = mtg.consume_feedback()
-        if feedback:
-            mtg.set_state(reopen_feedback=feedback)
-            store.update_meeting(mtg.meeting_id, phase="reopen")
+        state = mtg.state()
+        mtg.consume_feedback()
+        state = mtg.state()
+        feedback = str(state.get("reopen_feedback") or "").strip()
+        if not feedback:
+            return
+        # 只有已经推进到议题与表态阶段，反馈才走"复议"。澄清、名单阶段的反馈
+        # 不能把会议直接跳到复议：否则名单、立场、议题都不会执行，会议空着就成稿。
+        if not (state.get("roster_done") and _points(mtg)):
+            if not state.get("early_feedback"):
+                speaker = ("评审意见" if state.get("feedback_kind") == "reroute"
+                           else "用户")
+                phase = store.get_meeting(mtg.meeting_id)["phase"]
+                store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase=phase,
+                               speaker_id=None, speaker_name=speaker, kind="user_feedback",
+                               content=feedback)
+                changes = {"early_feedback": feedback, "reopen_feedback": ""}
+                if phase == "roster":
+                    changes["roster_feedback"] = feedback
+                mtg.set_state(**changes)
+            return
+        mtg.set_state(reopen_feedback=feedback)
+        store.update_meeting(mtg.meeting_id, phase="reopen")
 
     # ---------- 会前准备与澄清 ----------
     async def step_prepare(self, mtg):
@@ -522,11 +649,10 @@ class DiscussionProtocol(MeetingProtocol):
                                   system_prompt=template["system_prompt"])
         if mtg.state().get("brief"):
             return advance()                          # 简报已经写过（续开时）
-        materials, truncated = mtg.materials()
+        materials, _truncated = mtg.materials()       # 截断说明已由 read_materials 附在文本里
         segments = []
         if materials:
-            note = "\n（背景材料超出预算，以上只提供了前面的一部分）" if truncated else ""
-            segments.append(Segment("append", f"## 背景材料\n{materials}{note}", name="背景材料"))
+            segments.append(Segment("append", f"## 背景材料\n{materials}", name="背景材料"))
         result = await speak(mtg, _facilitator(mtg), kind="brief", turn_kind="brief",
                              segments=segments, structured=_validate_brief,
                              turn_round=mtg.meeting_round(),
@@ -604,6 +730,7 @@ class DiscussionProtocol(MeetingProtocol):
                            speaker_id=None, speaker_name="用户", kind="answer",
                            content=f"问：{question}\n答：{text}")
         mtg.set_state(clarifications=clarifications)
+        mtg.ack_decision(decision)
         return advance()
 
     # ---------- 名单 ----------
@@ -637,12 +764,15 @@ class DiscussionProtocol(MeetingProtocol):
                 payload={"proposed": mtg.state()["roster"], "min": low, "max": high,
                          "fixed": fixed}))
         if decision["action"] == "approve" and mtg.participants("participant"):
-            return self._finish_roster(mtg)
+            result = self._finish_roster(mtg)
+            mtg.ack_decision(decision)
+            return result
         # 驳回，或者通过时名单是空的：带着意见重新提议
         for row in mtg.participants("participant"):
             store.update_participant(row["id"], status="removed")
         mtg.set_state(roster=None,
                       roster_feedback=decision.get("feedback") or "至少需要一名参会角色")
+        mtg.ack_decision(decision)
         return advance("roster")
 
     async def _propose(self, mtg, spec: dict, low: int, high: int) -> None:
@@ -704,9 +834,10 @@ class DiscussionProtocol(MeetingProtocol):
         if not members:
             raise NodeFailure("讨论会议没有参会者")
         charter = _charter(mtg)
+        segments = _feedback_segments(mtg)             # 早期阶段收到的用户反馈/插话
         await speak_many(mtg, [
             {"participant": member, "kind": "position", "turn_kind": "position",
-             "charter": charter, "segments": [], "instruction": POSITION_INSTRUCTION,
+             "charter": charter, "segments": segments, "instruction": POSITION_INSTRUCTION,
              "structured": _validate_position, "turn_round": mtg.meeting_round()}
             for member in members])
         return advance()
@@ -714,16 +845,21 @@ class DiscussionProtocol(MeetingProtocol):
     async def step_agenda(self, mtg):
         if mtg.state().get("agenda_done"):
             return advance()
-        result = await speak(mtg, _facilitator(mtg), kind="agenda", turn_kind="agenda",
-                             charter=_charter(mtg), segments=_positions(mtg),
-                             instruction=AGENDA_INSTRUCTION, structured=_validate_agenda,
-                             turn_round=mtg.meeting_round())
-        existing = len(_points(mtg))
-        for offset, item in enumerate(result["data"]["points"]):
+        facilitator = _facilitator(mtg)
+        # 断点保护：模型这一步已落盘就复用，不重复调用；决策点按位置编号，重写幂等
+        found = store.find_turn(mtg.meeting_id, phase=mtg.meeting()["phase"],
+                                round=mtg.meeting_round(), kind="agenda",
+                                speaker_id=facilitator["id"])
+        data = found["data"] if found else (await speak(
+            mtg, facilitator, kind="agenda", turn_kind="agenda",
+            charter=_charter(mtg), segments=_positions(mtg),
+            instruction=AGENDA_INSTRUCTION, structured=_validate_agenda,
+            turn_round=mtg.meeting_round()))["data"]
+        for offset, item in enumerate(data["points"]):
             store.upsert_decision_point(
-                mtg.meeting_id, f"D{existing + offset + 1}", title=item["title"].strip(),
+                mtg.meeting_id, f"D{offset + 1}", title=item["title"].strip(),
                 question=str(item.get("question") or ""),
-                options_json=[str(option) for option in (item.get("options") or [])],
+                options_json=list(item.get("options") or []),
                 raised_by=str(item.get("raised_by") or ""), origin_round=mtg.meeting_round())
         mtg.set_state(agenda_done=True)
         await _ledger_updated(mtg)
@@ -731,22 +867,26 @@ class DiscussionProtocol(MeetingProtocol):
 
     async def step_stances(self, mtg):
         members = mtg.participants("participant")
+        open_points = _open_points(_points(mtg))
         if len(members) <= 1:
             # 只有一名参会者：立场即共识，不经过表态和交锋
-            for point in _open_points(_points(mtg)):
+            for point in open_points:
                 _close(mtg, point["index"], "agreed", "唯一参会者的立场", "只有一名参会者")
             await _ledger_updated(mtg)
             return advance("reopen")
-        charter, view = _charter(mtg), _view(mtg, ["position"])
+        charter = _charter(mtg)
+        view = _stance_view(mtg)
         results = await speak_many(mtg, [
             {"participant": member, "kind": "stance", "turn_kind": "stance", "charter": charter,
-             "segments": view, "instruction": STANCE_INSTRUCTION, "structured": _validate_stances,
+             "segments": view, "instruction": STANCE_INSTRUCTION,
+             "structured": _validate_stances([point["index"] for point in open_points]),
              "turn_round": mtg.meeting_round()} for member in members])
         for member, result in zip(members, results):
             _apply_stances(mtg, member, result["data"])
         _settle_round(mtg)
         remaining = _open_points(_points(mtg))
         await _ledger_updated(mtg)
+        mtg.reset_builder()                           # 账本变了，下一次调用以新账本为基线
         if not remaining:
             mtg.set_state(consensus_reason="all_closed")
             return advance("consensus")
@@ -765,14 +905,14 @@ class DiscussionProtocol(MeetingProtocol):
         for point in _open_points(_points(mtg)):
             ranked = rank_speakers(point, [member["id"] for member in members])
             claimer = by_id[ranked[0]]
+            # 质疑者从最反对的一端开始轮换；交锋次数大于人数时按环取，不会越界
+            opponents = [voter for voter in reversed(ranked) if voter != ranked[0]]
             subject = f"决策点 {point['index']}「{point['title']}」：{point['question']}"
             exchanges[point["index"]] = 0
             for number in range(1, limit + 1):
                 mark = f"{point['index']}:{number}"
-                if mark in done:                       # 这一次交锋重入前已经完成
-                    exchanges[point["index"]] += 1
-                    continue
-                opponent = ranked[-number] if ranked[-number] != ranked[0] else ranked[-1]
+                opponent = (opponents[(number - 1) % len(opponents)] if opponents
+                            else ranked[0])
                 challenger = by_id[opponent]
                 instructions = {
                     "claim": f"关于{subject}，请主张你支持的立场，给出理由和依据。只写一段话。",
@@ -798,6 +938,8 @@ class DiscussionProtocol(MeetingProtocol):
         round_no = mtg.meeting_round()
         facilitator = _facilitator(mtg)
         open_indexes = [point["index"] for point in _open_points(_points(mtg))]
+        if not open_indexes:                          # 没有未决点（全部了结后"继续讨论"）：跳过
+            return advance()
         found = store.find_turn(mtg.meeting_id, phase="summary", round=round_no,
                                 kind="exchange_summary", speaker_id=facilitator["id"])
         data = found["data"] if found else (await speak(
@@ -810,6 +952,7 @@ class DiscussionProtocol(MeetingProtocol):
             if str(row["index"]) in index_of:
                 store.update_decision_point(index_of[str(row["index"])],
                                             exchange_summary=str(row["summary"]).strip())
+        mtg.reset_builder()                           # 交锋摘要写进了账本，下一次调用以新账本为基线
         return advance()
 
     async def _rule(self, mtg, indexes: list[str]) -> None:
@@ -845,16 +988,25 @@ class DiscussionProtocol(MeetingProtocol):
                               int(params.get("exchanges_per_point") or 2))
             if used_up:
                 await self._rule(mtg, used_up)
+                mtg.reset_builder()                   # 裁决改写了账本，下一次调用以新账本为基线
+        remaining = _open_points(_points(mtg))
+        if not remaining:
+            # 裁决已经把最后的未决点关闭：不再向模型要一次"对零个点重新表态"的回复
+            mtg.set_state(consensus_reason="all_closed")
+            await _ledger_updated(mtg)
+            return advance("consensus")
         charter, view = _charter(mtg), _view(mtg, _ROUND_KINDS)
         results = await speak_many(mtg, [
             {"participant": member, "kind": "restance", "turn_kind": "restance",
              "charter": charter, "segments": view, "instruction": RESTANCE_INSTRUCTION,
-             "structured": _validate_stances, "turn_round": round_no} for member in members])
+             "structured": _validate_stances([point["index"] for point in remaining]),
+             "turn_round": round_no} for member in members])
         for member, result in zip(members, results):
             _apply_stances(mtg, member, result["data"])
         outcome = _settle_round(mtg)
         remaining = _open_points(_points(mtg))
         await _ledger_updated(mtg)
+        mtg.reset_builder()                           # 结算可能关闭了决策点
         if not remaining:
             mtg.set_state(consensus_reason="all_closed")
             return advance("consensus")
@@ -877,7 +1029,7 @@ class DiscussionProtocol(MeetingProtocol):
 
     # ---------- 轮次共识 ----------
     async def step_consensus(self, mtg):
-        points = _points(mtg)
+        points = _accounted_points(mtg)
         open_points = _open_points(points)
         decider = mtg.decider("consensus")
         reason = str(mtg.state().get("consensus_reason")
@@ -898,6 +1050,7 @@ class DiscussionProtocol(MeetingProtocol):
                 decision={"action": "approve", "option": "relax", **outcome},
                 payload={"reason": reason})
             await _ledger_updated(mtg)
+            mtg.reset_builder()
             return advance()
         decision = mtg.decision()
         if decision is None:
@@ -910,6 +1063,11 @@ class DiscussionProtocol(MeetingProtocol):
         data = decision["data"] or {}
         option = str(data.get("option") or ("integrate" if decision["action"] == "approve"
                                             else "continue"))
+        if option == "continue" and not open_points:
+            # 全部了结时没有可继续讨论的点：忽略"继续讨论"，直接成稿
+            mtg.ack_decision(decision)
+            mtg.set_state(consensus_reason=None)
+            return advance()
         if option == "continue":
             # 再讨论一轮：指导语作为一条用户发言进入纪要，算在下一轮里
             following = mtg.meeting_round() + 1
@@ -917,6 +1075,7 @@ class DiscussionProtocol(MeetingProtocol):
                            speaker_name="用户", kind="user_guidance",
                            content=decision.get("feedback") or "")
             store.update_meeting(mtg.meeting_id, round=following)
+            mtg.ack_decision(decision)
             mtg.set_state(consensus_reason=None, stall=0, exchange_done=[], exchanges={},
                           stance_snapshot=snapshot(open_points),
                           rounds_limit=max(_rounds_max(mtg), following))
@@ -924,48 +1083,68 @@ class DiscussionProtocol(MeetingProtocol):
             return advance("exchange")
         if option == "delegate" and open_points:
             await self._rule(mtg, [point["index"] for point in open_points])
+            mtg.reset_builder()
         else:
             for point in open_points:                 # 带着分歧整合：未了结的记为待定
                 _close(mtg, point["index"], DEFERRED, "各方未达成一致，待用户决定")
             await _ledger_updated(mtg)
+            mtg.reset_builder()
+        mtg.ack_decision(decision)
         mtg.set_state(consensus_reason=None)
         return advance()
 
     # ---------- 复议 ----------
     async def step_reopen(self, mtg):
-        feedback = str(mtg.state().get("reopen_feedback") or "").strip()
+        state = mtg.state()
+        feedback = str(state.get("reopen_feedback") or "").strip()
         if not feedback:
             return advance()
-        mtg.set_state(reopen_feedback="")
-        speaker = "评审意见" if mtg.state().get("feedback_kind") == "reroute" else "用户"
-        store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase="reopen", speaker_id=None,
-                       speaker_name=speaker, kind="user_feedback", content=feedback)
-        result = await speak(
-            mtg, _facilitator(mtg), kind="reopen", turn_kind="reopen_plan", charter=_charter(mtg),
-            segments=[render.ledger_segment(_points(mtg), round_no=mtg.meeting_round()),
-                      Segment("append", f"## 需要处理的反馈\n{feedback}", name="反馈")],
-            instruction=REOPEN_INSTRUCTION, structured=_validate_reopen,
-            turn_round=mtg.meeting_round())
+        facilitator = _facilitator(mtg)
+        round_no = mtg.meeting_round()
+        following = round_no + 1
+        speaker = "评审意见" if state.get("feedback_kind") == "reroute" else "用户"
+        # 断点保护：reopen 的回复已经落盘就复用；反馈发言也按轮次与内容去重
+        found = store.find_turn(mtg.meeting_id, phase="reopen", round=round_no,
+                                kind="reopen_plan", speaker_id=facilitator["id"])
+        if found is None:
+            existing = {turn["content"] for turn in store.round_turns(
+                mtg.meeting_id, round=following, kinds=["user_feedback"])}
+            if feedback not in existing:
+                store.add_turn(mtg.meeting_id, round=following, phase="reopen",
+                               speaker_id=None, speaker_name=speaker,
+                               kind="user_feedback", content=feedback)
+            data = (await speak(
+                mtg, facilitator, kind="reopen", turn_kind="reopen_plan",
+                charter=_charter(mtg),
+                segments=[render.ledger_segment(_points(mtg), round_no=round_no),
+                          Segment("append", f"## 需要处理的反馈\n{feedback}", name="反馈")],
+                instruction=REOPEN_INSTRUCTION, structured=_validate_reopen,
+                turn_round=round_no))["data"]
+        else:
+            data = found["data"]
         by_index = {point["index"]: point for point in _points(mtg)}
         number = len(by_index) + 1
-        for row in result["data"]["points"]:
+        reopened = dict(state.get("reopen_rounds") or {})
+        for row in data["points"]:
             index = str(row.get("index") or "").strip()
             if index in by_index:                     # 已有的决策点：置为复议中
                 store.update_decision_point(by_index[index]["id"], status="reopened",
                                             conclusion="", closed_round=None)
+                reopened[index] = following
             elif index:
                 continue                              # 账本里没有的编号：不计入
             else:                                     # 反馈带出了账本里没有的问题：新建
                 store.upsert_decision_point(
                     mtg.meeting_id, f"D{number}", title=str(row.get("title") or "").strip(),
                     question=str(row.get("question") or ""),
-                    options_json=[str(option) for option in (row.get("options") or [])],
-                    raised_by=speaker, origin_round=mtg.meeting_round() + 1)
+                    options_json=list(row.get("options") or []),
+                    raised_by=speaker, origin_round=following)
                 number += 1
-        following = mtg.meeting_round() + 1
         store.update_meeting(mtg.meeting_id, round=following)
+        # 反馈处理完之后才清空标记：模型调用或落盘失败重试时，这条反馈还在
         mtg.set_state(stance_snapshot={}, exchange_done=[], exchanges={}, stall=0,
-                      consensus_reason=None, rounds_limit=None)
+                      consensus_reason=None, rounds_limit=None, reopen_feedback="",
+                      reopen_rounds=reopened)
         mtg.reset_builder()
         await _ledger_updated(mtg)
         return advance("stances")
@@ -978,16 +1157,32 @@ class DiscussionProtocol(MeetingProtocol):
         if previous:
             segments.append(Segment("append", f"## 上一版建设方案\n{previous}", name="上一版方案"))
         result = await speak(
-            mtg, _facilitator(mtg), kind="proposal", turn_kind="proposal", charter=_charter(mtg),
+            mtg, _facilitator(mtg), kind="proposal_revise" if previous else "proposal",
+            turn_kind="proposal", charter=_charter(mtg),
             segments=segments, turn_round=mtg.meeting_round(),
             instruction=REVISION_INSTRUCTION if previous else PROPOSAL_INSTRUCTION)
-        self._save_proposal(mtg, strip_outer_fence(result["content"]))
+        self._save_proposal(mtg, strip_outer_fence(result["content"]),
+                            revision=bool(previous))
         return advance()
 
-    def _save_proposal(self, mtg, draft: str, notes: str = "") -> dict:
-        """程序在方案末尾附上决策点索引与待确认问题，然后落盘并更新纪要。"""
+    def _save_proposal(self, mtg, draft: str, notes: str = "",
+                       revision: bool = False) -> dict:
+        """先校验模型写的正文，再由程序在末尾附上决策点索引与待确认问题。
+
+        程序追加的两节会让"正文够长"变得廉价，所以正文必须自己具备六个必需章节；
+        修订版还必须写明修改说明。
+        """
+        draft = draft.strip()
+        issues = [] if len(draft) >= 100 else ["正文过短，请给出完整的建设方案"]
+        missing = [title for title in PROPOSAL_SECTIONS if title not in draft]
+        if missing:
+            issues.append("方案缺少这些章节：" + "、".join(missing))
+        if revision and "## 修改说明" not in draft:
+            issues.append("修订版缺少「## 修改说明」一节")
+        if issues:
+            raise NodeFailure("建设方案正文校验未通过：" + "；".join(issues))
         points = _points(mtg)
-        body = (draft.strip() + "\n\n" + _index_section(points) + "\n"
+        body = (draft + "\n\n" + _index_section(points) + "\n"
                 + _pending_section(mtg, points))
         issues = validate_artifact("proposal", body)
         if issues:
@@ -1036,7 +1231,7 @@ class DiscussionProtocol(MeetingProtocol):
             charter=_charter(mtg), turn_round=check_round,
             segments=view + [Segment("append", f"## 复核意见\n{notes}", name="复核意见")],
             instruction=REVISE_INSTRUCTION)
-        self._save_proposal(mtg, strip_outer_fence(result["content"]))
+        self._save_proposal(mtg, strip_outer_fence(result["content"]), revision=True)
         mtg.set_state(check_round=check_round + 1,
                       check_pending=[member["id"] for member, _data in flagged])
         return advance("check")                      # 只让提出意见的人再复核一遍

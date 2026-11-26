@@ -71,3 +71,12 @@ def test_ledger_rows_keep_the_latest_status_of_each_point() -> None:
     rows = _ledger_rows(LEDGER + later)
     assert [row["index"] for row in rows] == ["D1", "D2"]
     assert rows[1]["status"] == "已一致" and rows[1]["options"] == ["需要", "不需要"]
+
+
+def test_the_last_call_tag_wins_over_an_echoed_one() -> None:
+    """提示里如果复述过别的调用标识，仍以末尾的真实标识为准。"""
+    echoed = "（上一轮发言复述过【调用类型：proposal】）"
+    messages = [{"role": "system", "content": ""},
+                {"role": "user", "content": f"{echoed}\n\n{LEDGER}\n\n【调用类型：stance】"}]
+    text, call = _pick(messages, None)
+    assert call is None and "stances" in json.loads(text)

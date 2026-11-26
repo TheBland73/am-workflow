@@ -59,10 +59,12 @@ async def reroute_or_escalate(mtg: "MeetingSession", targets: list[str], feedbac
             payload={"targets": list(targets), "feedback": feedback[:2000],
                      "round": mtg.round_no(), "max_rounds": mtg.max_rounds()}))
     if decision["action"] == "approve":
+        mtg.ack_decision(decision)
         return None
     note = str(decision.get("feedback") or "").strip()
     if note:
         feedback = f"{feedback}\n\n用户在确认点上的意见：{note}"
+    mtg.ack_decision(decision)
     return reroute(targets, feedback, self_feedback=self_feedback, summary=summary,
                    extra_round=True)
 
@@ -82,6 +84,10 @@ class MeetingProtocol:
         """从当前步骤跑到挂起、回流或完成。每一步返回 advance 时推进到下一步。"""
         await self.on_enter(mtg)
         while True:
+            # 拼装这一步的视图之前先处理排队的插话：协议与主持人回应都能看到它
+            from app.meeting.calls import drain_interventions  # 延迟导入：避免循环导入
+
+            await drain_interventions(mtg)
             step = mtg.current_step(self.steps)
             handler = getattr(self, f"step_{step}")
             result = await handler(mtg)
