@@ -195,6 +195,13 @@ class Orchestrator:
             heartbeat.cancel()
 
         self._finish_attempt(attempt_id)
+        if result.get("suspended"):
+            # 会议在确认点挂起：门、节点与运行的状态已由会议运行器置好，这里只补一条事件
+            checkpoint = result.get("checkpoint") or {}
+            await emit(run_id, "meeting_suspended", node["id"], {
+                "meeting_id": result.get("meeting_id"), "gate_id": checkpoint.get("id"),
+                "kind": checkpoint.get("kind")})
+            return
         if node["type"] == "REVIEW" and result.get("verdict") == "block":
             await self._handle_review_block(run_id, node, attempt_id, attempt_no, result)
             return

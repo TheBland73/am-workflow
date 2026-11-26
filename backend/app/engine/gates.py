@@ -77,20 +77,22 @@ def _pending_questions(s, run_id: str) -> list[str]:
 
 
 def gate_payload(s, gate: Gate) -> dict:
-    """人工门对外 payload：request_gate / get_gate / run 快照共用同一份字段。
+    """门对外 payload：request_gate / get_gate / run 快照共用同一份字段。
 
     必须复用调用方 session（连接池 size=1，另开 session 会在池上死等）。
-    方案确认门（gate_proposal）的 description 追加讨论稿未决项；描述里已含该段落时
-    不重复追加，保证多次读取（刷新/重载）幂等。
+    会议内确认点（门上带类型）的标题与描述存在门的载荷里；工件确认点沿用节点配置，
+    方案确认门的描述追加讨论里的未决议题。描述里已含该段落时不重复追加，保证幂等。
     """
     node = s.get(Node, gate.node_id)
     config = dict(node.config_json or {}) if node is not None else {}
     node_key = node.node_key if node is not None else ""
-    description = config.get("description") or ""
-    if node_key == "gate_proposal" and PENDING_TITLE not in description:
+    payload = dict(gate.payload_json or {})
+    description = str(payload.get("description") or "") if gate.kind else (config.get("description") or "")
+    if node_key == "gate_proposal" and not gate.kind and PENDING_TITLE not in description:
         pending = _pending_questions(s, gate.run_id)
         if pending:
             description += f"\n\n{PENDING_TITLE}：\n" + "\n".join(pending)
+    title = (payload.get("title") if gate.kind else None) or config.get("title")
     return {
         "id": gate.id,
         "run_id": gate.run_id,
@@ -101,9 +103,12 @@ def gate_payload(s, gate: Gate) -> dict:
         "decided_by": gate.decided_by,
         "created_at": gate.created_at.isoformat() if gate.created_at else None,
         "decided_at": gate.decided_at.isoformat() if gate.decided_at else None,
-        "title": config.get("title") or (node.name if node is not None else ""),
+        "title": title or (node.name if node is not None else ""),
         "description": description,
         "artifact": config.get("artifact"),
+        "kind": gate.kind or "",
+        "payload": payload,
+        "decision": dict(gate.decision_json or {}),
     }
 
 

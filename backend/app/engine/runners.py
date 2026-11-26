@@ -137,6 +137,10 @@ async def execute_node(ctx: NodeContext) -> dict:
         return await _run_verify(ctx)
     if ctx.type == "REVIEW":
         return await _run_review(ctx)
+    if ctx.type == "MEETING":
+        from app.meeting.runner import run_meeting
+
+        return await run_meeting(ctx)
     if ctx.type == "TASKGRAPH":
         return await _run_taskgraph(ctx)
     if ctx.type in ("DECISION",):
