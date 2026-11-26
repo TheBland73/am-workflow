@@ -1,0 +1,136 @@
+"""会议的查询与介入接口。"""
+from __future__ import annotations
+
+import asyncio
+
+from fastapi.testclient import TestClient
+
+from app.db.base import init_db, session_scope
+from app.db.models import Node, Run, Workflow
+from app.engine.runners import NodeContext
+from app.engine.templates import seed_defaults
+from app.main import app
+from app.meeting import store
+from app.meeting.checkpoints import open_checkpoint
+from app.meeting.session import MeetingSession
+
+_counter = iter(range(1, 1000))
+
+
+def _meeting(phase: str = "roster", suspend: bool = True) -> MeetingSession:
+    init_db()
+    seed_defaults()
+    index = next(_counter)
+    with session_scope() as s:
+        workflow_id = s.query(Workflow).filter(Workflow.template_key == "sdlc_v1").one().id
+        run_id = f"api-run-{index}"
+        s.add(Run(id=run_id, workflow_id=workflow_id, status="running"))
+        s.flush()
+        node = Node(node_key="discuss", type="MEETING", name="讨论会议", run_id=run_id,
+                    status="running", config_json={"protocol": "discussion"})
+        s.add(node)
+        s.flush()
+        ctx = NodeContext(run_id=run_id, node_id=node.id, node_key="discuss", type="MEETING",
+                          name="讨论会议", phase="", config={"protocol": "discussion"},
+                          assignee={}, attempt_id=0, attempt_no=1)
+    meeting_id = store.create_meeting(run_id=run_id, node_id=node.id, node_key="discuss",
+                                      protocol="discussion", charter={}, config={})
+    store.update_meeting(meeting_id, phase=phase)
+    store.add_participant(meeting_id, role_key="facilitator", display_name="主持人",
+                          mode="facilitator")
+    mtg = MeetingSession(meeting_id=meeting_id, ctx=ctx)
+    if suspend:
+        asyncio.run(open_checkpoint(mtg, "roster", title="请确认名单", description="",
+                                    payload={"proposed": []}))
+    return mtg
+
+
+def _client(monkeypatch) -> TestClient:
+    return TestClient(app)
+
+
+def test_detail_lists_participants_and_checkpoint(monkeypatch) -> None:
+    mtg = _meeting()
+    with _client(monkeypatch) as client:
+        response = client.get(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["meeting"]["protocol"] == "discussion"
+    assert body["meeting"]["status"] == "suspended"
+    assert [p["display_name"] for p in body["participants"]] == ["主持人"]
+    assert body["checkpoints"][0]["kind"] == "roster"
+    assert body["node_status"] == "waiting_human"
+
+
+def test_list_meetings(monkeypatch) -> None:
+    mtg = _meeting()
+    with _client(monkeypatch) as client:
+        body = client.get(f"/api/runs/{mtg.run_id}/meetings").json()
+    assert [m["id"] for m in body["items"]] == [mtg.meeting_id]
+
+
+def test_missing_meeting_returns_404(monkeypatch) -> None:
+    mtg = _meeting()
+    with _client(monkeypatch) as client:
+        response = client.get(f"/api/runs/{mtg.run_id}/meetings/999999")
+    assert response.status_code == 404
+
+
+def test_replace_participants_at_roster_checkpoint(monkeypatch) -> None:
+    mtg = _meeting()
+    payload = {"participants": [
+        {"display_name": "架构", "persona": "你关注技术可行性。", "mode": "participant"},
+        {"display_name": "合规顾问", "persona": "你关注数据合规。", "mode": "participant"},
+    ]}
+    with _client(monkeypatch) as client:
+        response = client.put(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/participants",
+                              json=payload)
+    assert response.status_code == 200, response.text
+    rows = store.list_participants(mtg.meeting_id)
+    # 主持人与需求方代理保留，参会者被整体替换
+    assert [(r["display_name"], r["mode"]) for r in rows] == [
+        ("主持人", "facilitator"), ("架构", "participant"), ("合规顾问", "participant")]
+    assert rows[2]["source"] == "user" and rows[2]["role_key"] is None
+    assert rows[2]["system_prompt"] == "你关注数据合规。"
+
+
+def test_invalid_participant_mode_changes_nothing(monkeypatch) -> None:
+    mtg = _meeting()
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试",
+                          mode="participant", system_prompt="你是测试")
+    payload = {"participants": [{"display_name": "冒充主持人", "mode": "facilitator"}]}
+    with _client(monkeypatch) as client:
+        response = client.put(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/participants",
+                              json=payload)
+    assert response.status_code == 400
+    assert [r["display_name"] for r in store.list_participants(mtg.meeting_id)] == ["主持人", "测试"]
+
+
+def test_participants_cannot_be_changed_after_roster(monkeypatch) -> None:
+    mtg = _meeting(phase="stances")
+    with _client(monkeypatch) as client:
+        response = client.put(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/participants",
+                              json={"participants": []})
+    assert response.status_code == 400
+
+
+def test_patch_decision_point_while_suspended(monkeypatch) -> None:
+    mtg = _meeting()
+    point_id = store.upsert_decision_point(mtg.meeting_id, "D1", title="先做哪个平台",
+                                           status="open")
+    with _client(monkeypatch) as client:
+        response = client.patch(
+            f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/decision-points/{point_id}",
+            json={"status": "deferred", "conclusion": "留待用户决定"})
+    assert response.status_code == 200, response.text
+    assert store.list_decision_points(mtg.meeting_id)[0]["status"] == "deferred"
+
+
+def test_intervene_queues_request(monkeypatch) -> None:
+    mtg = _meeting(phase="debate", suspend=False)
+    with _client(monkeypatch) as client:
+        response = client.post(f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/intervene",
+                               json={"content": "注意成本"})
+        assert response.status_code == 201, response.text
+        taken = store.take_queued_interventions(mtg.meeting_id)
+    assert [t["content"] for t in taken] == ["注意成本"]
