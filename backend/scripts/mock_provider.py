@@ -3,11 +3,12 @@ r"""离线 OpenAI 兼容 Mock 服务（仅用于本地演示与端到端测试�
 启动：
     .\.venv\Scripts\python.exe scripts\mock_provider.py --port 8100
 
-它按提示词判断当前角色：文档节点按系统提示词路由；讨论三方的 R1 主张与
-R2 回应复用同一个 discuss_pro 角色提示词，无法靠系统提示词区分，因此这两个
-节点按「系统提示词角色关键词 + user 侧 instruction 关键词」组合路由。
-对开发者角色则模拟 write_file → write_file → run_command → finish 的工具
-调用序列，让平台无需真实 API Key 也能跑通完整的 SDLC 流程。
+路由规则：
+- 会议里的每一次调用，提示末尾都带一个调用标识（形如【调用类型：stance】），
+  按标识查表回复，不靠提示词里的关键词猜；
+- 文档节点按系统提示词里的角色关键词路由；
+- 开发者角色模拟 write_file → write_file → run_command → finish 的工具调用序列，
+  让平台无需真实 API Key 也能跑通完整的 SDLC 流程。
 
 生产使用真实供应商时不需要启动本服务。
 """
@@ -31,108 +32,6 @@ MODELS = [
 
 
 # ---------------------------------------------------------------- 文本工件
-def _idea_of(messages: list[dict]) -> str:
-    for m in messages:
-        if m.get("role") != "user":
-            continue
-        text = m.get("content") or ""
-        match = re.search(r"### idea\n\n(.+?)(?:\n\n### |\Z)", text, re.S)
-        if match:
-            return match.group(1).strip()[:400]
-    return "一个用于团队协作的软件项目"
-
-
-def _discussion(messages: list[dict], counter: bool) -> str:
-    idea = _idea_of(messages)
-    if counter:
-        return f"""## 质疑
-
-- **Q1 范围偏大**：主张中的「{idea[:40]}…」在第一版里同时做实时协作与权限体系，交付风险高。
-  建议动作：W1 只做单人流程 + 只读共享，把实时协作放到 M1。
-- **Q2 验收标准不清**：主张只写了"跑通"，没有可观测证据。
-  建议动作：每个阶段必须落到工件与退出码。
-- **Q3 模型依赖**：讨论中没有定义供应商不可用时的降级路径。
-  建议动作：保留离线 mock 与重试预算。
-- **Q4 人工门缺失**：方案、需求、设计三处一旦无人确认，返工成本会指数上升。
-  建议动作：为每个关键工件增加人工确认门与失败回流路径。
-"""
-    return f"""## 主张
-
-针对「{idea[:60]}」，建议采用**阶段化多智能体流水线**。
-
-### 目标与非目标
-
-- 目标：把想法到交付固化为可审计、可中断、可恢复的流程，W1 交付最小闭环；
-- 非目标：不做实时协作、细粒度权限与容器化执行。
-
-### 首批范围
-
-- 必做：供应商与模型配置、编排引擎、固定 SDLC 模板、工件链、人工确认门；
-- 不做：向量记忆、多 run 并行、讨论循环节点。
-
-### 技术路线
-
-1. 选项 A：单体脚本直连模型——实现最快，但无编排与恢复能力，不可审计；
-2. 选项 B：阶段化多智能体流水线（推荐）——工件链逐级收敛，控制流由编排器掌握，
-   失败可重试、可转人工，事件 append-only 支持断线重放；
-3. 选项 C：引入第三方工作流引擎——能力全但引入重依赖，演示与定制成本高。
-
-### 关键假设
-
-- 模型接口遵循 OpenAI 兼容协议，供应商可替换；
-- 单机 SQLite（WAL）足以支撑演示与小型团队使用。
-
-### 主要风险与缓解
-
-- 上下文超窗需要预算裁剪；
-- 并发写 SQLite 必须单连接 + WAL；
-- 模型不稳定：适配器重试一次，失败转人工。
-"""
-
-
-def _proposal(messages: list[dict]) -> str:
-    idea = _idea_of(messages)
-    return f"""# 建设方案：AM-Workflow 最小可用版本
-
-## 1. 背景与目标
-
-用户想法：{idea[:200]}
-
-目标是用一个可配置的工作流引擎，把「想法 → 讨论 → 方案 → 需求 → 设计 → 任务 → 执行 → 交付」
-固化为可审计、可中断、可恢复的流程；W1 先交付可演示的最小闭环。
-
-## 2. 总体架构
-
-- 前端：Vite + React + Ant Design，画布只读展示阶段与节点，SSE 驱动状态；
-- 后端：FastAPI + SQLAlchemy，SQLite（WAL）单连接，事件表 append-only；
-- 编排器：拓扑分波、同波并发、汇合屏障、失败回流、人工门挂起；
-- 模型层：Provider → Model → Binding 三层解耦，openai_chat 协议优先；
-- 工件层：Markdown + YAML front-matter，版本化落盘，旧版本标记 superseded。
-
-## 3. 关键流程
-
-1. 创建 run 时固化模板节点并写入 idea 工件；
-2. 讨论节点串行产出主张与质疑，合并为一份讨论稿；
-3. 方案/需求/设计/任务四个文档节点各设人工门；
-4. 任务图解析后展开为并行开发节点，VERIFY 节点统一跑单元测试；
-5. 交付节点汇总工件链与执行证据，生成 changelog。
-
-## 4. 风险与对策
-
-- 模型不稳定：适配器重试一次，失败转人工；
-- 上下文超窗：按系统/记忆/工件/历史配额裁剪；
-- 进程重启：启动时作废未回执 attempt，重排 ready 节点；
-- 预算耗尽：run 级 token 预算，超限暂停并请求人工。
-
-## 5. 验收标准
-
-- 8 个阶段全部产出工件，7 类工件齐备；
-- 5 个人工门可批准、驳回（带反馈与目标节点）、编辑后批准；
-- 并行开发真实调用模型并通过单元测试；
-- 杀进程重启后挂起的 run 可继续。
-"""
-
-
 def _requirement(messages: list[dict]) -> str:
     text = """# 需求规格：AM-Workflow W1
 
@@ -160,11 +59,11 @@ WHEN 用户提交想法并选择模板 THE SYSTEM SHALL 创建 run、固化节�
 
 ### R3 阶段推进与人工门
 
-WHEN 节点产出工件且到达人工门 THE SYSTEM SHALL 暂停运行并生成待审批记录。
+WHEN 节点产出工件且到达人工确认点 THE SYSTEM SHALL 暂停运行并等待决定。
 
 验收标准：
-- Given 方案门待审批，When 点击通过，Then 运行继续且门状态为 approved。
-- Given 需求门待审批，When 填写反馈并驳回并指定目标节点，Then 目标节点重跑且下游重置。
+- Given 方案确认点待处理，When 通过，Then 运行继续且门状态为 approved。
+- Given 需求确认点待处理，When 填写反馈并驳回，Then 目标节点带着反馈重跑。
 
 ### R4 任务图与并行执行
 
@@ -199,6 +98,15 @@ WHEN 成员在反馈列表点击「导出周报」THE SYSTEM SHALL 生成当前�
 - Given 筛选结果为空，When 点击导出周报，Then 提示没有可导出的内容且不生成文件。
 
 ## 3. 非功能需求""")
+    points = _ledger_rows(joined)
+    if points:
+        count = 6 if "### R6" in text else 5
+        text += ("\n\n## 需求追踪矩阵\n\n| 需求编号 | 来源决策点 | 方案章节 | 优先级 |\n"
+                 "|---|---|---|---|\n")
+        text += "".join(f"| R{number} | {points[(number - 1) % len(points)]['index']} | 总体方案 | P1 |\n"
+                        for number in range(1, count + 1))
+        text += ("\n## 非需求类决策\n\n| 决策点 | 不产出需求的理由 |\n|---|---|\n"
+                 "| （无） | 每个已了结的决策点都有对应的需求 |\n")
     return text
 
 
@@ -287,6 +195,149 @@ def _changelog(messages: list[dict]) -> str:
 """
 
 
+# ---------------------------------------------------------------- 会议调用
+_CALL_TAG = re.compile(r"【调用类型：([a-z_]+)】")
+_LEDGER_ROW = re.compile(
+    r"^\|\s*(D\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*$",
+    re.M,
+)
+_OPEN_STATUSES = ("讨论中", "复议中")
+
+
+def _ledger_rows(text: str) -> list[dict]:
+    """从提示文本里读出决策点账本表格的各行：编号、状态、标题、候选项、结论。
+
+    同一个决策点可能出现多次（账本快照、纪要）；以最后一次为准。
+    """
+    rows: dict[str, dict] = {}
+    for match in _LEDGER_ROW.finditer(text):
+        conclusion = match.group(5).strip()
+        rows[match.group(1)] = {
+            "index": match.group(1), "status": match.group(2).strip(),
+            "title": match.group(3).strip(),
+            "options": [option.strip() for option in match.group(4).split("/")
+                        if option.strip()],
+            "conclusion": "" if conclusion in ("—", "") else conclusion,
+        }
+    return list(rows.values())
+
+
+def _persona(text: str) -> str:
+    """取"## 你的角色"那一段的第一句，用来区分发言人。"""
+    match = re.search(r"## 你的角色\n(.+)", text)
+    return match.group(1).strip()[:40] if match else ""
+
+
+def _stances(text: str, *, yielding: bool) -> str:
+    """对每个未了结的决策点表态。用户体验视角对最后一个未了结的决策点持反对意见，交锋之后让步。"""
+    rows = [row for row in _ledger_rows(text) if row["status"] in _OPEN_STATUSES]
+    items = []
+    for position, row in enumerate(rows):
+        opposed = position == len(rows) - 1 and "体验" in _persona(text) and not yielding
+        choice = (row["options"][-1] if opposed else row["options"][0]) if row["options"] else ""
+        items.append({"index": row["index"], "level": 5 if opposed else 1,
+                      "reason": "多人共用时需要能区分反馈是谁的" if opposed else "同意目前的结论",
+                      "choice": choice})
+    return json.dumps({"stances": items}, ensure_ascii=False)
+
+
+def _proposal_from_ledger(rows: list[dict], *, revised: bool) -> str:
+    lines = ["# 建设方案"]
+    if revised:
+        lines += ["", "## 修改说明", "", "- 按反馈重开的决策点已重新讨论，结论以账本为准。"]
+    lines += ["", "## 目标与成功标准", "",
+              "把想法落成首版可用的最小闭环；每个阶段都有可验证的产出。",
+              "", "## 范围", "", "必做：反馈的提交、归类与导出。不做：实时协作、细粒度权限。",
+              "", "## 总体方案", ""]
+    lines += [f"- {row['index']} {row['title']}：{row['conclusion'] or '尚有分歧，待用户决定'}"
+              f"（{row['status']}）" for row in rows] or ["- （账本里还没有决策点）"]
+    lines += ["", "## 关键流程", "", "提交反馈 → 归类 → 导出。",
+              "", "## 里程碑与验收", "", "第一周：最小闭环可用，验收以可复现的检查为准。",
+              "", "## 风险与缓解", "", "- 范围蔓延：首版功能冻结。"]
+    return "\n".join(lines) + "\n"
+
+
+def _fallback(text: str) -> str:
+    """没有专门准备内容的调用：给一份格式正确的通用文档。"""
+    return (
+        "# 说明\n\n## 背景\n\n这是一份由离线 Mock 生成的通用文档，"
+        "用来让流程在没有真实模型时也能走下去。它不包含针对当前想法的具体判断。\n\n"
+        "## 要点\n\n- 范围：只覆盖最小闭环，不做的部分明确列出；\n"
+        "- 验收：每一步都有可复现的检查；\n"
+        "- 风险：范围蔓延，以及关键决策没有回退方案；对应的缓解是首版功能冻结、关键决策写明回退路径。\n\n"
+        "## 后续\n\n接入真实模型后，这份文档会由模型按节点要求撰写，内容以实际输入的工件与反馈为准。\n"
+    )
+
+
+def _meeting_reply(kind: str, text: str) -> str:
+    """会议里的一次调用。按调用标识给出格式正确的回复，内容尽量贴着提示里的账本与问题。"""
+    rows = _ledger_rows(text)
+    open_rows = [row for row in rows if row["status"] in _OPEN_STATUSES]
+    if kind == "brief":
+        return json.dumps({
+            "brief": "目标：把想法落成首版可用的最小闭环。用户：提出想法的人及其团队。"
+                     "约束：首版范围要小、每一步可验证。假设：小团队内部使用。",
+            "questions": ["首版必须支持哪些平台或入口？"]}, ensure_ascii=False)
+    if kind == "answer":
+        listing = text.split("## 待澄清的问题", 1)[-1]
+        count = len(re.findall(r"^\d+\.\s", listing, re.M))
+        return json.dumps({"answers": [{"text": "材料中没有说明", "source": ""}
+                                       for _ in range(count)]}, ensure_ascii=False)
+    if kind == "roster":
+        wanted = re.search(r"挑选 (\d+)", text)
+        offered = re.findall(r"^- ([a-z_]+)｜", text, re.M)
+        preferred = [key for key in ("architect", "ux", "qa") if key in offered]
+        picked = (preferred + [key for key in offered if key not in preferred])
+        picked = picked[:int(wanted.group(1)) if wanted else 2]
+        return json.dumps({"participants": [
+            {"role_key": key, "reason": "覆盖想法涉及的一类主要风险"} for key in picked]},
+            ensure_ascii=False)
+    if kind == "position":
+        return json.dumps({"must": ["每一步都可验证"], "risks": ["范围蔓延", "关键决策没有回退方案"],
+                           "route": "先做能跑通的最小闭环", "questions": []}, ensure_ascii=False)
+    if kind == "agenda":
+        return json.dumps({"points": [
+            {"title": "首版的范围与入口", "question": "首版做哪些功能、从哪里进入",
+             "options": ["网页版最小闭环", "桌面版最小闭环"], "raised_by": "架构师"},
+            {"title": "多人共用时如何区分反馈", "question": "首版是否需要登录",
+             "options": ["需要", "不需要"], "raised_by": "用户体验"}]}, ensure_ascii=False)
+    if kind in ("stance", "restance"):
+        return _stances(text, yielding=kind == "restance")
+    subject = re.search(r"决策点 (D\d+)「([^」]*)」", text)
+    label = f"{subject.group(1)}「{subject.group(2)}」" if subject else "这个决策点"
+    if kind == "claim":
+        return f"我支持{label}目前的结论：它覆盖了最主要的场景，实现成本最低。"
+    if kind == "challenge":
+        return f"关于{label}，我担心它忽略了多人共用时的区分问题，建议补上最小的区分手段。"
+    if kind == "respond":
+        return f"这个质疑有道理。我调整立场：{label}按质疑方的建议补上最小区分手段。"
+    if kind == "exchange_summary":
+        return json.dumps({"summaries": [
+            {"index": row["index"],
+             "summary": f"围绕{row['title']}，一方主张成本最低的做法，另一方担心多人共用时的区分问题，"
+                        "主张方同意补上最小区分手段。"} for row in open_rows]}, ensure_ascii=False)
+    if kind == "ruling":
+        return json.dumps({"rulings": [
+            {"index": row["index"], "conclusion": row["options"][0] if row["options"] else "按最小闭环处理",
+             "rationale": "在成本与风险之间取折中", "dissent": "有参会者认为应当采用另一种做法"}
+            for row in open_rows]}, ensure_ascii=False)
+    if kind == "reopen":
+        last = rows[-1] if rows else None
+        point = ({"index": last["index"], "title": "", "question": "", "options": []} if last
+                 else {"index": "", "title": "反馈提出的新问题", "question": "", "options": []})
+        return json.dumps({"points": [point], "note": "按反馈重开最近的一个决策点"}, ensure_ascii=False)
+    if kind in ("proposal", "proposal_revise"):
+        return _proposal_from_ledger(rows, revised=kind == "proposal_revise")
+    if kind == "proposal_check":
+        return '{"ok": true, "issues": []}'
+    if kind == "summarize":
+        return ("较早的发言围绕首版范围与是否登录展开：一方强调成本最低的最小闭环，"
+                "另一方强调多人共用时要能区分反馈；结论以账本为准。")
+    if kind == "intervention_ack":
+        return "收到。我会在接下来的讨论里先处理这一点。"
+    return _fallback(text)
+
+
 # ---------------------------------------------------------------- 开发工具序列
 def _dev_tool_call(messages: list[dict]) -> dict:
     user = next((m.get("content") or "" for m in messages if m.get("role") == "user"), "")
@@ -338,57 +389,6 @@ if __name__ == "__main__":
     return {"name": "finish",
             "args": {"summary": f"完成任务 {uid}：新增 {module}.py 与测试 test_{module}.py，"
                                 "本地 unittest 全部通过。"}}
-
-
-def _discussion_response(messages: list[dict]) -> str:
-    return """## 回应
-
-- **Q1 范围偏大——采纳**。
-  > "建议动作：W1 只做单人流程 + 只读共享，把实时协作放到 M1。"
-  理由：W1 首要目标是跑通端到端闭环，范围越大返工越贵。
-  调整后的方案：首批只做单人流程 + 只读共享，实时协作放到 M1。
-- **Q2 验收标准不清——采纳**。
-  > "建议动作：每个阶段必须落到工件与退出码。"
-  理由：不可验收的主张等于没有主张。
-  调整后的方案：每个阶段必须落到工件与退出码，验证节点以 `python -m unittest` 退出码为准。
-- **Q3 模型依赖——采纳**。理由：供应商不可用时必须有降级路径。
-  调整后的方案：保留离线 mock 与重试预算，失败按指数退避后转人工。
-- **Q4 人工门缺失——不采纳**。理由：主张已在首批范围写明「人工确认门」，质疑与主张重复。
-  调整后的方案：门的位置与驳回回流在方案工件中细化。
-"""
-
-
-def _discussion_mod(messages: list[dict]) -> str:
-    return """## 共识蒸馏
-
-### 共识
-
-- C1：W1 只做单人流程 + 只读共享，实时协作延后到 M1。
-  （依据：> "建议动作：W1 只做单人流程 + 只读共享，把实时协作放到 M1。"）
-- C2：每个阶段必须落到工件与退出码，验证以可观测证据为准。
-  （依据：> "建议动作：每个阶段必须落到工件与退出码。"）
-
-### 分歧（保留）
-
-- D1：供应商不可用时的降级路径是否充分。
-  > "讨论中没有定义供应商不可用时的降级路径。"
-  ↔ > "调整后的方案：保留离线 mock 与重试预算，失败按指数退避后转人工。"
-  → 已裁决：按回应执行，降级路径写入方案的风险节。
-- D2：人工门是否在主张中已有安排。
-  > "方案、需求、设计三处一旦无人确认，返工成本会指数上升。"
-  ↔ > "调整后的方案：门的位置与驳回回流在方案工件中细化。"
-  → 未决：门的具体位置需要人在方案门确认。
-
-### 证据
-
-- 主张与回应均认可：控制流由编排器掌握，模型只是节点；
-- 验证命令以 `python -m unittest` 退出码为准（回应 Q2）。
-
-### 未决项
-
-- [ ] 人工门的具体位置与驳回回流路径，需要人拍板。
-- [ ] 实时协作放入 M1 还是更晚迭代，需要人拍板。
-"""
 
 
 # ---------------------------------------------------------------- 响应构造
@@ -478,19 +478,13 @@ def _pm_plan(messages: list[dict]) -> str:
 
 
 def _pick(messages: list[dict], tools: list[dict] | None) -> tuple[str, dict | None]:
-    system = next((m.get("content") or "" for m in messages if m.get("role") == "system"), "")
     if tools:
-        call = _dev_tool_call(messages)
-        return "", call
-    user = "\n".join(str(m.get("content") or "") for m in messages if m.get("role") == "user")
-    # 三方讨论：R2 回应复用 discuss_pro 提示词，系统提示词无法区分 R1/R2，
-    # 须按 user 侧 instruction 关键词路由；但不能只看 user 关键词——
-    # proposal 的 instruction 也含「逐条回应」，蒸馏后的工件全文也会进入
-    # 后续节点的 user 消息，故组合「系统角色关键词 + user 指令关键词」判定。
-    if "主持人" in system and "共识蒸馏" in user:
-        return _discussion_mod(messages), None
-    if "主张者" in system and "逐条回应" in user:
-        return _discussion_response(messages), None
+        return "", _dev_tool_call(messages)
+    text = "\n".join(str(m.get("content") or "") for m in messages)
+    tagged = _CALL_TAG.search(text)
+    if tagged:                                   # 会议里的调用：只按调用标识路由
+        return _meeting_reply(tagged.group(1), text), None
+    system = next((m.get("content") or "" for m in messages if m.get("role") == "system"), "")
     if "计划分解器" in system or "只输出一个 JSON 对象" in system:
         return _pm_plan(messages), None
     if "EARS" in system:
@@ -501,11 +495,7 @@ def _pick(messages: list[dict], tools: list[dict] | None) -> tuple[str, dict | N
         return _design(messages), None
     if "changelog" in system.lower():
         return _changelog(messages), None
-    if "质疑者" in system or "反方" in system:
-        return _discussion(messages, counter=True), None
-    if "主张者" in system:
-        return _discussion(messages, counter=False), None
-    return _proposal(messages), None
+    return _fallback(text), None
 
 
 def _usage(messages: list[dict], text: str) -> dict:
