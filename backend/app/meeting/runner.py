@@ -78,6 +78,11 @@ def _enter(ctx: NodeContext, protocol: str) -> tuple[int, str]:
               and config.get("feedback_kind") in (*REOPEN_KINDS, "reroute_self")
               and seq != existing["state"].get("handled_feedback_seq"))
     if reopen:
+        # 带着反馈续开时，节点上还开着、也没有决定的旧确认点一并作废，否则调度器会一直等那扇门
+        with session_scope() as s:
+            for stale in s.query(Gate).filter(
+                    Gate.node_id == ctx.node_id, Gate.status == "open").all():
+                stale.status = "superseded"
         store.update_meeting(
             existing["id"], status=MEETING_ACTIVE,
             state_json={**existing["state"], "pending_feedback": feedback,

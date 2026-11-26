@@ -7,74 +7,38 @@
 """
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
-from pathlib import Path
 
-from app.artifacts.store import parse_front_matter
-from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Artifact, Gate, Node, Run
+from app.db.models import DecisionPoint, Gate, Meeting, Node, Run
 from app.engine.feedback import with_feedback
 
-PENDING_SECTION = "未决项"
-PENDING_TITLE = "讨论未决项（需人工拍板）"
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+PENDING_TITLE = "待确认问题（需要你决定）"
 
 
 class GateError(ValueError):
     pass
 
 
-def _extract_pending_questions(body: str) -> list[str]:
-    """按段落作用域提取讨论稿的未决项（`- [ ]` 行）。
-
-    优先定位标题恰为「未决项」的小节（规范是 `### 未决项`，兼容 `##` 等层级），只收集
-    该标题之后、下一个同级或更高级标题之前的勾选项，避免把共识/证据/分歧里的勾选项
-    误当未决项。找不到该标题时退回全文扫描，兼容没有该小节的旧工件。
-    """
-    lines = [line.strip() for line in body.splitlines()]
-    start: int | None = None
-    level = 0
-    for index, line in enumerate(lines):
-        match = _HEADING_RE.match(line)
-        if match and match.group(2) == PENDING_SECTION:
-            start = index + 1
-            level = len(match.group(1))
-            break
-    if start is None:
-        return [line for line in lines if line.startswith("- [ ]")]
-    items: list[str] = []
-    for line in lines[start:]:
-        match = _HEADING_RE.match(line)
-        if match and len(match.group(1)) <= level:
-            break
-        if line.startswith("- [ ]"):
-            items.append(line)
-    return items
-
-
 def _pending_questions(s, run_id: str) -> list[str]:
-    """提取讨论稿蒸馏部分的未决项（`- [ ]` 行），供方案确认门卡片展示。
+    """账本里待定的决策点，供方案确认门的卡片展示。
 
     必须复用调用方 session（连接池 size=1，另开 session 会在池上死等）。
+    取最近一场讨论会议的账本；讨论会议还没开过时返回空列表。
     """
-    row = (
-        s.query(Artifact)
-        .filter(Artifact.run_id == run_id, Artifact.kind == "discussion",
-                Artifact.status == "active")
-        .order_by(Artifact.version.desc())
-        .first()
-    )
-    if row is None:
+    meeting = (s.query(Meeting)
+               .filter(Meeting.run_id == run_id, Meeting.protocol == "discussion")
+               .order_by(Meeting.id.desc())
+               .first())
+    if meeting is None:
         return []
-    path = Path(row.path)
-    if not path.is_absolute():
-        path = settings.base_dir / path
-    if not path.exists():
-        return []
-    _meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
-    return _extract_pending_questions(body)
+    rows = (s.query(DecisionPoint)
+            .filter(DecisionPoint.meeting_id == meeting.id,
+                    DecisionPoint.status == "deferred")
+            .order_by(DecisionPoint.id.asc())
+            .all())
+    return [f"- [ ] {row.index} {row.title}：{row.conclusion or '各方理由见会议纪要'}"
+            for row in rows]
 
 
 def gate_payload(s, gate: Gate) -> dict:

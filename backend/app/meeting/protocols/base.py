@@ -1,6 +1,7 @@
 """协议基类：步进循环与步骤的返回值。"""
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -98,8 +99,21 @@ def register_protocol(cls: type["MeetingProtocol"]) -> type["MeetingProtocol"]:
     return cls
 
 
+# 协议名就是 protocols 包里的模块名
+PROTOCOL_MODULES = ("discussion", "review", "confirm")
+
+
 def get_protocol(name: str) -> "MeetingProtocol":
+    """取协议的实例。协议模块按名字惰性导入，模块里的类用 register_protocol 登记。"""
     cls = _PROTOCOLS.get(name or "")
+    if cls is None and name in PROTOCOL_MODULES:
+        try:
+            importlib.import_module(f"app.meeting.protocols.{name}")
+        except ModuleNotFoundError as exc:
+            from app.engine.runners import NodeFailure
+
+            raise NodeFailure(f"会议协议 {name} 还没有实现", fatal=True) from exc
+        cls = _PROTOCOLS.get(name)
     if cls is None:
         from app.engine.runners import NodeFailure  # 延迟导入：协议基类不在导入期牵动引擎
 

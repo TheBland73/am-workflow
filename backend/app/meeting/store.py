@@ -184,6 +184,15 @@ def finish_turn(turn_id: int, *, content: str, structured: dict | None = None,
         row.model_id = model_id
 
 
+def _turn_dict(row: MeetingTurn) -> dict:
+    return {"id": row.id, "seq": row.seq, "round": row.round, "phase": row.phase,
+            "speaker_id": row.speaker_id, "speaker_name": row.speaker_name, "kind": row.kind,
+            "decision_point_id": row.decision_point_id, "content": row.content,
+            "structured": dict(row.structured_json or {}), "reply_to": row.reply_to,
+            "tokens_in": row.tokens_in, "tokens_out": row.tokens_out,
+            "cached_tokens": row.cached_tokens}
+
+
 def list_turns(meeting_id: int, since_seq: int = 0, limit: int = 500) -> list[dict]:
     with session_scope() as s:
         rows = (
@@ -193,15 +202,7 @@ def list_turns(meeting_id: int, since_seq: int = 0, limit: int = 500) -> list[di
             .limit(limit)
             .all()
         )
-        return [
-            {"id": r.id, "seq": r.seq, "round": r.round, "phase": r.phase, "speaker_id": r.speaker_id,
-             "speaker_name": r.speaker_name, "kind": r.kind,
-             "decision_point_id": r.decision_point_id, "content": r.content,
-             "structured": dict(r.structured_json or {}), "reply_to": r.reply_to,
-             "tokens_in": r.tokens_in, "tokens_out": r.tokens_out,
-             "cached_tokens": r.cached_tokens}
-            for r in rows
-        ]
+        return [_turn_dict(r) for r in rows]
 
 
 def completed_speakers(meeting_id: int, *, phase: str, round: int, kind: str) -> set[int]:
@@ -324,3 +325,34 @@ def find_turn(meeting_id: int, *, phase: str, round: int, kind: str,
             return None
         return {"turn_id": row.id, "content": row.content,
                 "data": dict(row.structured_json) if row.structured_json else None}
+
+
+def round_turns(meeting_id: int, *, round: int, kinds: list[str] | None = None) -> list[dict]:
+    """某一轮里有内容的发言，按序号升序。kinds 给出时只取这些类型。
+
+    进程被杀时留下的空白发言行不算数。
+    """
+    with session_scope() as s:
+        query = s.query(MeetingTurn).filter(
+            MeetingTurn.meeting_id == meeting_id, MeetingTurn.round == round,
+            MeetingTurn.content != "")
+        if kinds:
+            query = query.filter(MeetingTurn.kind.in_(kinds))
+        rows = query.order_by(MeetingTurn.seq.asc()).all()
+        return [_turn_dict(r) for r in rows]
+
+
+def set_stance(point_id: int, participant_id: int, stance: dict) -> None:
+    """写入某个参会者在某个决策点上的最新表态；上一轮的等级与理由留进 history。"""
+    with session_scope() as s:
+        row = s.get(DecisionPoint, point_id)
+        if row is None:
+            return
+        stances = dict(row.stances_json or {})
+        previous = dict(stances.get(str(participant_id)) or {})
+        history = list(previous.get("history") or [])
+        if previous.get("level") is not None and previous.get("round") != stance.get("round"):
+            history.append({"round": previous.get("round"), "level": previous.get("level"),
+                            "reason": previous.get("reason")})
+        stances[str(participant_id)] = {**stance, "history": history}
+        row.stances_json = stances
