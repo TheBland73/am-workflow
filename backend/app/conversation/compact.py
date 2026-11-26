@@ -1,4 +1,8 @@
-"""条件压缩：占用到阈值才压缩，一次压到目标占用以下。只改发给模型的视图，不改存储。"""
+"""条件压缩：占用到阈值才压缩，尽量一次压到目标占用以下。只改发给模型的视图，不改存储。
+
+系统提示本身就很大，或保留部分里有截不掉的大工具调用时，压不到目标占用、甚至压不到触发线
+以下：这时只能带着超线的内容继续，等它再涨上去时重试。
+"""
 from __future__ import annotations
 
 import contextlib
@@ -144,7 +148,8 @@ async def compact_messages(messages: list[Message], *, summarize: Summarizer,
         candidate = head + [summary_message] + [_cap(m, cap) for m in rest[cut:]]
         after = estimate_messages(candidate)
     # 压完仍在触发线之上（保留部分里有截不掉的大工具调用）：下一次请求会立刻再次触发压缩，
-    # 每一步都得重新摘要。把保留部分里较早的几组整组并进摘要，直到落到触发线以下。
+    # 每一步都得重新摘要。把保留部分里较早的几组整组并进摘要，直到落到触发线以下，
+    # 或者保留部分已经并空（系统提示本身就很大时降不下去，只能带着超线的内容继续）。
     # 整组进出，工具结果不会和它回应的助手消息拆开。
     while after >= trigger and cut < len(rest):
         size = _group_size(rest, cut)
@@ -161,14 +166,25 @@ async def compact_messages(messages: list[Message], *, summarize: Summarizer,
 async def maybe_compact(*, run_id: str, node_id: int, model: ModelInfo,
                         policy: ContextPolicy, messages: list[Message],
                         summarize: Summarizer | None = None) -> tuple[list[Message], int, int]:
-    """没到阈值时原样返回，后两个值为 -1。"""
+    """没压缩时（没到阈值，或者到了阈值但没有可压的内容）原样返回，后两个值为 -1。
+
+    压缩过时返回新列表和压缩前后的估算占用；摘要消息的正文用 summary_of() 取。
+    """
     input_budget = ContextBudget(model.context_window, model.max_output_tokens).input_budget
     if not needs_compaction(messages, input_budget=input_budget, policy=policy):
         return messages, -1, -1
     summarize = summarize or make_summarizer(run_id=run_id, attempt_id=0, model=model)
     result, before, after = await compact_messages(
         messages, summarize=summarize, input_budget=input_budget, policy=policy)
+    if result is messages:
+        return messages, -1, -1
     return result, before, after
+
+
+def summary_of(messages: list[Message]) -> str | None:
+    """压缩结果里那条摘要消息的正文；没有就是 None。"""
+    return next((m.content for m in messages
+                 if m.role == "user" and m.content.startswith(SUMMARY_PREFIX)), None)
 
 
 def make_summarizer(*, run_id: str, attempt_id: int, model: ModelInfo) -> Summarizer:
@@ -189,6 +205,10 @@ def make_summarizer(*, run_id: str, attempt_id: int, model: ModelInfo) -> Summar
         if attempt_id:
             add_attempt_usage(attempt_id, usage, model_id=model.id)
         consume_run_budget(run_id, usage)
-        return (reply.content or "").strip() or "（摘要为空）"
+        summary = (reply.content or "").strip()
+        if not summary:
+            # 空正文不能当摘要：滚动摘要里，一句占位话会把此前各块压好的内容全替换掉
+            raise RuntimeError("摘要模型返回了空正文")
+        return summary
 
     return summarize

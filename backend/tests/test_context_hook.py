@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from app.artifacts.store import workspace_dir
 from app.conversation.store import (
     append_message,
@@ -16,7 +18,8 @@ from app.db.models import Event, Node, NodeAttempt, Run, Workflow
 from app.engine import agent_loop, events
 from app.engine.agent_loop import run_agent
 from app.engine.templates import seed_defaults
-from app.models.types import GenParams, Message, StreamEvent, ToolCall, Usage
+from app.engine.usage import BudgetExceeded
+from app.models.types import GenParams, Message, ProviderError, StreamEvent, ToolCall, Usage
 from app.tools.registry import Toolbox
 
 # 窗口 1200、输出上限 256：可用窗口取下限 1024 个 token，压缩阈值是它的 80%。
@@ -47,11 +50,12 @@ def _event_types(run_id: str) -> list[str]:
         return [e.type for e in s.query(Event).filter(Event.run_id == run_id).all()]
 
 
-def _step_logs(run_id: str) -> int:
-    """循环里逐步刷的"第 N 步：请求模型"日志条数。"""
+def _node_logs(run_id: str) -> list[tuple[str, str]]:
+    """循环里写的节点日志：(级别, 内容)。"""
     with session_scope() as s:
         logs = s.query(Event).filter(Event.run_id == run_id, Event.type == "node_log").all()
-    return sum(1 for e in logs if str((e.payload_json or {}).get("message", "")).startswith("第 "))
+    return [((e.payload_json or {}).get("level", ""), str((e.payload_json or {}).get("message", "")))
+            for e in logs]
 
 
 def _install_fake_stream(monkeypatch, seen: list[list[Message]], tool_calls: int) -> None:
@@ -64,7 +68,7 @@ def _install_fake_stream(monkeypatch, seen: list[list[Message]], tool_calls: int
                               tool_calls=[ToolCall(id=f"c{len(seen)}", name="list_files", args={})])
         else:
             message = Message(role="assistant", content="完成")
-        return message, Usage(input_tokens=10, output_tokens=5)
+        return message, Usage(input_tokens=10, output_tokens=5, cached_tokens=3)
 
     async def fake_summarize(text: str) -> str:
         return "摘要"
@@ -120,6 +124,7 @@ def test_hook_compacts_when_threshold_is_reached(monkeypatch) -> None:
     assert last[0].content == "系统"
     assert last[1].content.startswith("【较早对话的摘要】")
     assert "context_compacted" in _event_types("hook-c")
+    assert result.usage.cached_tokens == 18                  # 六次调用各命中 3 个，累加进结果
 
 
 def test_hook_leaves_short_history_alone(monkeypatch) -> None:
@@ -134,16 +139,54 @@ def test_hook_leaves_short_history_alone(monkeypatch) -> None:
     assert [m.content for m in seen[-1][:2]] == ["系统", "列出文件"]     # 原始提示一直在
 
 
-def test_quiet_suppresses_step_logs(monkeypatch) -> None:
-    # 会议里的发言由会议运行时自己写节点日志，工具循环不必逐步刷"请求模型"
+def test_quiet_suppresses_the_loop_logs(monkeypatch) -> None:
+    # 会议里的发言由会议运行时自己写节点日志，工具循环不必逐步刷"请求模型"和 token 数
     for run_id, quiet in (("hook-e", True), ("hook-f", False)):
         node_id, attempt_id = _setup(run_id)
         _install_fake_stream(monkeypatch, [], tool_calls=0)
         asyncio.run(run_agent(
             run_id=run_id, node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
             system_prompt="系统", user_prompt="你好", toolbox=None, max_steps=2, quiet=quiet))
-    assert _step_logs("hook-e") == 0
-    assert _step_logs("hook-f") == 1
+    assert _node_logs("hook-e") == []
+    assert [message.startswith("第 ") for _, message in _node_logs("hook-f")] == [True, False]
+
+
+def test_failed_summarization_does_not_kill_the_node(monkeypatch) -> None:
+    # 摘要调用失败时按原消息继续：压缩只是优化，不该让已经跑了很久的节点作废、从头重来
+    node_id, attempt_id = _setup("hook-h")
+    toolbox = Toolbox(workspace_dir("hook-h"), allow_shell=False)
+    seen: list[list[Message]] = []
+    _install_fake_stream(monkeypatch, seen, tool_calls=5)
+
+    async def broken_summarize(text: str) -> str:
+        raise ProviderError("供应商 503", 503)
+
+    monkeypatch.setattr(agent_loop, "make_summarizer", lambda **kwargs: broken_summarize)
+    result = asyncio.run(run_agent(
+        run_id="hook-h", node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
+        system_prompt="系统", user_prompt="字" * 900, toolbox=toolbox, max_steps=6, quiet=True))
+    assert result.content == "完成"
+    assert "context_compacted" not in _event_types("hook-h")
+    assert seen[-1][1].content == "字" * 900              # 原始提示原样还在，没有留下半截摘要
+    # 之后每一步仍在阈值之上，所以每一步都会再试一次、各记一条告警（每条都是压缩告警）
+    logs = _node_logs("hook-h")
+    assert logs and all(level == "warn" and "压缩" in message for level, message in logs)
+
+
+def test_budget_exhausted_during_summarization_still_stops_the_run(monkeypatch) -> None:
+    # 预算耗尽是例外：那是必须由人处理的事，照常上抛
+    node_id, attempt_id = _setup("hook-i")
+    toolbox = Toolbox(workspace_dir("hook-i"), allow_shell=False)
+    _install_fake_stream(monkeypatch, [], tool_calls=5)
+
+    async def over_budget(text: str) -> str:
+        raise BudgetExceeded("运行 token 预算已耗尽")
+
+    monkeypatch.setattr(agent_loop, "make_summarizer", lambda **kwargs: over_budget)
+    with pytest.raises(BudgetExceeded):
+        asyncio.run(run_agent(
+            run_id="hook-i", node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
+            system_prompt="系统", user_prompt="字" * 900, toolbox=toolbox, max_steps=6, quiet=True))
 
 
 def test_token_extra_rides_on_streamed_tokens(monkeypatch) -> None:
@@ -164,6 +207,7 @@ def test_token_extra_rides_on_streamed_tokens(monkeypatch) -> None:
     monkeypatch.setattr(agent_loop, "emit_token", fake_emit_token)
     monkeypatch.setattr(agent_loop.pool, "adapter_for", lambda model: Adapter())
     monkeypatch.setattr(agent_loop.pool, "slot", slot)
+    monkeypatch.setattr(agent_loop.settings, "stream_tokens", True)    # 不依赖运行环境的开关
 
     asyncio.run(agent_loop._call_stream(
         SimpleNamespace(provider=object()), [Message(role="user", content="你好")], None,

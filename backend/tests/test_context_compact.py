@@ -1,4 +1,4 @@
-"""条件压缩：到阈值才压缩，压到目标以下，系统提示与最近的消息不动。"""
+"""条件压缩：到阈值才压缩，尽量压到目标以下；系统提示不动，最近的消息尽量原样保留。"""
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from app.conversation import compact
 from app.conversation.compact import compact_messages, needs_compaction
@@ -221,3 +222,44 @@ def test_kept_part_stays_valid_when_only_some_groups_are_folded() -> None:
     assert len(seen) == 2
     assert "a2.py" in seen[1] and "2 写好了" in seen[1]         # 并进去的是完整的一组
     assert "a3.py" not in seen[1]
+
+
+def test_empty_summary_is_a_failure_not_a_summary(monkeypatch) -> None:
+    # 思考型模型可能把输出上限耗在推理上、正文为空。拿一句占位话当摘要，滚动摘要里
+    # 此前各块压好的内容就会被这一句替换掉，而且没有任何报错
+    init_db()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "  "}}]})
+
+
+    async def slot(provider):
+        return asyncio.Semaphore(1)
+
+    monkeypatch.setattr(compact.pool, "slot", slot)
+    monkeypatch.setattr(compact.pool, "adapter_for",
+                        lambda model: OpenAIChatAdapter(base_url="http://mock/v1", api_key=""))
+    monkeypatch.setattr(
+        OpenAIChatAdapter, "_client",
+        lambda self: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    summarize = compact.make_summarizer(
+        run_id="compact-empty", attempt_id=0,
+        model=SimpleNamespace(id=None, model_name="m", max_output_tokens=4096,
+                              provider=SimpleNamespace(id=1)))
+
+    with pytest.raises(RuntimeError, match="空正文"):
+        asyncio.run(summarize("旧对话"))
+
+
+def test_maybe_compact_reports_no_compaction_when_there_is_nothing_to_compact() -> None:
+    # 到了阈值、但非系统消息不超过保留条数：没有东西可压。后两个值必须是 -1（没压缩），
+    # 否则调用方会把一条没发生的压缩记进会话日志
+    messages = [Message(role="system", content="系统"),
+                Message(role="user", content="字" * 3000),
+                Message(role="assistant", content="字" * 3000)]
+    model = SimpleNamespace(context_window=8192, max_output_tokens=1024)
+    result, before, after = asyncio.run(compact.maybe_compact(
+        run_id="x", node_id=1, model=model, policy=ContextPolicy(), messages=messages,
+        summarize=_noop))
+    assert result is messages and (before, after) == (-1, -1)

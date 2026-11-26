@@ -5,13 +5,13 @@ import json
 from dataclasses import dataclass
 
 from app.config import settings
-from app.conversation.compact import make_summarizer, maybe_compact
+from app.conversation.compact import make_summarizer, maybe_compact, summary_of
 from app.conversation.policy import DEFAULT_POLICY
 from app.conversation.store import record_compaction
 from app.db.base import session_scope
 from app.db.models import Message as MessageRow
 from app.engine.events import emit, emit_token
-from app.engine.usage import add_attempt_usage, consume_run_budget
+from app.engine.usage import BudgetExceeded, add_attempt_usage, consume_run_budget
 from app.models.pool import ModelInfo, pool
 from app.models.types import GenParams, Message, StreamEvent, Usage
 from app.tools.registry import Toolbox, ToolOutcome
@@ -100,15 +100,25 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
             max_tokens=min(4096, model.max_output_tokens or 4096),
         )
         if len(messages) > 2:
-            # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）
-            compacted, before_tokens, after_tokens = await maybe_compact(
-                run_id=run_id, node_id=node_id, model=model,
-                policy=DEFAULT_POLICY, messages=messages,
-                summarize=make_summarizer(run_id=run_id, attempt_id=attempt_id, model=model))
+            # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）。
+            # 摘要失败时按原消息继续——压缩只是优化，不该让已经跑了很久的节点作废、从头重来。
+            # 预算耗尽是例外：那是要由人处理的事，照常上抛。
+            try:
+                compacted, before_tokens, after_tokens = await maybe_compact(
+                    run_id=run_id, node_id=node_id, model=model,
+                    policy=DEFAULT_POLICY, messages=messages,
+                    summarize=make_summarizer(run_id=run_id, attempt_id=attempt_id, model=model))
+            except BudgetExceeded:
+                raise
+            except Exception as exc:
+                compacted, before_tokens, after_tokens = messages, -1, -1
+                await emit(run_id, "node_log", node_id, {
+                    "level": "warn",
+                    "message": f"上下文压缩失败，按原内容继续：{exc}"[:300]})
             if compacted is not messages:
                 await record_compaction(
                     run_id=run_id, node_id=node_id, attempt_id=attempt_id, scope="agent_loop",
-                    summary=compacted[1].content, before_tokens=before_tokens,
+                    summary=summary_of(compacted) or "", before_tokens=before_tokens,
                     after_tokens=after_tokens)
                 messages = compacted
         if not quiet:
@@ -120,12 +130,14 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
                                             token_extra=token_extra)
         total.input_tokens += usage.input_tokens
         total.output_tokens += usage.output_tokens
+        total.cached_tokens += usage.cached_tokens
         add_attempt_usage(attempt_id, usage, model_id=model.id)
         consume_run_budget(run_id, usage)
-        if usage.total:
+        if usage.total and not quiet:
             await emit(run_id, "node_log", node_id,
                        {"level": "debug",
-                        "message": f"tokens in/out = {usage.input_tokens}/{usage.output_tokens}"})
+                        "message": "tokens in/out = "
+                                  f"{usage.input_tokens}/{usage.output_tokens}"})
         _save_message(node_id, attempt_id, "assistant", message.content,
                       [{"id": c.id, "name": c.name, "args": c.args} for c in message.tool_calls])
         messages.append(message)
