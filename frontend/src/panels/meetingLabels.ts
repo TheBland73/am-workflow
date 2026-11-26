@@ -1,5 +1,7 @@
 /** 会议式前半段的中文名：步骤、确认点类型、决策点状态、结论与判定者。 */
 
+import type { AgentTemplate } from "../api/types";
+
 export const MEETING_PHASE_LABEL: Record<string, string> = {
   // 三种协议共用
   prepare: "会前准备", intake: "接收上游", report: "写出报告",
@@ -19,6 +21,10 @@ export const CHECKPOINT_LABEL: Record<string, string> = {
   roster: "参会名单",
   consensus: "轮次共识",
   escalation: "轮次用尽",
+  // 运行级配置里的工件确认点
+  proposal: "方案确认",
+  review: "评审裁决",
+  requirement: "需求确认",
 };
 
 export const POINT_STATUS_LABEL: Record<string, string> = {
@@ -61,4 +67,35 @@ export function decidedByLabel(value: string | null | undefined): string {
   if (value === "user-delegated") return "人工委托";
   if (value === "program" || value === "proxy") return "程序";
   return value;
+}
+
+/** 确认点的判定者（运行级配置里的 automation.checkpoints）。 */
+export const DECIDER_LABEL: Record<string, string> = {
+  human: "人工",
+  program: "程序",
+  program_fallback: "程序（兜底让步）",
+  proxy: "需求方代理",
+  auto: "自动",
+  model: "模型",
+};
+
+/** 每个确认点允许的判定者，与后端参数校验的规则一致。 */
+export const CHECKPOINT_DECIDERS: Record<string, string[]> = {
+  clarify: ["human", "proxy"],
+  roster: ["human", "auto"],
+  consensus: ["human", "program", "program_fallback"],
+  proposal: ["human", "auto"],
+  review: ["human", "model"],
+  requirement: ["human", "model"],
+};
+
+export function deciderLabel(value: string | null | undefined): string {
+  if (!value) return "—";
+  return DECIDER_LABEL[value] ?? value;
+}
+
+/** 能当讨论参会者的角色：元数据标了适合讨论，或者没标会议角色（用户自建、没填）。 */
+export function canJoinDiscussion(template: AgentTemplate): boolean {
+  const roles = template.meta?.meeting_roles;
+  return roles ? roles.includes("discussion") : true;
 }

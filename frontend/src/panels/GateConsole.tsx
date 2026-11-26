@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, Input, Modal, Select, Tag, message } from "antd";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { AgentTemplate, Gate, Snapshot } from "../api/types";
-import { CHECKPOINT_LABEL, decidedByLabel } from "./meetingLabels";
+import type { Gate, Snapshot } from "../api/types";
+import { CHECKPOINT_LABEL, canJoinDiscussion, decidedByLabel } from "./meetingLabels";
 
 function durationText(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "—";
@@ -14,12 +14,6 @@ function durationText(seconds: number) {
   return h > 0
     ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
     : `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
-/** 能当讨论参会者的角色：元数据标了适合讨论，或者没标会议角色（用户自建、没填）。 */
-function canJoinDiscussion(template: AgentTemplate) {
-  const roles = template.meta?.meeting_roles;
-  return roles ? roles.includes("discussion") : true;
 }
 
 function asRows(value: unknown): Array<Record<string, unknown>> {
