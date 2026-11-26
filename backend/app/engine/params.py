@@ -45,7 +45,7 @@ def _coerce(key: str, spec: dict, raw) -> tuple[object | None, str | None]:
             value = (str(raw).strip().lower() in ("1", "true", "yes", "on")) if isinstance(raw, str) else bool(raw)
         else:
             value = str(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None, f"{title}须是{_KIND_LABEL.get(kind, '文本')}"
     if kind in ("int", "float"):
         if "min" in spec and value < spec["min"]:
@@ -72,9 +72,13 @@ def _cross_rules(values: dict) -> list[str]:
 
 def merge_params(schema: dict, overrides: dict | None) -> tuple[dict, list[str]]:
     """返回 (生效值, 错误列表)。不在参数表里的覆盖项被忽略。"""
+    schema = schema if isinstance(schema, dict) else {}
+    errors: list[str] = []
+    if overrides is not None and not isinstance(overrides, dict):
+        errors.append("参数覆盖须是对象")
+        overrides = {}
     overrides = overrides or {}
     values: dict = {}
-    errors: list[str] = []
     for key, spec in schema.items():
         value, error = _coerce(key, spec, overrides.get(key, spec.get("default")))
         if error:
@@ -86,8 +90,10 @@ def merge_params(schema: dict, overrides: dict | None) -> tuple[dict, list[str]]
 
 def effective_params(definition: dict, config: dict | None) -> dict[str, dict]:
     """每个参数分组的生效值：模板默认值叠加运行级配置。有错误的项回落到默认值。"""
-    config = config or {}
-    overrides = config.get("params") or {}
+    config = config if isinstance(config, dict) else {}
+    overrides = config.get("params")
+    if not isinstance(overrides, dict):
+        overrides = {}
     return {section: merge_params(schema, overrides.get(section))[0]
             for section, schema in (definition.get("params") or {}).items()}
 
@@ -100,31 +106,53 @@ def _deciders_for(definition: dict, checkpoint: str) -> tuple[str, ...] | None:
     """
     if checkpoint in VALID_DECIDERS:
         return VALID_DECIDERS[checkpoint]
+    if checkpoint == "gate_proposal":
+        # 方案确认点在模型模式下不调用裁决模型，直接送评审（详设 §5.3）
+        return ("human", "auto")
     is_gate = any(node.get("type") == "HUMAN_GATE" and node.get("key") == checkpoint
                   for node in definition.get("nodes") or [])
     return ("human", "model") if is_gate else None
 
 
 def validate_run_config(definition: dict, config: dict | None) -> list[str]:
-    config = config or {}
+    config = config if isinstance(config, dict) else {}
     errors: list[str] = []
-    automation = dict(config.get("automation") or {})
+    automation = config.get("automation")
+    if automation is not None and not isinstance(automation, dict):
+        errors.append("自动化配置须是对象")
+        automation = {}
+    automation = automation or {}
+    checkpoints = automation.get("checkpoints")
+    if checkpoints is not None and not isinstance(checkpoints, dict):
+        errors.append("自动化确认点覆盖须是对象")
+        checkpoints = {}
     level = str(automation.get("level") or DEFAULT_LEVEL)
     if level not in (definition.get("automation_levels") or {}):
         errors.append(f"未知的自动化等级：{level}")
-    for checkpoint, decider in dict(automation.get("checkpoints") or {}).items():
+    for checkpoint, decider in (checkpoints or {}).items():
         allowed = _deciders_for(definition, checkpoint)
         if allowed is None:
             errors.append(f"未知的确认点：{checkpoint}")
         elif decider not in allowed:
             errors.append(f"确认点 {checkpoint} 的判定者只能是 {allowed} 之一")
     params = definition.get("params") or {}
-    for section, values in dict(config.get("params") or {}).items():
+    raw_params = config.get("params")
+    if raw_params is not None and not isinstance(raw_params, dict):
+        errors.append("参数配置须是对象")
+        raw_params = {}
+    for section, values in (raw_params or {}).items():
         if section not in params:
             errors.append(f"未知的参数分组：{section}")
             continue
+        if not isinstance(values, dict):
+            errors.append(f"参数分组 {section} 须是对象")
+            continue
         errors += merge_params(params[section], values)[1]
-    return errors + validate_rosters(config.get("rosters"))
+    rosters = config.get("rosters")
+    if rosters is not None and not isinstance(rosters, dict):
+        errors.append("名单配置须是对象")
+        rosters = None
+    return errors + validate_rosters(rosters)
 
 
 def decider_for(run_config: dict | None, definition: dict | None, checkpoint: str,
@@ -154,11 +182,11 @@ def apply_run_config(run_id: str, definition: dict, config: dict | None,
             if only_pending and node.status not in ("pending", "ready"):
                 continue
             protocol = (node.config_json or {}).get("protocol")
-            if protocol not in params:
+            if not isinstance(protocol, str) or protocol not in params:
                 continue
             config_json = dict(node.config_json or {})
             config_json["params"] = params[protocol]
-            if protocol in ("review", "confirm"):
+            if protocol in ("review", "confirm") and "rounds_max" in params[protocol]:
                 config_json["max_rounds"] = params[protocol]["rounds_max"]
             node.config_json = config_json
     return errors
@@ -186,12 +214,19 @@ _ROSTER_GROUPS = ("participants", "reviewers")
 
 def validate_rosters(rosters: dict | None) -> list[str]:
     """名单配置的结构检查：每一组要么点名具体角色，要么给固定人数，要么不写。"""
+    if rosters is None:
+        return []
+    if not isinstance(rosters, dict):
+        return ["名单配置须是对象"]
     errors: list[str] = []
-    for group, item in dict(rosters or {}).items():
+    for group, item in rosters.items():
         if group not in _ROSTER_GROUPS:
             errors.append(f"未知的名单分组：{group}")
             continue
-        item = item if isinstance(item, dict) else {}
+        if not isinstance(item, dict):
+            label = "参会者" if group == "participants" else "评审者"
+            errors.append(f"{label}的配置须是对象")
+            continue
         label = "参会者" if group == "participants" else "评审者"
         keys, count = item.get("role_keys"), item.get("count")
         if keys is not None and count is not None:
@@ -199,6 +234,8 @@ def validate_rosters(rosters: dict | None) -> list[str]:
         if keys is not None and not (isinstance(keys, list) and keys
                                      and all(isinstance(key, str) and key for key in keys)):
             errors.append(f"{label}的具体角色须是非空的字符串数组")
+        elif isinstance(keys, list) and len(keys) > 99:
+            errors.append(f"{label}的具体角色不能超过 99 个")
         if count is not None and (isinstance(count, bool) or not isinstance(count, int)
                                   or not 1 <= count <= 99):
             errors.append(f"{label}的固定人数须是 1 到 99 的整数")

@@ -37,21 +37,29 @@ def validate_context_policy(policy: ContextPolicy) -> list[str]:
     return issues
 
 
-_policy_cache: dict[str, ContextPolicy] = {}
+_policy_cache: dict[str, tuple[str, ContextPolicy]] = {}
 
 
 def policy_for_run(run_id: str) -> ContextPolicy:
-    """运行级配置里的 context 参数 → 策略。每个运行只读一次库，之后用缓存。"""
-    cached = _policy_cache.get(run_id)
-    if cached is None:
-        from app.engine.params import definition_of, effective_params, run_of
+    """运行级配置里的 context 参数 → 策略。
 
-        config = run_of(run_id)["config"]
-        cached = policy_from_config(effective_params(definition_of(run_id), config).get("context"))
-        _policy_cache[run_id] = cached
-    return cached
+    每次读一遍运行配置（短事务），用它的规范化文本判断缓存是否还新鲜：
+    配置在别的进程里被改过也能发现；没变时省掉模板定义与参数合并的查询。
+    """
+    import json
+
+    from app.engine.params import definition_of, effective_params, run_of
+
+    config = run_of(run_id)["config"]
+    signature = json.dumps(config, ensure_ascii=False, sort_keys=True, default=str)
+    cached = _policy_cache.get(run_id)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    policy = policy_from_config(effective_params(definition_of(run_id), config).get("context"))
+    _policy_cache[run_id] = (signature, policy)
+    return policy
 
 
 def reset_policy_cache(run_id: str) -> None:
-    """运行级配置改了之后调用。"""
+    """运行级配置改了之后调用（缓存本身也会按配置内容失效，这里只是及时释放）。"""
     _policy_cache.pop(run_id, None)

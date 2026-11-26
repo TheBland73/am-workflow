@@ -49,6 +49,13 @@ def builtin_fingerprint(fields: dict) -> str:
     return hashlib.sha256(_canonical_json(fields).encode("utf-8")).hexdigest()
 
 
+def legacy_template_fingerprint(row: AgentTemplate) -> str:
+    """旧版算法（六个字段、不含 meta_json）的指纹，用来识别升级前的未修改行。"""
+    fields = template_fields(row)
+    fields.pop("meta_json", None)
+    return builtin_fingerprint(fields)
+
+
 def role_fields(role: dict) -> dict:
     """内置角色定义 → 落库字段；默认值与建新行时的取值保持一致。"""
     return {
@@ -106,6 +113,11 @@ def _sync_builtin_row(row: AgentTemplate, role: dict) -> None:
         _refresh_builtin_fields(row, fields)
         row.builtin_hash = target
         return
+    if row.builtin_hash == legacy_template_fingerprint(row):
+        # 旧版算法写下、字段没改过：按未修改处理，升级到七字段指纹
+        _refresh_builtin_fields(row, fields)
+        row.builtin_hash = target
+        return
     if template_fingerprint(row) != row.builtin_hash:
         return
     if row.builtin_hash != target:
@@ -132,12 +144,13 @@ def seed_defaults() -> None:
             retired = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
             if retired is None:
                 continue
-            unmodified = (retired.builtin_hash
-                          and template_fingerprint(retired) == retired.builtin_hash)
-            if unmodified:
-                s.delete(retired)                # 没改过：清理
+            unmodified = bool(retired.builtin_hash) and (
+                template_fingerprint(retired) == retired.builtin_hash
+                or legacy_template_fingerprint(retired) == retired.builtin_hash)
+            if unmodified and retired.default_model_id is None:
+                s.delete(retired)                # 没改过、也没绑模型：清理
                 continue
-            retired.builtin_hash = None          # 改过，或旧库没有指纹：保留为自定义角色，之后不再触碰
+            retired.builtin_hash = None          # 改过、绑过模型，或旧库没有指纹：保留为自定义角色
         s.flush()
         existing = {r.role_key: r for r in s.query(AgentTemplate).all()}
         for role in ROLES:

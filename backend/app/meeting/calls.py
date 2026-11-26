@@ -16,7 +16,7 @@ from typing import Callable
 from app.artifacts.store import strip_outer_fence
 from app.conversation.builder import Segment
 from app.conversation.compact import compact_messages
-from app.conversation.policy import policy_for_run
+from app.conversation.policy import DEFAULT_POLICY, policy_for_run
 from app.conversation.store import record_compaction
 from app.engine.agent_loop import _extract_json, run_agent
 from app.engine.events import emit
@@ -99,7 +99,10 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
     压缩只动追加区：冻结区（章程、人设、账本快照）是前缀缓存命中的部分，本轮内逐字节不变。
     摘要失败时按原视图继续——压缩只是优化，不该让一次发言作废；预算耗尽是例外。
     """
-    policy = policy_for_run(mtg.run_id)
+    try:
+        policy = policy_for_run(mtg.run_id)
+    except Exception:
+        policy = DEFAULT_POLICY
     fixed = estimate_tokens(BASE_SYSTEM_PROMPT) + sum(
         estimate_tokens(s.text) for s in segments if s.kind == "frozen")
     append = [s for s in segments if s.kind == "append"]

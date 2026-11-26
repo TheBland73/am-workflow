@@ -7,14 +7,27 @@
 """
 from __future__ import annotations
 
+import os
 import re
+import threading
 from pathlib import Path
 
 from app.config import settings
 from app.models.budget import estimate_tokens, truncate_to_tokens
 
 _BAD_CHARS = re.compile(r'[\\/:*?"<>|\r\n]')
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TRUNCATED_NOTE = "\n\n（仅提供了部分材料：背景材料超出预算，以上只是前面的一部分）"
+_NAME_MAX_BYTES = 200         # 文件名上限 255 字节，留出序号前缀与扩展名
+
+_locks_guard = threading.Lock()
+_locks: dict[str, threading.Lock] = {}
+
+
+def _lock(run_id: str) -> threading.Lock:
+    """同一运行的材料读写串行化：总量检查与序号分配要在同一个临界区里完成。"""
+    with _locks_guard:
+        return _locks.setdefault(run_id, threading.Lock())
 
 
 def _dir(run_id: str) -> Path:
@@ -35,14 +48,34 @@ def _entries(run_id: str) -> list[tuple[int, str, Path]]:
 def _name_error(name: str) -> str | None:
     if not 1 <= len(name) <= 80:
         return "材料名称长度须是 1 到 80 个字符"
+    try:
+        encoded = name.encode("utf-8")
+    except UnicodeEncodeError:
+        return "材料名称含有无法保存的字符"
+    if len(encoded) > _NAME_MAX_BYTES:
+        return "材料名称过长"
+    if _CONTROL.search(name):
+        return "材料名称不能包含控制字符"
     if _BAD_CHARS.search(name):
         return f'材料名称不能包含 \\ / : * ? " < > | 或换行：{name}'
     return None
 
 
+def free_material_name(used: set[str], start: int = 1) -> str:
+    """第一个未被占用的自动名称。"""
+    index = max(1, start)
+    while f"材料{index}" in used:
+        index += 1
+    return f"材料{index}"
+
+
 def check_materials(items: list[tuple[str, str]]) -> list[str]:
-    """新建运行时的一次性检查：名称合法、总量不超限。返回错误列表。"""
+    """新建运行时的一次性检查：名称合法、不重名、总量不超限。返回错误列表。"""
     errors = [error for error in (_name_error(name) for name, _ in items) if error]
+    names = [name for name, _ in items]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        errors.append("材料名称重复：" + "、".join(duplicates))
     total = sum(len(content) for _, content in items)
     if total > settings.materials_max_chars:
         errors.append(f"背景材料总量不能超过 {settings.materials_max_chars} 字，当前 {total} 字")
@@ -59,21 +92,33 @@ def total_chars(run_id: str) -> int:
 
 
 def save_material(run_id: str, name: str, content: str) -> dict:
-    """写入一份材料，重名则覆盖。名称不合法或总量超限时抛 ValueError。"""
-    error = _name_error(name)
-    if error:
-        raise ValueError(error)
-    entries = _entries(run_id)
-    target = next((path for _, item_name, path in entries if item_name == name), None)
-    replaced = len(target.read_text(encoding="utf-8")) if target else 0
-    if total_chars(run_id) - replaced + len(content) > settings.materials_max_chars:
-        raise ValueError(f"背景材料总量不能超过 {settings.materials_max_chars} 字")
-    _dir(run_id).mkdir(parents=True, exist_ok=True)
-    if target is None:
-        seq = max((seq for seq, _, _ in entries), default=0) + 1
-        target = _dir(run_id) / f"{seq:03d}-{name}.md"
-    target.write_text(content, encoding="utf-8")
-    return {"name": name, "chars": len(content)}
+    """写入一份材料；名称为空时自动编号，重名则覆盖。名称不合法或总量超限时抛 ValueError。"""
+    name = (name or "").strip()
+    with _lock(run_id):
+        entries = _entries(run_id)
+        if not name:
+            name = free_material_name({item_name for _, item_name, _ in entries},
+                                      len(entries) + 1)
+        error = _name_error(name)
+        if error:
+            raise ValueError(error)
+        try:
+            content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("材料内容含有无法保存的字符") from exc
+        target = next((path for _, item_name, path in entries if item_name == name), None)
+        replaced = len(target.read_text(encoding="utf-8")) if target else 0
+        if total_chars(run_id) - replaced + len(content) > settings.materials_max_chars:
+            raise ValueError(f"背景材料总量不能超过 {settings.materials_max_chars} 字")
+        _dir(run_id).mkdir(parents=True, exist_ok=True)
+        if target is None:
+            seq = max((seq for seq, _, _ in entries), default=0) + 1
+            target = _dir(run_id) / f"{seq:03d}-{name}.md"
+        # 先写临时文件再原子替换：写到一半失败不会毁掉同名旧材料
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, target)
+        return {"name": name, "chars": len(content)}
 
 
 def read_material(run_id: str, name: str) -> str:

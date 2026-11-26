@@ -39,9 +39,9 @@ def update_template(template_id: int, payload: TemplatePatch) -> dict:
         row = s.get(AgentTemplate, template_id)
         if row is None:
             raise HTTPException(404, "角色模板不存在")
-        data = payload.model_dump(exclude_unset=True)
+        data = payload.model_dump(exclude_unset=True, exclude_none=True)
         meta = data.pop("meta", None)
-        if data.get("default_model_id"):
+        if "default_model_id" in data:
             if s.get(ModelEntry, data["default_model_id"]) is None:
                 raise HTTPException(400, "指定的模型不存在")
         if meta is not None:
@@ -56,7 +56,8 @@ def create_template(payload: TemplateCreate) -> dict:
     with session_scope() as s:
         if s.query(AgentTemplate).filter(AgentTemplate.role_key == payload.role_key).first():
             raise HTTPException(400, f"角色键已存在：{payload.role_key}")
-        if payload.default_model_id and s.get(ModelEntry, payload.default_model_id) is None:
+        if payload.default_model_id is not None and s.get(
+                ModelEntry, payload.default_model_id) is None:
             raise HTTPException(400, "指定的模型不存在")
         row = AgentTemplate(
             role_key=payload.role_key, name=payload.name, system_prompt=payload.system_prompt,

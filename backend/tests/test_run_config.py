@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
@@ -191,3 +193,108 @@ def test_doc_agent_revises_previous_version_when_feedback_is_given(monkeypatch) 
     assert "上一版" in seen[1] and "旧的一版" in seen[1] and "修订" in seen[1]
     assert parse_front_matter(read_artifact(revise_run, "requirement"))[1].strip() == REVISED.strip()
     assert result["artifact"]["version"] == 2
+
+
+def test_bad_config_shapes_are_400_not_500(monkeypatch) -> None:
+    cases = [
+        {"automation": "L2"},
+        {"automation": {"checkpoints": "bad"}},
+        {"params": "bad"},
+        {"params": {"discussion": ["x"]}},
+        {"rosters": ["x"]},
+        {"rosters": {"participants": "architect"}},
+    ]
+    with _client(monkeypatch) as client:
+        statuses = [client.post("/api/runs", json={"idea": IDEA, "config": case}).status_code
+                    for case in cases]
+    assert statuses == [400] * len(cases)
+
+
+def test_material_name_and_duplicates_are_rejected_without_creating_a_run(monkeypatch) -> None:
+    with _client(monkeypatch) as client:
+        before = len(client.get("/api/runs").json()["items"])
+        nul = client.post("/api/runs", json={
+            "idea": IDEA, "materials": [{"name": "a\u0000b", "content": "x"}]})
+        duplicate = client.post("/api/runs", json={
+            "idea": IDEA, "materials": [{"name": "材料1", "content": "A"},
+                                        {"name": "", "content": "B"},
+                                        {"name": "材料1", "content": "C"}]})
+        after = len(client.get("/api/runs").json()["items"])
+    assert nul.status_code == 400 and duplicate.status_code == 400
+    assert after == before                                   # 校验失败不建运行
+
+
+def test_auto_material_name_does_not_overwrite(monkeypatch) -> None:
+    with _client(monkeypatch) as client:
+        run_id = _create(client)["run"]["id"]
+        first = client.post(f"/api/runs/{run_id}/materials",
+                            json={"name": "材料2", "content": "A"})
+        auto = client.post(f"/api/runs/{run_id}/materials", json={"content": "B"})
+        listed = client.get(f"/api/runs/{run_id}/materials").json()["items"]
+    assert first.status_code == 201 and auto.status_code == 201
+    assert auto.json()["name"] == "材料3"
+    assert [item["name"] for item in listed] == ["材料2", "材料3"]
+
+
+def test_patch_config_keeps_other_groups(monkeypatch) -> None:
+    with _client(monkeypatch) as client:
+        run_id = _create(client, config={"params": {
+            "discussion": {"rounds_max": 6},
+            "context": {"compact_at": 0.6, "compact_to": 0.3}}})["run"]["id"]
+        assert policy_for_run(run_id).compact_at == 0.6
+        patched = client.patch(f"/api/runs/{run_id}/config",
+                               json={"params": {"discussion": {"rounds_max": 4}}})
+        shown = client.get(f"/api/runs/{run_id}/config").json()["config"]
+        assert policy_for_run(run_id).compact_at == 0.6
+    assert patched.status_code == 200
+    assert shown["params"]["context"]["compact_at"] == 0.6
+    assert shown["params"]["discussion"]["rounds_max"] == 4
+
+
+def test_only_pending_skips_started_meeting_nodes(monkeypatch) -> None:
+    with _client(monkeypatch) as client:
+        run_id = _create(client)["run"]["id"]
+        with session_scope() as s:
+            s.query(Node).filter(Node.run_id == run_id,
+                                 Node.node_key == "discuss").one().status = "done"
+        patched = client.patch(f"/api/runs/{run_id}/config",
+                               json={"params": {"discussion": {"rounds_max": 4}}})
+    assert patched.status_code == 200
+    assert _node(run_id, "discuss").config_json["params"]["rounds_max"] == 20   # 已开始：沿用旧参数
+
+
+def test_missing_run_is_404(monkeypatch) -> None:
+    with _client(monkeypatch) as client:
+        assert client.get("/api/runs/no-such-run/config").status_code == 404
+        assert client.get("/api/runs/no-such-run/materials").status_code == 404
+
+
+def test_too_large_previous_version_fails_instead_of_truncating(monkeypatch) -> None:
+    run_id = _template_run()
+    write_artifact(run_id, "requirement", "字" * 20_000, created_by="test", inputs=[])
+    _install_doc_agent(monkeypatch, [])
+    ctx = _doc_node(run_id)
+    ctx.feedback = "补充失败时的提示"
+    with pytest.raises(runners.NodeFailure) as caught:
+        asyncio.run(runners.execute_node(ctx))
+    assert caught.value.fatal is True
+    assert "上一版太大" in str(caught.value)
+
+
+def test_create_failure_does_not_leave_a_created_run(monkeypatch) -> None:
+    """建运行后的任何一步失败，都不能留下会被恢复流程拉起的 created 运行。"""
+    init_db()
+    seed_defaults()
+    monkeypatch.setattr(orchestrator, "start", lambda run_id: None)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("磁盘满了")
+
+    monkeypatch.setattr("app.api.runs.save_material", broken)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/api/runs", json={
+            "idea": IDEA, "materials": [{"name": "片段", "content": "内容"}]})
+    assert response.status_code == 500
+    with session_scope() as s:
+        failed = s.query(Run).filter(Run.status == "failed").all()
+    assert any((run.error or "").startswith("创建运行失败") for run in failed)

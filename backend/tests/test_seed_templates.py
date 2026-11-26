@@ -229,3 +229,77 @@ def test_new_roles_carry_meeting_metadata() -> None:
     assert architect.meta_json["meeting_roles"] == ["discussion", "review"]
     assert architect.meta_json["description"]
     assert _row("judge").meta_json["tags"] == ["裁决"]
+
+
+def test_legacy_six_field_hash_is_upgraded() -> None:
+    """升级前的指纹是六个字段；未改过的旧行要升级到七字段并拿到新元数据。"""
+    role = _role("requirement")
+    seed_defaults()
+    with session_scope() as s:
+        row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "requirement").one()
+        row.system_prompt = "旧版需求提示词"
+        row.meta_json = {}
+        fields = template_fields(row)
+        fields.pop("meta_json")
+        row.builtin_hash = builtin_fingerprint(fields)
+
+    seed_defaults()
+
+    row = _row("requirement")
+    assert row.system_prompt == role["system_prompt"]
+    assert row.meta_json == role["meta"]
+
+
+def test_retired_role_with_legacy_hash_is_removed() -> None:
+    with session_scope() as s:
+        s.add(AgentTemplate(
+            role_key="discuss_con", name="讨论者·质疑", system_prompt="旧内置提示词",
+            tools_json=[], memory_scope="agent", max_steps=3, stop_condition=[], builtin_hash="x"))
+        s.flush()
+        row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "discuss_con").one()
+        fields = template_fields(row)
+        fields.pop("meta_json")
+        row.builtin_hash = builtin_fingerprint(fields)
+
+    seed_defaults()
+
+    with session_scope() as s:
+        assert s.query(AgentTemplate).filter(AgentTemplate.role_key == "discuss_con").count() == 0
+
+
+def test_retired_role_with_model_binding_is_kept() -> None:
+    """退役角色即使没改过提示词，只要绑过模型也保留为自定义角色。"""
+    with session_scope() as s:
+        provider = ProviderConfig(
+            name="retired-binding-test", protocol="openai_chat",
+            base_url="http://127.0.0.1:9/v1")
+        s.add(provider)
+        s.flush()
+        model = ModelEntry(provider_id=provider.id, model_name="retired-binding-model")
+        s.add(model)
+        s.flush()
+        model_id = model.id
+        s.add(AgentTemplate(
+            role_key="discuss_pro", name="讨论者·主张", system_prompt="旧内置提示词",
+            tools_json=[], memory_scope="agent", max_steps=3, stop_condition=[],
+            builtin_hash="x", default_model_id=model_id))
+        s.flush()
+        row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "discuss_pro").one()
+        fields = template_fields(row)
+        fields.pop("meta_json")
+        row.builtin_hash = builtin_fingerprint(fields)
+
+    try:
+        seed_defaults()
+        row = _row("discuss_pro")
+        assert row.default_model_id == model_id
+        assert row.builtin_hash is None
+    finally:
+        with session_scope() as s:
+            provider = (
+                s.query(ProviderConfig)
+                .filter(ProviderConfig.name == "retired-binding-test")
+                .one_or_none()
+            )
+            if provider is not None:
+                s.delete(provider)

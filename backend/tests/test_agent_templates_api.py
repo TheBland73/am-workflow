@@ -32,10 +32,26 @@ def test_create_and_delete_custom_role(monkeypatch) -> None:
         patched = client.patch(f"/api/agent-templates/{body['id']}",
                                json={"name": "数据与算法", "meta": {"tags": ["数据", "算法"]}})
         assert patched.json()["name"] == "数据与算法"
+        assert patched.json()["meta"]["tags"] == ["数据", "算法"]
         assert client.delete(f"/api/agent-templates/{body['id']}").status_code == 200
         with session_scope() as s:
             assert s.query(AgentTemplate).filter(
                 AgentTemplate.role_key == "data_expert").count() == 0
+
+
+def test_null_name_and_bad_model_id_are_rejected_without_500(monkeypatch) -> None:
+    with _client(monkeypatch) as client:
+        rows = client.get("/api/agent-templates").json()["items"]
+        chair = next(r for r in rows if r["role_key"] == "review_chair")
+        null_name = client.patch(f"/api/agent-templates/{chair['id']}", json={"name": None})
+        bad_model = client.patch(f"/api/agent-templates/{chair['id']}",
+                                 json={"default_model_id": 0})
+        created = client.post("/api/agent-templates", json={
+            "role_key": "low_model_role", "name": "x", "system_prompt": "x",
+            "default_model_id": 0})
+    assert null_name.status_code == 200 and null_name.json()["name"] == chair["name"]
+    assert bad_model.status_code == 422
+    assert created.status_code == 422
 
 
 def test_builtin_role_cannot_be_deleted(monkeypatch) -> None:

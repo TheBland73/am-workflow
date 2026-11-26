@@ -62,7 +62,7 @@ class TemplatePatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     system_prompt: str | None = None
     tools_json: list[str] | None = None
-    default_model_id: int | None = None
+    default_model_id: int | None = Field(default=None, ge=1)
     max_steps: int | None = None
     stop_condition: list[str] | None = None
     meta: dict | None = None
@@ -75,7 +75,7 @@ class TemplateCreate(BaseModel):
     tools_json: list[str] = Field(default_factory=list)
     memory_scope: str = "agent"
     max_steps: int = Field(default=3, ge=1, le=64)
-    default_model_id: int | None = None
+    default_model_id: int | None = Field(default=None, ge=1)
     meta: dict = Field(default_factory=dict)
 
 
@@ -89,7 +89,7 @@ class RunIn(BaseModel):
     template_key: str = "sdlc_v1"
     budget_tokens: int | None = None
     config: dict | None = None                        # 运行级配置：automation / params / rosters
-    materials: list[MaterialIn] = Field(default_factory=list)
+    materials: list[MaterialIn] = Field(default_factory=list, max_length=50)
 
 
 class RunConfigPatch(BaseModel):

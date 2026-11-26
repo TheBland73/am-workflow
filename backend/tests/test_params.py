@@ -1,7 +1,8 @@
 """参数表：硬限校验、默认值合并、跨字段规则；判定者的解析。"""
 from __future__ import annotations
 
-from app.engine.params import decider_for, effective_params, merge_params, validate_run_config
+from app.engine.params import (decider_for, effective_params, merge_params, validate_rosters,
+                               validate_run_config)
 
 SCHEMA = {
     "rounds_max": {"type": "int", "default": 20, "min": 1, "max": 99, "title": "讨论轮次上限"},
@@ -68,3 +69,25 @@ def test_gates_of_the_template_can_opt_into_model_judging() -> None:
     assert validate_run_config(definition, {"automation": {"checkpoints": {"gate_design": "model"}}}) == []
     assert validate_run_config(definition, {"automation": {"checkpoints": {"gate_design": "auto"}}})
     assert validate_run_config(definition, {"automation": {"checkpoints": {"gate_tasks": "model"}}})
+
+
+def test_bad_config_shapes_are_reported_as_errors() -> None:
+    assert validate_run_config(DEFINITION, {"automation": "L2"})
+    assert validate_run_config(DEFINITION, {"automation": {"checkpoints": "bad"}})
+    assert validate_run_config(DEFINITION, {"params": "bad"})
+    assert validate_run_config(DEFINITION, {"rosters": ["x"]})
+
+
+def test_roster_groups_must_be_objects_and_respect_the_hard_limit() -> None:
+    assert validate_rosters({"participants": "architect"})
+    assert validate_rosters({"participants": {"role_keys": [f"role_{index}" for index in range(100)]}})
+    assert validate_rosters({"reviewers": {"count": True}})
+
+
+def test_proposal_gate_does_not_accept_the_judge_model() -> None:
+    """方案确认点在模型模式下直接送评审，不调用裁决模型（详设 §5.3）。"""
+    definition = {**DEFINITION, "nodes": [{"key": "gate_proposal", "type": "HUMAN_GATE"}]}
+    assert validate_run_config(
+        definition, {"automation": {"checkpoints": {"gate_proposal": "model"}}})
+    assert validate_run_config(
+        definition, {"automation": {"checkpoints": {"gate_proposal": "auto"}}}) == []

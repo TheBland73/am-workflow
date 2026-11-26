@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -22,7 +23,7 @@ from app.db.models import (
 from app.engine.events import bus, emit, load_events, sse_format
 from app.engine.gates import GateError, gate_payload
 from app.engine.materials import (
-    check_materials, list_materials, read_material, save_material, total_chars,
+    check_materials, free_material_name, list_materials, read_material, save_material, total_chars,
 )
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config, run_of, validate_run_config
@@ -43,15 +44,39 @@ def _run_or_404(run_id: str) -> dict:
 
 
 def _roster_errors(config: dict) -> list[str]:
-    """名单里点名的角色必须存在。"""
-    wanted = [key for group in (config.get("rosters") or {}).values() if isinstance(group, dict)
-              for key in (group.get("role_keys") or [])]
+    """名单里点名的角色必须存在。结构不合法时交给 validate_rosters，这里不再二次崩溃。"""
+    rosters = config.get("rosters")
+    if not isinstance(rosters, dict):
+        return []
+    wanted = [key for group in rosters.values() if isinstance(group, dict)
+              for key in (group.get("role_keys") if isinstance(group.get("role_keys"), list) else [])
+              if isinstance(key, str) and key]
     if not wanted:
         return []
     with session_scope() as s:
         known = {row[0] for row in s.query(AgentTemplate.role_key)
                  .filter(AgentTemplate.role_key.in_(wanted)).all()}
     return [f"角色模板不存在：{key}" for key in wanted if key not in known]
+
+
+def _merge_run_config(base: dict, patch: dict) -> dict:
+    """按分组浅合并一层：只改 params.discussion 时，params.context 等其他分组保持不变。"""
+    merged = dict(base)
+    for key in ("automation", "params", "rosters"):
+        if key not in patch:
+            continue
+        value = patch[key]
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            section = dict(current)
+            for name, item in value.items():
+                section[name] = ({**section[name], **item}
+                                 if isinstance(section.get(name), dict) and isinstance(item, dict)
+                                 else item)
+            merged[key] = section
+        else:
+            merged[key] = value
+    return merged
 
 
 def _iso(value) -> str | None:
@@ -75,9 +100,17 @@ async def create_run(payload: RunIn) -> dict:
         definition = workflow_definition(payload.template_key)
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(400, str(exc)) from exc
+    if payload.config is not None and not isinstance(payload.config, dict):
+        raise HTTPException(400, "运行级配置须是对象")
     config = payload.config or {}
-    materials = [(item.name.strip() or f"材料{index + 1}", item.content)
-                 for index, item in enumerate(payload.materials)]
+    used: set[str] = set()
+    materials: list[tuple[str, str]] = []
+    for index, item in enumerate(payload.materials):
+        name = item.name.strip()
+        if not name:
+            name = free_material_name(used, index + 1)
+        used.add(name)
+        materials.append((name, item.content))
     errors = (validate_run_config(definition, config) + _roster_errors(config)
               + check_materials(materials))
     if errors:
@@ -90,17 +123,31 @@ async def create_run(payload: RunIn) -> dict:
         s.add(Run(id=run_id, workflow_id=wf.id, status="created", idea_text=payload.idea,
                   budget_tokens=payload.budget_tokens or settings.default_budget_tokens,
                   config_json=config))
-    instantiate_nodes(run_id, definition)
-    apply_run_config(run_id, definition, config)       # 生效参数写进会议节点
-    for name, content in materials:
-        save_material(run_id, name, content)
-    record = write_artifact(run_id, "idea", payload.idea, created_by="user",
-                            inputs=[], status="approved")
-    await emit(run_id, "run_created", None,
-               {"run_id": run_id, "template": payload.template_key,
-                "idea": payload.idea[:500]})
-    await emit(run_id, "artifact_written", None, record)
-    orchestrator.start(run_id)
+    try:
+        instantiate_nodes(run_id, definition)
+        apply_run_config(run_id, definition, config)   # 生效参数写进会议节点
+        for name, content in materials:
+            save_material(run_id, name, content)
+        record = write_artifact(run_id, "idea", payload.idea, created_by="user",
+                                inputs=[], status="approved")
+        await emit(run_id, "run_created", None,
+                   {"run_id": run_id, "template": payload.template_key,
+                    "idea": payload.idea[:500]})
+        await emit(run_id, "artifact_written", None, record)
+        orchestrator.start(run_id)
+    except Exception as exc:
+        # 建运行后的任何一步失败都不能留下一个可被恢复流程拉起的 created 运行
+        with session_scope() as s:
+            row = s.get(Run, run_id)
+            if row is not None:
+                row.status = "failed"
+                row.error = f"创建运行失败：{exc}"[:2000]
+        shutil.rmtree(settings.runs_dir / run_id, ignore_errors=True)
+        try:
+            await emit(run_id, "run_error", None, {"error": f"创建运行失败：{exc}"[:500]})
+        except Exception:
+            pass
+        raise
     return get_run(run_id)
 
 
@@ -573,7 +620,7 @@ def patch_run_config(run_id: str, payload: RunConfigPatch) -> dict:
     run = _run_or_404(run_id)
     if run["status"] not in EDITABLE_RUN_STATUSES:
         raise HTTPException(400, "运行级配置只能在运行开始前或有确认点挂起时修改")
-    config = {**run["config"], **payload.model_dump(exclude_unset=True)}
+    config = _merge_run_config(run["config"], payload.model_dump(exclude_unset=True))
     definition = workflow_definition(run_of(run_id)["template_key"])
     errors = validate_run_config(definition, config) + _roster_errors(config)
     if errors:
@@ -595,9 +642,8 @@ def list_run_materials(run_id: str) -> dict:
 @router.post("/runs/{run_id}/materials", status_code=201)
 def add_run_material(run_id: str, payload: MaterialIn) -> dict:
     _run_or_404(run_id)
-    name = payload.name.strip() or f"材料{len(list_materials(run_id)) + 1}"
     try:
-        return save_material(run_id, name, payload.content)
+        return save_material(run_id, payload.name.strip(), payload.content)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
