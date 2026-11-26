@@ -35,3 +35,23 @@ def validate_context_policy(policy: ContextPolicy) -> list[str]:
     if policy.keep_recent < 2:
         issues.append("压缩时保留的最近消息数至少为 2")
     return issues
+
+
+_policy_cache: dict[str, ContextPolicy] = {}
+
+
+def policy_for_run(run_id: str) -> ContextPolicy:
+    """运行级配置里的 context 参数 → 策略。每个运行只读一次库，之后用缓存。"""
+    cached = _policy_cache.get(run_id)
+    if cached is None:
+        from app.engine.params import definition_of, effective_params, run_of
+
+        config = run_of(run_id)["config"]
+        cached = policy_from_config(effective_params(definition_of(run_id), config).get("context"))
+        _policy_cache[run_id] = cached
+    return cached
+
+
+def reset_policy_cache(run_id: str) -> None:
+    """运行级配置改了之后调用。"""
+    _policy_cache.pop(run_id, None)

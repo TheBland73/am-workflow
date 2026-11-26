@@ -79,10 +79,23 @@ class TemplateCreate(BaseModel):
     meta: dict = Field(default_factory=dict)
 
 
+class MaterialIn(BaseModel):
+    name: str = Field(default="", max_length=80)      # 留空时自动编号
+    content: str = Field(min_length=1, max_length=200_000)
+
+
 class RunIn(BaseModel):
     idea: str = Field(min_length=1, max_length=20000)
     template_key: str = "sdlc_v1"
     budget_tokens: int | None = None
+    config: dict | None = None                        # 运行级配置：automation / params / rosters
+    materials: list[MaterialIn] = Field(default_factory=list)
+
+
+class RunConfigPatch(BaseModel):
+    automation: dict | None = None
+    params: dict | None = None
+    rosters: dict | None = None
 
 
 class ArtifactPatch(BaseModel):

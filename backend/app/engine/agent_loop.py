@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from app.config import settings
 from app.conversation.compact import make_summarizer, maybe_compact, summary_of
-from app.conversation.policy import DEFAULT_POLICY
+from app.conversation.policy import policy_for_run
 from app.conversation.store import record_compaction
 from app.db.base import session_scope
 from app.db.models import Message as MessageRow
@@ -107,7 +107,7 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
             try:
                 compacted, before_tokens, after_tokens = await maybe_compact(
                     run_id=run_id, node_id=node_id, model=model,
-                    policy=DEFAULT_POLICY, messages=messages,
+                    policy=policy_for_run(run_id), messages=messages,
                     summarize=make_summarizer(run_id=run_id, attempt_id=attempt_id, model=model))
             except BudgetExceeded:
                 raise

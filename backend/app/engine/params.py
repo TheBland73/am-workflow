@@ -124,7 +124,7 @@ def validate_run_config(definition: dict, config: dict | None) -> list[str]:
             errors.append(f"未知的参数分组：{section}")
             continue
         errors += merge_params(params[section], values)[1]
-    return errors
+    return errors + validate_rosters(config.get("rosters"))
 
 
 def decider_for(run_config: dict | None, definition: dict | None, checkpoint: str,
@@ -179,3 +179,27 @@ def definition_of(run_id: str) -> dict:
     """运行的模板定义：自动化等级预设与判据文本从这里读。"""
     template_key = run_of(run_id)["template_key"]
     return workflow_definition(template_key) if template_key else {}
+
+
+_ROSTER_GROUPS = ("participants", "reviewers")
+
+
+def validate_rosters(rosters: dict | None) -> list[str]:
+    """名单配置的结构检查：每一组要么点名具体角色，要么给固定人数，要么不写。"""
+    errors: list[str] = []
+    for group, item in dict(rosters or {}).items():
+        if group not in _ROSTER_GROUPS:
+            errors.append(f"未知的名单分组：{group}")
+            continue
+        item = item if isinstance(item, dict) else {}
+        label = "参会者" if group == "participants" else "评审者"
+        keys, count = item.get("role_keys"), item.get("count")
+        if keys is not None and count is not None:
+            errors.append(f"{label}只能指定具体角色或固定人数之一")
+        if keys is not None and not (isinstance(keys, list) and keys
+                                     and all(isinstance(key, str) and key for key in keys)):
+            errors.append(f"{label}的具体角色须是非空的字符串数组")
+        if count is not None and (isinstance(count, bool) or not isinstance(count, int)
+                                  or not 1 <= count <= 99):
+            errors.append(f"{label}的固定人数须是 1 到 99 的整数")
+    return errors

@@ -48,6 +48,9 @@ class Settings:
         self.secret_key_env = os.environ.get("AM_SECRET_KEY")
         # 离线演示用本地 OpenAI 兼容 mock（不是产品内置供应商）
         self.demo_base_url = os.environ.get("AM_DEMO_BASE_URL", "http://127.0.0.1:8100/v1")
+        # 背景材料：总量上限（字），以及拼进会议章程时的预算（估算 token）
+        self.materials_max_chars = int(os.environ.get("AM_MATERIALS_MAX_CHARS", "40000"))
+        self.materials_context_tokens = int(os.environ.get("AM_MATERIALS_CONTEXT_TOKENS", "6000"))
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -164,6 +164,27 @@ def phase_names(definition: dict) -> dict[str, str]:
     return {p["key"]: p.get("name", p["key"]) for p in definition.get("phases", [])}
 
 
+def role_library() -> list[dict]:
+    """角色库：每个角色的键、名称、提示词与元数据。主持人挑名单、前端列角色都用它。"""
+    with session_scope() as s:
+        return [
+            {"role_key": r.role_key, "name": r.name, "system_prompt": r.system_prompt,
+             "meta": dict(r.meta_json or {}), "builtin": bool(r.builtin_hash),
+             "default_model_id": r.default_model_id}
+            for r in s.query(AgentTemplate).order_by(AgentTemplate.id.asc()).all()
+        ]
+
+
+def role_template(role_key: str) -> dict | None:
+    """取一个角色；不存在时返回 None。"""
+    with session_scope() as s:
+        row = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
+        if row is None:
+            return None
+        return {"role_key": row.role_key, "name": row.name, "system_prompt": row.system_prompt,
+                "meta": dict(row.meta_json or {}), "default_model_id": row.default_model_id}
+
+
 def instantiate_nodes(run_id: str, definition: dict) -> int:
     nodes_def = definition.get("nodes", [])
     deps_map = {n["key"]: list(n.get("deps") or []) for n in nodes_def}

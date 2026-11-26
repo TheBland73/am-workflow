@@ -112,3 +112,33 @@ class MeetingSession:
                               payload: dict | None = None) -> dict:
         return await open_checkpoint(self, kind, title=title, description=description,
                                      payload=payload)
+
+    # ---------- 会议自身、运行级配置与背景材料 ----------
+    def meeting(self) -> dict:
+        return store.get_meeting(self.meeting_id)
+
+    def meeting_round(self) -> int:
+        """会议内部的轮次，例如讨论的交锋轮次。它与节点级的回流轮次 round_no() 不是一回事。"""
+        return int(self.meeting()["round"] or 1)
+
+    def reset_builder(self) -> None:
+        """新一轮开始时调用。账本快照每轮更新一次，这是预期内的变化，不该报冻结段被改。"""
+        self.builder = ContextBuilder()
+
+    def run_config(self) -> dict:
+        from app.engine.params import run_of
+
+        return dict(run_of(self.run_id)["config"] or {})
+
+    def decider(self, checkpoint: str) -> str:
+        """某个确认点由谁判定：human / program / program_fallback / proxy / auto / model。"""
+        from app.engine.params import decider_for, definition_of
+
+        return decider_for(self.run_config(), definition_of(self.run_id), checkpoint)
+
+    def materials(self) -> tuple[str, bool]:
+        """背景材料（已按预算截好的一段文本）和它是否被截断。"""
+        from app.config import settings
+        from app.engine.materials import read_materials
+
+        return read_materials(self.run_id, settings.materials_context_tokens)
