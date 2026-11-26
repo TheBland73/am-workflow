@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from app.conversation.builder import Segment, capped
 from app.meeting.rules import CLOSED_STATUSES, LEVEL_NAMES, OPEN_STATUSES
 from app.models.budget import estimate_tokens
@@ -20,7 +22,12 @@ TURN_LABELS = {"position": "立场", "stance": "表态", "restance": "重新表�
                "challenge": "质疑", "respond": "回应", "exchange_summary": "交锋摘要",
                "question": "提问", "answer": "回答", "facilitator_note": "主持人",
                "user_intervention": "用户插话", "user_feedback": "用户反馈",
-               "user_guidance": "用户指导", "ruling": "裁决"}
+               "user_guidance": "用户指导", "ruling": "裁决",
+               "review_intake": "受理意见", "review_brief": "评审准备",
+               "review_points": "评审要点", "review": "独立评审", "review_delta": "增量复审",
+               "review_merge": "汇总分级", "author_response": "作者回应",
+               "review_defend": "意见辩护", "review_rule": "主席定夺",
+               "author_revise": "方案修订", "revision_verify": "修订验证"}
 
 
 def _cell(value) -> str:
@@ -122,6 +129,21 @@ def turn_text(turn: dict) -> str:
             lines.append(f"- 建议路线：{data['route']}")
         if lines:
             return "\n".join(lines)
+    if kind in ("review", "review_delta"):
+        lines = [f"- 优点：{item}" for item in (data.get("strengths") or [])
+                 if str(item).strip()]
+        for item in data.get("issues") or []:
+            location = f"[{item['location']}] " if item.get("location") else ""
+            suggestion = f"（建议：{item['suggestion']}）" if item.get("suggestion") else ""
+            lines.append(f"- 问题：{location}{item.get('problem') or ''}{suggestion}")
+        for item in data.get("resolved") or []:
+            lines.append(f"- 上一轮 {item.get('id')}："
+                         f"{'已处理' if item.get('handled') else '未处理'}"
+                         + (f"（{item['note']}）" if item.get("note") else ""))
+        if lines:
+            return "\n".join(lines)
+    if data:                                          # 其余结构化输出：缩进的 JSON
+        return json.dumps(data, ensure_ascii=False, indent=2)
     return str(turn.get("content") or "")
 
 

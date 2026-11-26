@@ -303,6 +303,43 @@ def _meeting_reply(kind: str, text: str) -> str:
              "options": ["需要", "不需要"], "raised_by": "用户体验"}]}, ensure_ascii=False)
     if kind in ("stance", "restance"):
         return _stances(text, yielding=kind == "restance")
+    if kind == "review_intake":
+        return json.dumps({"issues": [{
+            "severity": "major", "category": "wording", "location": "## 范围",
+            "problem": "用户认为范围写得不够清楚", "suggestion": "把必做与不做分别列清楚"}]},
+            ensure_ascii=False)
+    if kind == "review_brief":
+        return json.dumps({"checklist": ["范围是否完整", "验收标准是否可核对",
+                                         "风险是否都有缓解"]}, ensure_ascii=False)
+    if kind == "review_points":
+        return json.dumps({"focus": ["决策点与方案是否一致"]}, ensure_ascii=False)
+    if kind == "review":
+        return json.dumps({"strengths": ["方案覆盖了主要决策点"], "issues": []},
+                          ensure_ascii=False)
+    if kind == "review_delta":
+        return json.dumps({"strengths": [], "issues": [], "resolved": []}, ensure_ascii=False)
+    if kind == "review_merge":
+        return json.dumps({"issues": []}, ensure_ascii=False)
+    if kind == "author_response":
+        ids = re.findall(r"\bI\d+\b", text)
+        return json.dumps({"responses": [
+            {"id": issue_id, "accepted": True, "reason": "采纳", "ask_requester": []}
+            for issue_id in dict.fromkeys(ids)]}, ensure_ascii=False)
+    if kind == "review_defend":
+        return "这条意见成立：如果不改，评审者会按同一个标准再次提出，方案无法通过评审。"
+    if kind == "review_rule":
+        ids = re.findall(r"\bI\d+\b", text)
+        return json.dumps({"rulings": [
+            {"id": issue_id, "keep": True, "category": "wording", "severity": "major",
+             "note": "意见成立", "dissent": ""}
+            for issue_id in dict.fromkeys(ids)]}, ensure_ascii=False)
+    if kind == "revision_verify":
+        ids = re.findall(r"\bI\d+\b", text)
+        return json.dumps({"verified": [
+            {"id": issue_id, "fixed": True, "note": "已核对"} for issue_id in dict.fromkeys(ids)]},
+            ensure_ascii=False)
+    if kind == "author_revise":
+        return _proposal_from_ledger(rows, revised=True)
     subject = re.search(r"决策点 (D\d+)「([^」]*)」", text)
     label = f"{subject.group(1)}「{subject.group(2)}」" if subject else "这个决策点"
     if kind == "claim":

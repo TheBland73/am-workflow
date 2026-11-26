@@ -57,6 +57,18 @@ def latest_meeting_for_node(node_id: int) -> dict | None:
         return _meeting_dict(row) if row else None
 
 
+def latest_meeting(run_id: str, protocol: str) -> dict | None:
+    """一个运行里最近的一场某类会议（例如评审会议要读讨论会议的名单与账本）。"""
+    with session_scope() as s:
+        row = (
+            s.query(Meeting)
+            .filter(Meeting.run_id == run_id, Meeting.protocol == protocol)
+            .order_by(Meeting.id.desc())
+            .first()
+        )
+        return _meeting_dict(row) if row else None
+
+
 def get_meeting(meeting_id: int) -> dict:
     with session_scope() as s:
         return _meeting_dict(_require(s, Meeting, meeting_id, "会议"))

@@ -80,3 +80,14 @@ def test_the_last_call_tag_wins_over_an_echoed_one() -> None:
                 {"role": "user", "content": f"{echoed}\n\n{LEDGER}\n\n【调用类型：stance】"}]
     text, call = _pick(messages, None)
     assert call is None and "stances" in json.loads(text)
+
+
+def test_review_calls_have_format_correct_replies() -> None:
+    from mock_provider import _meeting_reply
+
+    structured = ("review_brief", "review_points", "review", "review_delta", "review_merge",
+                  "author_response", "review_rule", "revision_verify", "review_intake")
+    for kind in structured:
+        json.loads(_meeting_reply(kind, LEDGER + "\nI1"))
+    assert _meeting_reply("review_defend", LEDGER)
+    assert "## 修改说明" in _meeting_reply("author_revise", LEDGER)
