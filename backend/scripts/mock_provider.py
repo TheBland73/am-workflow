@@ -269,6 +269,13 @@ def _fallback(text: str) -> str:
     )
 
 
+def _marked_points(text: str) -> list[str]:
+    """需求确认的调用里"必须覆盖/核对这些决策点：…"列出的编号。"""
+    marker = re.search(r"必须(?:覆盖|核对)这些决策点[：:]([^\n]*)", text)
+    segment = marker.group(1) if marker else text
+    return list(dict.fromkeys(re.findall(r"\bD\d+\b", segment)))
+
+
 def _meeting_reply(kind: str, text: str) -> str:
     """会议里的一次调用。按调用标识给出格式正确的回复，内容尽量贴着提示里的账本与问题。"""
     rows = _ledger_rows(text)
@@ -308,6 +315,25 @@ def _meeting_reply(kind: str, text: str) -> str:
             "severity": "major", "category": "wording", "location": "## 范围",
             "problem": "用户认为范围写得不够清楚", "suggestion": "把必做与不做分别列清楚"}]},
             ensure_ascii=False)
+    if kind == "expect":
+        indexes = _marked_points(text)
+        return json.dumps({"expected": [
+            {"index": index, "content": "方案的结论应当体现在需求里，并给出对应的验收标准"}
+            for index in indexes]}, ensure_ascii=False)
+    if kind == "fidelity":
+        indexes = _marked_points(text)
+        return json.dumps({"checks": [
+            {"index": index, "result": "faithful", "reason": ""}
+            for index in indexes], "added": []}, ensure_ascii=False)
+    if kind == "quality":
+        return json.dumps({"issues": []}, ensure_ascii=False)
+    if kind == "confirm_merge":
+        return json.dumps({"items": []}, ensure_ascii=False)
+    if kind == "confirm_intake":
+        return json.dumps({"items": [{
+            "kind": "quality", "requirement": "R1", "criterion": "无歧义",
+            "severity": "major", "problem": "用户认为需求写得不够清楚",
+            "suggestion": "把验收标准写成可核对的条件"}]}, ensure_ascii=False)
     if kind == "review_brief":
         return json.dumps({"checklist": ["范围是否完整", "验收标准是否可核对",
                                          "风险是否都有缓解"]}, ensure_ascii=False)
