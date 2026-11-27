@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 
-from app.artifacts.store import latest_artifact, parse_front_matter, read_artifact
+from app.artifacts.store import artifact_version, parse_front_matter, read_record
 from app.db.base import session_scope
 from app.db.models import (MEETING_ABANDONED, MEETING_COMPLETED, AgentTemplate, Gate, Meeting,
                            MeetingIntervention, ModelEntry, Node, Run)
@@ -188,12 +188,17 @@ async def patch_issue(run_id: str, meeting_id: int, issue_id: str,
 
 @router.get("/runs/{run_id}/meetings/{meeting_id}/minutes")
 def meeting_minutes(run_id: str, meeting_id: int) -> dict:
-    """这场会议的纪要：讨论会议取 discussion，评审与确认会议取 review。"""
+    """这场会议自己写的那一版纪要：讨论会议取 discussion，评审与确认会议取 review。
+
+    评审与确认会议共用 review 工件，所以不取最新版，只取会议状态里记下的版本
+    （minutes_version，协议写纪要时记下）；还没写过的会议返回 404。
+    """
     meeting = _meeting_or_404(run_id, meeting_id)
     kind = "discussion" if meeting["protocol"] == "discussion" else "review"
-    record = latest_artifact(run_id, kind)
-    raw = read_artifact(run_id, kind)
-    if not record or not raw:
+    version = meeting["state"].get("minutes_version")
+    record = artifact_version(run_id, kind, int(version)) if version else None
+    raw = read_record(record)
+    if not raw:
         raise HTTPException(404, "这场会议还没有纪要")
     _meta, body = parse_front_matter(raw)
     return {"kind": kind, "version": record["version"], "body": body.strip()}

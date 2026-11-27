@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
@@ -14,6 +15,7 @@ from app.engine.gates import get_gate, request_gate
 from app.engine.params import apply_run_config
 from app.engine.runners import NodeFailure
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
+from app.main import app
 from app.meeting import store
 from tests.meeting_fakes import drive, install
 
@@ -208,6 +210,25 @@ def test_meeting_reaches_a_proposal_with_two_human_checkpoints(monkeypatch) -> N
     types = [event["type"] for event in load_events(run_id)]
     assert "meeting_ledger_updated" in types and "meeting_turn_finished" in types
     assert "context_prefix_changed" not in types        # 账本的正常更新不该报冻结段被改
+
+
+def test_minutes_endpoint_returns_the_minutes_this_meeting_wrote(monkeypatch) -> None:
+    """纪要接口只认会议自己写的那一版：协议写纪要时把版本记进会议状态。"""
+    install(monkeypatch, _replies(restance=_split))
+    run_id, node_id = _meeting_run({"automation": {"level": "L3"}})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    with TestClient(app) as client:
+        response = client.get(f"/api/runs/{run_id}/meetings/{meeting_id}/minutes")
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["kind"] == "discussion"
+    assert data["version"] == result["minutes"]["version"]
+    assert "## 决策点账本" in data["body"]
 
 
 def test_full_automation_falls_back_at_a_stall_without_asking_anyone(monkeypatch) -> None:

@@ -958,6 +958,7 @@ class ReviewProtocol(MeetingProtocol):
         precheck_ok, precheck_reason = self._precheck(verdict, accepted_by_user, unfixed)
         mtg.set_state(precheck_ok=precheck_ok, precheck_reason=precheck_reason)
         report = self._write_report(mtg, issues, verdict, accepted_by_user, unfixed)
+        mtg.set_state(minutes_version=report["version"])    # 纪要接口按会议记下的版本取
         blocking = review_rules.blocking(
             issues, line=str(mtg.params().get("min_blocking_severity") or "major"))
         summary = (f"评审会议完成：结论 {review_rules.VERDICT_NAMES.get(verdict, verdict)}，"

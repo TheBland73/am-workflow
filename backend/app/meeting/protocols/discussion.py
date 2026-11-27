@@ -1178,10 +1178,12 @@ class DiscussionProtocol(MeetingProtocol):
 
     def _write_minutes(self, mtg, notes: str = "") -> dict:
         extra = [("复核遗留意见", notes)] if notes else []
-        return minutes.write_minutes(
+        record = minutes.write_minutes(
             mtg.run_id, kind="discussion", created_by="facilitator", inputs=["idea"],
             meeting=mtg.meeting(), participants=mtg.participants(), points=_points(mtg),
             turns=store.list_turns(mtg.meeting_id, limit=100_000), extra_sections=extra)
+        mtg.set_state(minutes_version=record["version"])    # 纪要接口按会议记下的版本取
+        return record
 
     async def step_check(self, mtg):
         state = mtg.state()

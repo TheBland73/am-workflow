@@ -115,7 +115,9 @@ def test_patch_an_unknown_issue_is_404() -> None:
 
 def test_minutes_export_for_a_discussion_meeting() -> None:
     run_id = _make_run("finished")
-    meeting_id = _meeting(run_id, "discuss", "discussion", status="completed")
+    # 协议写纪要时会把版本记进会议状态，接口只认这个版本
+    meeting_id = _meeting(run_id, "discuss", "discussion", status="completed",
+                          state={"minutes_version": 1})
     write_artifact(run_id, "discussion", "# 会议纪要（讨论会议）\n\nMINUTES-MARKER\n",
                    created_by="chair", inputs=[])
 

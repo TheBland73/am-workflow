@@ -5,6 +5,7 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
+from app.artifacts.store import write_artifact
 from app.db.base import init_db, session_scope
 from app.db.models import Node, Run, Workflow
 from app.engine.events import load_events
@@ -214,3 +215,63 @@ def test_intervene_queues_request(monkeypatch) -> None:
         assert response.status_code == 201, response.text
         taken = store.take_queued_interventions(mtg.meeting_id)
     assert [t["content"] for t in taken] == ["注意成本"]
+
+
+def _two_report_meetings() -> tuple[str, int, int]:
+    """同一条运行上的评审、确认两个会议节点。两种会议的报告共用 review 工件。"""
+    init_db()
+    seed_defaults()
+    run_id = f"api-run-{next(_counter)}"
+    node_ids: list[int] = []
+    with session_scope() as s:
+        workflow_id = s.query(Workflow).filter(Workflow.template_key == "sdlc_v1").one().id
+        s.add(Run(id=run_id, workflow_id=workflow_id, status="running"))
+        s.flush()
+        for node_key, name in (("review", "评审会议"), ("confirm", "需求确认会议")):
+            node = Node(node_key=node_key, type="MEETING", name=name, run_id=run_id,
+                        status="running", config_json={"protocol": node_key})
+            s.add(node)
+            s.flush()
+            node_ids.append(node.id)
+    review, confirm = [
+        store.create_meeting(run_id=run_id, node_id=node_id, node_key=node_key,
+                             protocol=node_key, charter={}, config={})
+        for node_key, node_id in zip(("review", "confirm"), node_ids)]
+    return run_id, review, confirm
+
+
+def _minutes(client: TestClient, run_id: str, meeting_id: int):
+    return client.get(f"/api/runs/{run_id}/meetings/{meeting_id}/minutes")
+
+
+def test_minutes_are_404_until_the_meeting_writes_its_own_report(monkeypatch) -> None:
+    """确认会议还没写报告时，不能把评审会议的报告当成它的纪要。"""
+    run_id, _review, confirm = _two_report_meetings()
+    write_artifact(run_id, "review", "评审会议的报告", created_by="chair", inputs=["proposal"],
+                   status="reviewed", extra_meta={"review_type": "proposal"})
+
+    with _client(monkeypatch) as client:
+        response = _minutes(client, run_id, confirm)
+
+    assert response.status_code == 404, response.text
+
+
+def test_minutes_are_the_version_the_meeting_wrote_not_the_latest(monkeypatch) -> None:
+    run_id, review, confirm = _two_report_meetings()
+    for version, (text, review_type) in enumerate(
+            [("评审会议的报告", "proposal"), ("确认会议的报告", "requirement")], start=1):
+        write_artifact(run_id, "review", text, created_by="chair", inputs=[], status="reviewed",
+                       extra_meta={"review_type": review_type})
+        store.set_state(review if version == 1 else confirm, {"minutes_version": version})
+
+    with _client(monkeypatch) as client:
+        first = _minutes(client, run_id, review)
+        second = _minutes(client, run_id, confirm)
+
+    # 评审会议写的是第 1 版：第 2 版出现之后它取到的仍是自己那一版
+    assert first.status_code == 200, first.text
+    assert (first.json()["kind"], first.json()["version"]) == ("review", 1)
+    assert first.json()["body"] == "评审会议的报告"
+    assert second.status_code == 200, second.text
+    assert (second.json()["kind"], second.json()["version"]) == ("review", 2)
+    assert second.json()["body"] == "确认会议的报告"

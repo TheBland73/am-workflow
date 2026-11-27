@@ -7,6 +7,7 @@ import re
 from collections import Counter
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
@@ -17,6 +18,7 @@ from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
 from app.engine.runners import NodeContext
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
+from app.main import app
 from app.meeting import store
 from app.meeting.protocols import review as review_module
 from app.meeting.session import MeetingSession
@@ -171,6 +173,29 @@ def test_review_without_issues_accepts(monkeypatch) -> None:
     report = parse_front_matter(read_artifact(run_id, "review"))
     assert report[0]["review_type"] == "proposal"      # 与需求确认报告共用 review 工件，靠它区分
     assert "结论：接受。" in report[1] and "方案覆盖了主要决策点" in report[1]
+
+
+def test_minutes_endpoint_returns_the_report_this_meeting_wrote(monkeypatch) -> None:
+    """纪要接口只认会议自己写的那一版报告：之后写进同一个工件类型的报告不会顶掉它。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _review_run()
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    # 之后的需求确认会议写进 review 工件的报告（第 2 版）
+    write_artifact(run_id, "review", "# 需求确认报告", created_by="chair",
+                   inputs=["requirement"], status="reviewed",
+                   extra_meta={"review_type": "requirement"})
+    meeting_id = _meeting(node_id)["id"]
+    with TestClient(app) as client:
+        response = client.get(f"/api/runs/{run_id}/meetings/{meeting_id}/minutes")
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["kind"] == "review"
+    assert data["version"] == result["report"]["version"] == 1
+    assert "结论：接受。" in data["body"] and "需求确认报告" not in data["body"]
 
 
 ISSUE = {"id": "I1", "standing": True, "accepted": True, "category": "wording",

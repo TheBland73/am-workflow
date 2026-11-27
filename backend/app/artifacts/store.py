@@ -84,6 +84,16 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     return meta, parts[2].lstrip("\n")
 
 
+def _record(row: Artifact) -> dict:
+    return {
+        "kind": row.kind,
+        "path": row.path,
+        "version": row.version,
+        "status": row.status,
+        "created_by_node": row.created_by_node,
+    }
+
+
 def latest_artifact(run_id: str, kind: str) -> dict | None:
     with session_scope() as s:
         row = (
@@ -92,19 +102,22 @@ def latest_artifact(run_id: str, kind: str) -> dict | None:
             .order_by(Artifact.version.desc())
             .first()
         )
-        if not row:
-            return None
-        return {
-            "kind": row.kind,
-            "path": row.path,
-            "version": row.version,
-            "status": row.status,
-            "created_by_node": row.created_by_node,
-        }
+        return _record(row) if row else None
 
 
-def read_artifact(run_id: str, kind: str) -> str | None:
-    record = latest_artifact(run_id, kind)
+def artifact_version(run_id: str, kind: str, version: int) -> dict | None:
+    """某一版的工件记录；没有这一版返回 None。"""
+    with session_scope() as s:
+        row = (
+            s.query(Artifact)
+            .filter(Artifact.run_id == run_id, Artifact.kind == kind, Artifact.version == version)
+            .first()
+        )
+        return _record(row) if row else None
+
+
+def read_record(record: dict | None) -> str | None:
+    """读一条工件记录指向的正文；没有记录或文件不存在返回 None。"""
     if not record:
         return None
     path = Path(record["path"])
@@ -113,6 +126,10 @@ def read_artifact(run_id: str, kind: str) -> str | None:
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
+
+
+def read_artifact(run_id: str, kind: str) -> str | None:
+    return read_record(latest_artifact(run_id, kind))
 
 
 def write_artifact(run_id: str, kind: str, body: str, *, created_by: str | None = None,

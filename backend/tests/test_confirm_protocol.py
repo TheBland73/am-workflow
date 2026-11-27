@@ -7,6 +7,7 @@ import re
 from collections import Counter
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
@@ -17,6 +18,7 @@ from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
 from app.engine.runners import NodeFailure
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
+from app.main import app
 from app.meeting import store
 from tests.meeting_fakes import drive, install
 
@@ -214,6 +216,28 @@ def test_faithful_spec_passes(monkeypatch) -> None:
     expect_prompts = [call["text"] for call in seen if call["kind"] == "expect"]
     assert expect_prompts and all("WHEN 团队成员提交反馈" not in text
                                   for text in expect_prompts)
+
+
+def test_minutes_endpoint_returns_the_report_this_meeting_wrote(monkeypatch) -> None:
+    """纪要接口只认会议自己写的那一版报告：方案评审报告与需求确认报告共用 review 工件。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _confirm_run()
+    # 此前的评审会议留下的报告（第 1 版）
+    write_artifact(run_id, "review", "# 方案评审报告", created_by="chair", inputs=["proposal"],
+                   status="reviewed", extra_meta={"review_type": "proposal"})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = _meeting(node_id)["id"]
+    with TestClient(app) as client:
+        response = client.get(f"/api/runs/{run_id}/meetings/{meeting_id}/minutes")
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["kind"] == "review"
+    assert data["version"] == result["report"]["version"] == 2
+    assert "结论：通过。" in data["body"] and "方案评审报告" not in data["body"]
 
 
 def test_mechanical_failure_skips_model_checks_and_reroutes(monkeypatch) -> None:
