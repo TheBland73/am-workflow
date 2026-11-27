@@ -27,7 +27,7 @@ from app.artifacts.store import (latest_artifact, parse_front_matter, read_artif
 from app.conversation.builder import Segment
 from app.engine.events import emit
 from app.engine.runners import NodeFailure
-from app.engine.templates import role_library, role_template
+from app.engine.templates import role_library, role_suits_meeting, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, store
 from app.meeting.calls import meeting_input_budget, speak, speak_many
@@ -514,8 +514,7 @@ def _apply_stances(mtg, participant: dict, data: dict) -> None:
 
 def _can_join_discussion(role: dict) -> bool:
     """能当讨论参会者的角色：元数据标了适合讨论，或者没有标会议角色（用户自建、没填）。"""
-    roles = (role.get("meta") or {}).get("meeting_roles")
-    return "discussion" in roles if roles is not None else True
+    return role_suits_meeting(role, "discussion")
 
 
 def _write_charter(mtg) -> None:
@@ -762,11 +761,15 @@ class DiscussionProtocol(MeetingProtocol):
         """名单的优先级：用户点名 > 主持人在人数要求内挑选。结果写成参会者。"""
         library = {row["role_key"]: row for row in role_library()}
         if spec.get("role_keys"):
-            keys = [key for key in spec["role_keys"] if key in library]
-            if not keys:
-                raise NodeFailure("运行级配置里点名的参会角色都已不存在，请修改运行级配置")
+            configured = [str(key) for key in spec["role_keys"]]
+            problems = [f"已不存在：{key}" for key in configured if key not in library]
+            problems += [f"不适合参加讨论会议：{key}" for key in configured
+                         if key in library and not role_suits_meeting(library[key], "discussion")]
+            if problems:
+                raise NodeFailure("运行级配置点名的参会角色有问题：" + "；".join(problems)
+                                  + "，请修改运行级配置", fatal=True)
             picked = [{"role_key": key, "display_name": library[key]["name"], "reason": "用户指定"}
-                      for key in keys]
+                      for key in configured]
             source = "user"
         else:
             offered = [row for row in library.values() if _can_join_discussion(row)]

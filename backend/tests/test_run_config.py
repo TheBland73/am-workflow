@@ -76,11 +76,28 @@ def test_bad_run_config_is_rejected_with_reasons(monkeypatch) -> None:
             "idea": IDEA, "config": {"rosters": {"participants": {"count": 0}}}})
         out_of_range = client.post("/api/runs", json={
             "idea": IDEA, "config": {"params": {"discussion": {"rounds_max": 0}}}})
+        judge_participant = client.post("/api/runs", json={
+            "idea": IDEA, "config": {"rosters": {"participants": {"role_keys": ["judge"]}}}})
+        judge_reviewer = client.post("/api/runs", json={
+            "idea": IDEA, "config": {"rosters": {"reviewers": {"role_keys": ["judge"]}}}})
+        run_id = _create(client)["run"]["id"]
+        patch_participant = client.patch(f"/api/runs/{run_id}/config", json={
+            "rosters": {"participants": {"role_keys": ["judge"]}}})
+        patch_reviewer = client.patch(f"/api/runs/{run_id}/config", json={
+            "rosters": {"reviewers": {"role_keys": ["judge"]}}})
     assert bad_level.status_code == 400 and "未知的自动化等级" in bad_level.json()["detail"]
     assert unknown_role.status_code == 400
     assert "角色模板不存在：no_such_role" in unknown_role.json()["detail"]
     assert bad_count.status_code == 400 and "固定人数" in bad_count.json()["detail"]
     assert out_of_range.status_code == 400 and "讨论轮次上限" in out_of_range.json()["detail"]
+    assert judge_participant.status_code == 400
+    assert "不适合参加讨论会议：judge" in judge_participant.json()["detail"]
+    assert judge_reviewer.status_code == 400
+    assert "不适合参加评审会议：judge" in judge_reviewer.json()["detail"]
+    assert patch_participant.status_code == 400
+    assert "不适合参加讨论会议：judge" in patch_participant.json()["detail"]
+    assert patch_reviewer.status_code == 400
+    assert "不适合参加评审会议：judge" in patch_reviewer.json()["detail"]
 
 
 def test_materials_are_saved_listed_and_bounded(monkeypatch) -> None:

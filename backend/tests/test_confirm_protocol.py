@@ -116,7 +116,8 @@ def _replies(**overrides) -> dict:
 
 def _confirm_run(config: dict | None = None, *, spec: str = SPEC,
                  participants: list[tuple[str, str]] | None = None,
-                 stances: dict[str, list[str]] | None = None) -> tuple[str, int]:
+                 stances: dict[str, list[str]] | None = None,
+                 with_review: bool = True) -> tuple[str, int]:
     """一个跑到需求确认之前的运行：讨论会议（两个已一致决策点、一名参会者）与已完成的评审会议。"""
     init_db()
     seed_defaults()
@@ -169,11 +170,13 @@ def _confirm_run(config: dict | None = None, *, spec: str = SPEC,
             store.set_stance(points[index], ids[role_key], {
                 "level": 1, "reason": "同意这个结论", "choice": "", "round": 1,
                 "name": names[role_key]})
-    review_meeting = store.create_meeting(run_id=run_id, node_id=review_id, node_key="review",
-                                          protocol="review", charter={"sections": []}, config={})
-    store.update_meeting(review_meeting, status="completed", phase="done", round=1)
-    store.add_participant(review_meeting, role_key="architect", display_name="架构师",
-                          mode="reviewer", system_prompt="你是评审者")
+    if with_review:
+        review_meeting = store.create_meeting(run_id=run_id, node_id=review_id, node_key="review",
+                                              protocol="review", charter={"sections": []},
+                                              config={})
+        store.update_meeting(review_meeting, status="completed", phase="done", round=1)
+        store.add_participant(review_meeting, role_key="architect", display_name="架构师",
+                              mode="reviewer", system_prompt="你是评审者")
     return run_id, confirm_id
 
 
@@ -219,6 +222,36 @@ def test_faithful_spec_passes(monkeypatch) -> None:
     expect_prompts = [call["text"] for call in seen if call["kind"] == "expect"]
     assert expect_prompts and all("WHEN 团队成员提交反馈" not in text
                                   for text in expect_prompts)
+
+
+def test_named_reviewers_become_quality_reviewers_when_no_review_meeting_exists(
+        monkeypatch) -> None:
+    """没有评审会议、运行级配置点名评审者：质量评审者取点名的角色。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _confirm_run({"rosters": {"reviewers": {"role_keys": ["security"]}}},
+                                   with_review=False)
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = _meeting(node_id)["id"]
+    quality = [(row["role_key"], row["display_name"])
+               for row in store.list_participants(meeting_id) if row["mode"] == "quality_reviewer"]
+    assert quality == [("security", "安全与合规")]
+
+
+def test_a_named_reviewer_not_meant_for_review_fails_the_confirm_meeting(monkeypatch) -> None:
+    """点名不适合参加评审会议的角色（裁决模型）：确认会议带明确的错误失败，fatal。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _confirm_run({"rosters": {"reviewers": {"role_keys": ["judge"]}}},
+                                   with_review=False)
+
+    with pytest.raises(NodeFailure) as excinfo:
+        drive(run_id, node_id, _never, idea=IDEA)
+    assert "不适合参加评审" in str(excinfo.value) and "judge" in str(excinfo.value)
+    assert excinfo.value.fatal is True
 
 
 def test_minutes_endpoint_returns_the_report_this_meeting_wrote(monkeypatch) -> None:

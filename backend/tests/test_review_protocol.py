@@ -16,7 +16,7 @@ from app.engine.events import load_events
 from app.engine.feedback import with_feedback
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
-from app.engine.runners import NodeContext
+from app.engine.runners import NodeContext, NodeFailure
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.main import app
 from app.meeting import store
@@ -481,3 +481,45 @@ def test_reviewers_count_in_run_config_limits_the_panel(monkeypatch) -> None:
                  if row["mode"] == "reviewer"]
     assert len(reviewers) == 1                    # 讨论会议留下两名参会者，按配置只请一名
     assert Counter(call["kind"] for call in seen)["review"] == 1
+
+
+def test_named_reviewers_become_the_panel_in_order_without_inheriting_the_discussion(
+        monkeypatch) -> None:
+    """点名评审者：按配置里的顺序成为评审者，不沿用讨论会议的参会者。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run({
+        "rosters": {"reviewers": {"role_keys": ["security", "qa"]}}})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True and result["verdict"] == "accept"
+    meeting_id = _meeting(node_id)["id"]
+    reviewers = [(row["role_key"], row["display_name"])
+                 for row in store.list_participants(meeting_id) if row["mode"] == "reviewer"]
+    assert reviewers == [("security", "安全与合规"), ("qa", "测试与质量")]   # 按配置顺序，名称取自角色库
+    assert Counter(call["kind"] for call in seen)["review"] == 2          # 两名评审者各发言一次
+
+
+def test_a_named_reviewer_that_no_longer_exist_fails_the_meeting(monkeypatch) -> None:
+    """点名的评审角色被删了：会议带明确的错误失败，fatal。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run({"rosters": {"reviewers": {"role_keys": ["deleted_role"]}}})
+
+    with pytest.raises(NodeFailure) as excinfo:
+        drive(run_id, node_id, _never, idea=IDEA)
+    assert "已不存在：deleted_role" in str(excinfo.value)
+    assert excinfo.value.fatal is True
+
+
+def test_a_named_reviewer_not_meant_for_review_fails_the_meeting(monkeypatch) -> None:
+    """点名不适合参加评审会议的角色（裁决模型）：会议带明确的错误失败，fatal。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run({"rosters": {"reviewers": {"role_keys": ["judge"]}}})
+
+    with pytest.raises(NodeFailure) as excinfo:
+        drive(run_id, node_id, _never, idea=IDEA)
+    assert "不适合参加评审" in str(excinfo.value) and "judge" in str(excinfo.value)
+    assert excinfo.value.fatal is True

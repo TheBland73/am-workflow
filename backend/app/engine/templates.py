@@ -188,6 +188,16 @@ def role_library() -> list[dict]:
         ]
 
 
+def role_suits_meeting(role: dict, meeting: str) -> bool:
+    """这个角色能不能参加这类会议（meeting 是会议类型键：参会者看 "discussion"，评审者看 "review"）。
+
+    元数据里标了"适合的会议角色"就必须包含这类会议；没标（用户自建、没填）不受限。
+    接口的名单校验与三个协议的点名分支共用这条规则。
+    """
+    roles = (role.get("meta") or {}).get("meeting_roles")
+    return meeting in roles if roles is not None else True
+
+
 def role_template(role_key: str) -> dict | None:
     """取一个角色；不存在时返回 None。"""
     with session_scope() as s:

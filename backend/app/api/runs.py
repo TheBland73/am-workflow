@@ -28,7 +28,8 @@ from app.engine.materials import (
 )
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config, run_of, validate_run_config
-from app.engine.templates import instantiate_nodes, phase_names, workflow_definition
+from app.engine.templates import (instantiate_nodes, phase_names, role_suits_meeting,
+                                  workflow_definition)
 
 router = APIRouter(tags=["runs"])
 
@@ -44,8 +45,15 @@ def _run_or_404(run_id: str) -> dict:
         return {"id": run.id, "status": run.status, "config": dict(run.config_json or {})}
 
 
+_ROSTER_MEETINGS = {"participants": "discussion", "reviewers": "review"}
+_MEETING_LABELS = {"discussion": "讨论", "review": "评审"}
+
+
 def _roster_errors(config: dict) -> list[str]:
-    """名单里点名的角色必须存在。结构不合法时交给 validate_rosters，这里不再二次崩溃。"""
+    """名单里点名的角色必须存在，并且适合这一组对应的会议（参会者→讨论、评审者→评审）。
+
+    结构不合法时交给 validate_rosters，这里不再二次崩溃。
+    """
     rosters = config.get("rosters")
     if not isinstance(rosters, dict):
         return []
@@ -55,9 +63,21 @@ def _roster_errors(config: dict) -> list[str]:
     if not wanted:
         return []
     with session_scope() as s:
-        known = {row[0] for row in s.query(AgentTemplate.role_key)
+        metas = {row[0]: (row[1] or {}) for row in
+                 s.query(AgentTemplate.role_key, AgentTemplate.meta_json)
                  .filter(AgentTemplate.role_key.in_(wanted)).all()}
-    return [f"角色模板不存在：{key}" for key in wanted if key not in known]
+    errors = [f"角色模板不存在：{key}" for key in wanted if key not in metas]
+    for group, meeting in _ROSTER_MEETINGS.items():
+        item = rosters.get(group)
+        keys = item.get("role_keys") if isinstance(item, dict) else None
+        if not (isinstance(keys, list) and keys):
+            continue
+        for key in keys:
+            if not isinstance(key, str) or not key or key not in metas:
+                continue                       # 不存在已单独报告
+            if not role_suits_meeting({"meta": metas[key]}, meeting):
+                errors.append(f"不适合参加{_MEETING_LABELS[meeting]}会议：{key}")
+    return errors
 
 
 def _merge_run_config(base: dict, patch: dict) -> dict:

@@ -24,7 +24,7 @@ from app.artifacts.store import latest_artifact, parse_front_matter, read_artifa
 from app.conversation.builder import Segment
 from app.engine.events import emit
 from app.engine.runners import NodeFailure
-from app.engine.templates import role_library, role_template
+from app.engine.templates import role_library, role_suits_meeting, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, review_rules, store
 from app.meeting.calls import meeting_input_budget, speak, speak_many
@@ -574,10 +574,12 @@ class ReviewProtocol(MeetingProtocol):
         spec = (mtg.run_config().get("rosters") or {}).get("reviewers") or {}
         configured = [str(key) for key in (spec.get("role_keys") or [])]
         if configured:
-            missing = [key for key in configured if key not in library]
-            if missing:
-                raise NodeFailure("运行级配置点名的评审角色已不存在：" + "、".join(missing),
-                                  fatal=True)
+            problems = [f"已不存在：{key}" for key in configured if key not in library]
+            problems += [f"不适合参加评审会议：{key}" for key in configured
+                         if key in library and not role_suits_meeting(library[key], "review")]
+            if problems:
+                raise NodeFailure("运行级配置点名的评审角色有问题：" + "；".join(problems)
+                                  + "，请修改运行级配置", fatal=True)
             reviewers = [{"role_key": key, "display_name": library[key]["name"], "mode": "reviewer",
                           "system_prompt": library[key]["system_prompt"], "model_id": None}
                          for key in configured]

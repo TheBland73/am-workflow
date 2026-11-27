@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.api.runs import run_metrics
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
-from app.db.models import Gate, Node, Run, Workflow
+from app.db.models import AgentTemplate, Gate, Node, Run, Workflow
 from app.engine.events import load_events
 from app.engine.feedback import with_feedback
 from app.engine.gates import get_gate, request_gate
@@ -359,14 +359,52 @@ def test_participants_named_in_the_run_config_take_effect_without_a_proposal_or_
 
 def test_named_participants_that_no_longer_exist_fail_the_meeting_with_a_clear_message(
         monkeypatch) -> None:
-    """点名的角色后来被删了：带着明确的错误失败，不悄悄换人，也不空着名单往下走。"""
+    """点名的角色缺任何一个：带着明确的错误失败并列出缺的是哪个，不悄悄去掉剩下照开。"""
     seen: list[dict] = []
     install(monkeypatch, _replies(), seen)
-    run_id, node_id = _meeting_run({"rosters": {"participants": {"role_keys": ["deleted_role"]}}})
+    run_id, node_id = _meeting_run({
+        "rosters": {"participants": {"role_keys": ["architect", "deleted_role"]}}})
 
-    with pytest.raises(NodeFailure, match="点名的参会角色都已不存在"):
+    with pytest.raises(NodeFailure) as excinfo:
         drive(run_id, node_id, _approve, idea=IDEA)
-    assert "roster" not in {call["kind"] for call in seen}         # 没有退回去让主持人另挑一份
+    assert "已不存在：deleted_role" in str(excinfo.value)
+    assert excinfo.value.fatal is True                              # 重试没有意义
+    assert "roster" not in {call["kind"] for call in seen}          # 没有退回去让主持人另挑一份
+
+
+def test_a_named_role_that_is_not_meant_for_discussion_fails_the_meeting(monkeypatch) -> None:
+    """点名了不适合参加讨论的角色（裁决模型）：会议带明确的错误失败。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run({"rosters": {"participants": {"role_keys": ["judge"]}}})
+
+    with pytest.raises(NodeFailure) as excinfo:
+        drive(run_id, node_id, _approve, idea=IDEA)
+    assert "不适合参加讨论" in str(excinfo.value) and "judge" in str(excinfo.value)
+    assert excinfo.value.fatal is True
+
+
+def test_a_custom_role_without_meeting_roles_can_be_named(monkeypatch) -> None:
+    """没填"适合的会议角色"的自定义角色不受限：点名它可以照常开会；用完把角色行删掉。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    with session_scope() as s:
+        s.add(AgentTemplate(role_key="consultant_free", name="自由顾问",
+                            system_prompt="你是自由顾问，从价值角度看这个想法",
+                            meta_json={"description": "外部顾问，没有限定会议类型"}))
+    run_id, node_id = _meeting_run({
+        "rosters": {"participants": {"role_keys": ["consultant_free"]}}})
+    try:
+        result = drive(run_id, node_id, _approve, idea=IDEA)
+        assert result["done"] is True
+        meeting_id = store.latest_meeting_for_node(node_id)["id"]
+        rows = [row for row in store.list_participants(meeting_id) if row["mode"] == "participant"]
+        assert [(row["role_key"], row["display_name"]) for row in rows] == [
+            ("consultant_free", "自由顾问")]
+    finally:
+        with session_scope() as s:
+            row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "consultant_free").one()
+            s.delete(row)
 
 
 def test_a_fixed_headcount_overrides_the_participant_range_in_the_prompt_and_at_the_checkpoint(
