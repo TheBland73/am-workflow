@@ -345,7 +345,7 @@ def _front_review_reports(run_id: str) -> list[dict]:
             reports.append({
                 "node_id": row.node_id, "node_key": node.node_key, "node_name": node.name,
                 "node_status": node.status, "order_index": node.order_index,
-                "max_rounds": int((node.config_json or {}).get("max_rounds") or 2),
+                "max_rounds": int((node.config_json or {}).get("max_rounds") or 3),
                 "meeting_id": row.id, "round": int(row.round or 1),
                 "review_type": "requirement" if row.protocol == "confirm" else "proposal",
                 "version": int(state.get("minutes_version") or 0),
@@ -432,7 +432,7 @@ def get_run_review(run_id: str) -> dict:
             .first()
         )
         if node is None:
-            return {"available": False, "run_id": run_id, "status": run.status}
+            return {"available": False, "run_id": run_id, "run_status": run.status}
         config = dict(node.config_json or {})
         report = dict(config.get("review") or {})
         issues = report.get("issues")
