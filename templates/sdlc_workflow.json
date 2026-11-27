@@ -65,10 +65,6 @@
       "compact_at": {"type": "float", "default": 0.8, "min": 0.5, "max": 0.95, "title": "压缩触发阈值"},
       "compact_to": {"type": "float", "default": 0.5, "min": 0.2, "max": 0.6, "title": "压缩后目标占用",
                      "hint": "须比触发阈值至少低 20 个百分点"}
-    },
-    "meeting": {
-      "token_budget": {"type": "int", "default": 0, "min": 0, "max": 100000000, "title": "会议 token 预算",
-                       "hint": "0 表示不限，受运行总预算约束"}
     }
   },
   "rubrics": {

@@ -44,6 +44,14 @@ def test_params_and_levels_are_declared() -> None:
     assert set(definition["rubrics"]) == {"proposal", "review", "requirement", "artifact"}
 
 
+def test_every_param_group_is_consumed_by_code() -> None:
+    # 参数表里不保留没人读取的组：界面照着它生成输入项，用户改了却没有效果
+    definition = _definition()
+    protocols = {node["config"]["protocol"] for node in definition["nodes"]
+                 if node["type"] == "MEETING"}
+    assert set(definition["params"]) == protocols | {"gates", "context"}
+
+
 def test_run_config_is_applied_to_meeting_nodes() -> None:
     init_db()
     seed_defaults()

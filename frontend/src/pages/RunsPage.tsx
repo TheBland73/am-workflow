@@ -39,8 +39,7 @@ const LEVEL_NAME: Record<string, string> = {
 };
 
 const PARAM_GROUP_LABEL: Record<string, string> = {
-  discussion: "讨论", review: "评审", confirm: "需求确认", gates: "确认点",
-  context: "上下文", meeting: "会议",
+  discussion: "讨论", review: "评审", confirm: "需求确认", gates: "确认点", context: "上下文",
 };
 
 /** 在「常用参数」里单列的项。 */
