@@ -6,7 +6,7 @@
 
 引擎拥有控制流、上下文与状态；模型只是可替换的节点；人工审批是一等公民；完成与否由证据判定。
 
-[![Tests](https://img.shields.io/badge/tests-93%20passed-brightgreen.svg)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen.svg)](#开发与测试)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-18%2B-339933.svg)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -59,7 +59,7 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 | 数据统计 | 可用 | 全局运行量 / 成功率 / 耗时 / Token / 成本 / 趋势 / 状态分布（只读聚合，6 个接口） |
 | 代码评审 + 验收门 | 实验 | 启发式静态评审（文件摘要 + 验收清单），无 diff / AST / 覆盖率分析 |
 | 多进程 / 分布式 | 设计封存 | 见 [`docs/分布式执行模式设计.md`](docs/分布式执行模式设计.md) |
-| 单元测试 | 通过 | `93 passed`（pytest，约 3 秒）；前端 `tsc --noEmit` 无错误 |
+| 单元测试 | 通过 | `119 passed`（pytest，约 6 秒）；前端 `tsc --noEmit` 无错误 |
 
 > W1 的目标是**把控制流跑通并证明它可靠**，不是把生成质量做到可交付。质量与规模的边界见 [已知限制](#已知限制)。
 
@@ -223,7 +223,7 @@ flowchart LR
 | 存储 | SQLite（WAL + `synchronous=NORMAL` + 单连接池 `pool_size=1`） |
 | 前端 | Vite · React 18 · TypeScript · Ant Design 5 · TanStack Query · React Router · @xyflow/react · zustand |
 | 视觉 | 终末地控制台风格（纸白 / 墨黑 / 单一信号黄），Saira 字体（SIL OFL） |
-| 测试 | pytest（后端 · 65 用例）· `tsc --noEmit`（前端类型检查） |
+| 测试 | pytest（后端 · 119 用例）· `tsc --noEmit`（前端类型检查） |
 
 ---
 
@@ -470,7 +470,7 @@ am-workflow/
 ```powershell
 cd backend
 ..\.venv\Scripts\python.exe -m pytest tests -q
-# 93 passed in ~3s
+# 119 passed in ~6s
 ```
 
 覆盖范围：图与任务解析、front-matter、预算估算、门禁通过 / 驳回 / 升级重试、供应商与模型 CRUD、模板绑定校验、计划章节索引 / 错误码 / 波次 / 关键路径 / 环路径、计划 API（生成 / 编辑 / save 与 run 提交 / 幂等 / 归档）、并发闸门 / 节点超时 / 退避重试 / seq 缓存 / 取消收据 / metrics、模型发现与导入去重、评审节点 / 阻塞回退 / 轮次用尽 / 评审 API 与指标、三方讨论、数据统计（空窗口不除零 / 成功率 / 失败计数 / 平均耗时 / Token / 成本空态 / 时间筛选 / 趋势补零 / 状态分布 / 非法参数 400）。
