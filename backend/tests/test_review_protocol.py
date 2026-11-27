@@ -166,6 +166,9 @@ def test_review_without_issues_accepts(monkeypatch) -> None:
     # 前置检查的结论要写进会议状态：裁决模型（F1）从这里读
     state = _meeting(node_id)["state"]
     assert state["precheck_ok"] is True
+    # 报告的摘要与阻塞数也记进会议状态：/runs/{id}/review 与指标按报告的会议取
+    assert state["summary"] == "评审会议完成：结论 接受，0 条意见，0 条达到阻塞线"
+    assert state["blocking"] == 0
     assert any(section["title"] == "被评审的建设方案"
                for section in _meeting(node_id)["charter"].get("sections") or [])
     kinds = Counter(call["kind"] for call in seen)

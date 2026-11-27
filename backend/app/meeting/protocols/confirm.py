@@ -787,11 +787,12 @@ class ConfirmProtocol(MeetingProtocol):
         precheck_ok, precheck_reason = self._precheck(verdict, accepted_by_user)
         mtg.set_state(precheck_ok=precheck_ok, precheck_reason=precheck_reason)
         report = self._write_report(mtg, items, verdict, accepted_by_user)
-        mtg.set_state(minutes_version=report["version"])    # 纪要接口按会议记下的版本取
         line = str(mtg.params().get("min_blocking_severity") or "major")
         blocking = _blocking(items, line)
         summary = (f"需求确认会议完成：结论 {'通过' if verdict == 'pass' else '不通过'}，"
                    f"{len(items)} 条待办，{len(blocking)} 条阻塞")
+        # 纪要接口按会议记下的版本取；摘要与阻塞数留给 /runs/{id}/review 与指标按报告取
+        mtg.set_state(minutes_version=report["version"], summary=summary, blocking=len(blocking))
         return done(summary, verdict=verdict, precheck_ok=precheck_ok,
                     precheck_reason=precheck_reason, accepted_by_user=accepted_by_user,
                     report=report, items=len(items), blocking=len(blocking))

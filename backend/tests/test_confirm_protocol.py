@@ -203,6 +203,9 @@ def test_faithful_spec_passes(monkeypatch) -> None:
     assert result["done"] is True
     assert result["verdict"] == "pass" and result["precheck_ok"] is True
     assert _state(node_id)["precheck_ok"] is True
+    # 报告的摘要与阻塞数也记进会议状态：/runs/{id}/review 与指标按报告的会议取
+    assert _state(node_id)["summary"] == "需求确认会议完成：结论 通过，0 条待办，0 条阻塞"
+    assert _state(node_id)["blocking"] == 0
     assert any(section["title"] == "需求规格（当前版本）"
                for section in _meeting(node_id)["charter"].get("sections") or [])
     assert _items(node_id) == []

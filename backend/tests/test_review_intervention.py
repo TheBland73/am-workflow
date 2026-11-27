@@ -136,6 +136,91 @@ def test_minutes_export_for_a_discussion_meeting() -> None:
             f"/api/runs/{empty_run}/meetings/{empty_meeting}/minutes").status_code == 404
 
 
+CONFIRM_ITEMS = [
+    {"id": "C1", "kind": "mechanical", "requirement": "", "index": "",
+     "severity": "blocker", "problem": "需求里有个编号重复", "suggestion": "改编号"},
+    {"id": "C2", "kind": "quality", "requirement": "R2", "index": "",
+     "severity": "minor", "problem": "表述有歧义", "suggestion": "补一句说明"},
+]
+
+
+def test_review_endpoints_serve_a_front_half_review_report() -> None:
+    """前半段的评审报告写在 review 工件里：结构化字段取自写出报告的那场会议。"""
+    run_id = _make_run("finished")
+    node_id = _node_id(run_id, "review")
+    with session_scope() as s:
+        s.add(Meeting(run_id=run_id, node_id=node_id, node_key="review", protocol="review",
+                      status="completed", phase="done", round=1, charter_json={},
+                      config_json={"params": {}},
+                      state_json={"verdict": "accept", "issues": [dict(ISSUE)],
+                                  "minutes_version": 1,
+                                  "summary": "评审会议完成：结论 接受，1 条意见，1 条达到阻塞线",
+                                  "blocking": 1}))
+    write_artifact(run_id, "review", "# 评审报告\n\nFRONT-REPORT-MARKER\n",
+                   created_by="chair", inputs=["proposal"],
+                   extra_meta={"review_type": "proposal"})
+
+    with TestClient(app) as client:
+        data = client.get(f"/api/runs/{run_id}/review").json()
+
+    assert data["available"] is True
+    assert data["verdict"] == "pass"            # accept 归一成前端面板认的 pass
+    assert data["summary"] == "评审会议完成：结论 接受，1 条意见，1 条达到阻塞线"
+    assert data["blocking"] == 1 and data["round"] == 1 and data["max_rounds"] == 3
+    assert data["node_key"] == "review" and data["can_rework"] is False
+    assert [issue["message"] for issue in data["issues"]] == ["范围写得不够清楚"]
+    issue = data["issues"][0]
+    assert issue["severity"] == "major" and issue["task_uid"] == ""
+    assert issue["file"] == ISSUE["location"] and issue["suggestion"] == ISSUE["suggestion"]
+    assert "FRONT-REPORT-MARKER" in data["body"]
+    assert data["artifact"]["version"] == 1
+
+    metrics = run_metrics(run_id)
+
+    review = metrics["review"]
+    assert review["total"] == 1 and review["verdict"] == "pass"
+    assert review["first_pass"] is True and review["rework_count"] == 0
+    assert review["nodes"][0]["node_key"] == "review" and review["nodes"][0]["issues"] == 1
+    assert review["severities"]["major"] == 1
+
+
+def test_review_endpoints_serve_a_requirement_confirmation_report() -> None:
+    """确认报告与评审报告共用 review 工件，靠 review_type 区分；待办映射成意见的形状。"""
+    run_id = _make_run("finished")
+    node_id = _node_id(run_id, "confirm")
+    with session_scope() as s:
+        s.add(Meeting(run_id=run_id, node_id=node_id, node_key="confirm", protocol="confirm",
+                      status="completed", phase="done", round=1, charter_json={},
+                      config_json={"params": {}},
+                      state_json={"verdict": "fail",
+                                  "items": [dict(row) for row in CONFIRM_ITEMS],
+                                  "minutes_version": 1,
+                                  "summary": "需求确认会议完成：结论 不通过，2 条待办，1 条阻塞",
+                                  "blocking": 1}))
+    write_artifact(run_id, "review", "# 需求确认报告\n\nCONFIRM-REPORT-MARKER\n",
+                   created_by="chair", inputs=["requirement"],
+                   extra_meta={"review_type": "requirement"})
+
+    with TestClient(app) as client:
+        data = client.get(f"/api/runs/{run_id}/review").json()
+
+    assert data["available"] is True
+    assert data["verdict"] == "block"           # fail 归一成 block
+    assert data["summary"] == "需求确认会议完成：结论 不通过，2 条待办，1 条阻塞"
+    assert data["blocking"] == 1 and data["node_key"] == "confirm"
+    assert [issue["severity"] for issue in data["issues"]] == ["blocker", "minor"]
+    assert [issue["message"] for issue in data["issues"]] == ["需求里有个编号重复", "表述有歧义"]
+    assert data["issues"][1]["file"] == "R2"
+    assert "CONFIRM-REPORT-MARKER" in data["body"]
+
+    metrics = run_metrics(run_id)
+
+    review = metrics["review"]
+    assert review["total"] == 1 and review["verdict"] == "block"
+    assert review["first_pass"] is False
+    assert review["severities"] == {"blocker": 1, "major": 0, "minor": 1}
+
+
 def test_metrics_include_context_and_meetings() -> None:
     run_id = _make_run("running")
     node_id = _node_id(run_id, "discuss")

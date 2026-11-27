@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 
 from app.api.schemas import MaterialIn, RunConfigPatch, RunIn
-from app.artifacts.store import latest_artifact, list_artifacts, read_artifact, write_artifact
+from app.artifacts.store import (latest_artifact, list_artifacts, parse_front_matter,
+                                 read_artifact, read_record, write_artifact)
 from app.config import settings
 from app.conversation.policy import reset_policy_cache
 from app.db.base import session_scope
@@ -293,9 +294,113 @@ def _span_ms(start: datetime | None, end: datetime | None) -> int:
     return max(0, int((b - a).total_seconds() * 1000))
 
 
+# 前半段报告的结论取值 → 前端面板认的 pass/block（旧 REVIEW 节点的报告本来就是 pass/block）
+_PASS_VERDICTS = ("pass", "accept", "conditional")
+
+
+def _front_review_reports(run_id: str) -> list[dict]:
+    """前半段写出评审/确认报告的会议，按会议先后排列。
+
+    报告正文写在 review 工件里（front-matter 的 review_type 区分评审与确认报告），
+    版本记在会议状态 minutes_version；结论、意见/待办、摘要与阻塞数是写报告时
+    记进会议状态的。
+    """
+    with session_scope() as s:
+        run = s.get(Run, run_id)
+        if run is None:
+            return []
+        nodes = {row.id: row for row in s.query(Node).filter(Node.run_id == run_id)}
+        meetings = (s.query(Meeting)
+                    .filter(Meeting.run_id == run_id, Meeting.protocol.in_(("review", "confirm")))
+                    .order_by(Meeting.id.asc()).all())
+        reports = []
+        for row in meetings:
+            state = dict(row.state_json or {})
+            if not state.get("minutes_version"):
+                continue
+            node = nodes.get(row.node_id)
+            if node is None:
+                continue
+            verdict_raw = str(state.get("verdict") or "")
+            reports.append({
+                "node_id": row.node_id, "node_key": node.node_key, "node_name": node.name,
+                "node_status": node.status, "order_index": node.order_index,
+                "max_rounds": int((node.config_json or {}).get("max_rounds") or 2),
+                "meeting_id": row.id, "round": int(row.round or 1),
+                "review_type": "requirement" if row.protocol == "confirm" else "proposal",
+                "version": int(state.get("minutes_version") or 0),
+                "verdict_raw": verdict_raw,
+                "verdict": ("pass" if verdict_raw in _PASS_VERDICTS else "block") if verdict_raw
+                           else None,
+                "summary": str(state.get("summary") or ""),
+                "blocking": int(state.get("blocking") or 0),
+                "rows": list(state.get("issues") or []) if row.protocol == "review"
+                        else list(state.get("items") or []),
+                "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+                "run_status": run.status,
+            })
+    return reports
+
+
+def _front_report_issues(report: dict) -> list[dict]:
+    """报告里的意见/待办映射成前端问题清单的形状（task_uid 恒空：前半段没有可回退的任务）。"""
+    is_requirement = report["review_type"] == "requirement"
+    return [{
+        "severity": str(row.get("severity") or "minor"),
+        "task_uid": "",
+        "file": (str(row.get("requirement") or row.get("index") or "") if is_requirement
+                 else str(row.get("location") or "")),
+        "message": str(row.get("problem") or ""),
+        "suggestion": str(row.get("suggestion") or ""),
+    } for row in report["rows"]]
+
+
 @router.get("/runs/{run_id}/review")
 def get_run_review(run_id: str) -> dict:
-    """最新评审报告：结论、问题清单、报告正文与是否可回退。"""
+    """最新评审报告：结论、问题清单、报告正文与是否可回退。
+
+    前半段的评审/确认报告写在 review 工件里（front-matter 的 review_type），
+    结构化字段取自写出报告的那场会议的状态；旧运行的报告仍在 REVIEW 节点的
+    配置里（它写的工件没有 review_type），按节点取。
+    """
+    reports = _front_review_reports(run_id)
+    record = latest_artifact(run_id, "review")
+    meta, body = {}, ""
+    if record:
+        raw = read_record(record)
+        if raw:
+            meta, body = parse_front_matter(raw)
+            body = body.strip()
+    if str(meta.get("review_type") or "") in ("proposal", "requirement"):
+        report = next((r for r in reversed(reports)
+                       if r["version"] == (record or {}).get("version")), None)
+        if report is not None:
+            return {
+                "available": True,
+                "run_id": run_id,
+                "run_status": report["run_status"],
+                "node_id": report["node_id"],
+                "node_key": report["node_key"],
+                "node_status": report["node_status"],
+                "verdict": report["verdict"],
+                "summary": report["summary"],
+                "issues": _front_report_issues(report),
+                "blocking": report["blocking"],
+                "targets": [],
+                "round": report["round"],
+                "max_rounds": report["max_rounds"],
+                "reviewed_at": report["finished_at"],
+                "files": [],
+                "history": [{"round": r["round"], "verdict": r["verdict"],
+                             "issues": len(r["rows"]), "blocking": r["blocking"],
+                             "at": r["finished_at"], "summary": r["summary"][:300]}
+                            for r in reports if r["node_id"] == report["node_id"]],
+                "escalated": False,
+                "can_rework": False,
+                "artifact": record,
+                "body": body,
+                "review_type": report["review_type"],
+            }
     with session_scope() as s:
         run = s.get(Run, run_id)
         if run is None:
@@ -336,10 +441,8 @@ def get_run_review(run_id: str) -> dict:
     payload["artifact"] = latest_artifact(run_id, "review")
     raw = read_artifact(run_id, "review")
     if raw:
-        from app.artifacts.store import parse_front_matter
-
-        _meta, body = parse_front_matter(raw)
-        payload["body"] = body.strip()
+        _meta, artifact_body = parse_front_matter(raw)
+        payload["body"] = artifact_body.strip()
     return payload
 
 
@@ -499,6 +602,33 @@ def run_metrics(run_id: str) -> dict:
             "attempts": len(rows), "exec_ms": sum(ms),
             "blocks": sum(1 for h in history if str(h.get("verdict")) == "block"),
             "history": history[-8:],
+        })
+    # 前半段的评审/确认会议：每个节点取最近一场写出报告的会议，历史按会议先后。
+    # 一场运行不会同时有 REVIEW 节点与会议报告，两段不会重复计数。
+    front_reports = _front_review_reports(run_id)
+    front_by_node: dict[int, list[dict]] = {}
+    for report in front_reports:
+        front_by_node.setdefault(report["node_id"], []).append(report)
+    for node_id in sorted(front_by_node, key=lambda nid: front_by_node[nid][0]["order_index"]):
+        rows = front_by_node[node_id]
+        latest = rows[-1]
+        node_rows = by_node.get(node_id, [])
+        ms = [_span_ms(a.started_at, a.finished_at) for a in node_rows]
+        review_ms.extend(ms)
+        for issue in latest["rows"]:
+            severity = str(issue.get("severity") or "minor")
+            severities[severity] = severities.get(severity, 0) + 1
+        review_nodes.append({
+            "node_key": latest["node_key"], "name": latest["node_name"],
+            "verdict": latest["verdict"],
+            "round": latest["round"], "max_rounds": latest["max_rounds"],
+            "issues": len(latest["rows"]), "blocking": latest["blocking"],
+            "summary": latest["summary"], "reviewed_at": latest["finished_at"],
+            "attempts": len(node_rows), "exec_ms": sum(ms),
+            "blocks": sum(1 for r in rows if r["verdict"] == "block"),
+            "history": [{"round": r["round"], "verdict": r["verdict"], "issues": len(r["rows"]),
+                         "blocking": r["blocking"], "at": r["finished_at"],
+                         "summary": r["summary"][:300]} for r in rows],
         })
     latest_review = review_nodes[-1] if review_nodes else None
     first_pass = bool(
