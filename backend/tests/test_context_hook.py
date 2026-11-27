@@ -98,15 +98,26 @@ def test_record_compaction_writes_summary_and_event() -> None:
     node_id, attempt_id = _setup("hook-b")
     message_id = asyncio.run(record_compaction(
         run_id="hook-b", node_id=node_id, attempt_id=attempt_id, scope="agent_loop",
-        summary="摘要", before_tokens=900, after_tokens=300))
+        summary="摘要", before_tokens=900, after_tokens=300,
+        calls=2, summarized_tokens=1500))
     assert "context_compacted" in _event_types("hook-b")
-    # 摘要作为一条标记了压缩边界的消息留在会话日志里，压缩前后的占用一并记下
+    # 摘要作为一条标记了压缩边界的消息留在会话日志里，压缩前后的占用与摘要成本一并记下
     conversation_id = get_or_create_conversation(
         run_id="hook-b", node_id=node_id, scope="agent_loop", owner=f"attempt-{attempt_id}")
     rows = load_messages(conversation_id)
     assert [(r["seq"], r["kind"], r["content"], r["meta"]) for r in rows] == [
-        (1, "summary", "摘要", {"before_tokens": 900, "after_tokens": 300})]
+        (1, "summary", "摘要", {"before_tokens": 900, "after_tokens": 300,
+                                "calls": 2, "summarized_tokens": 1500})]
     assert message_id > 0
+    event = next(e for e in _events("hook-b") if e.type == "context_compacted")
+    assert event.payload_json == {"scope": "agent_loop", "before_tokens": 900,
+                                  "after_tokens": 300, "calls": 2,
+                                  "summarized_tokens": 1500}
+
+
+def _events(run_id: str) -> list[Event]:
+    with session_scope() as s:
+        return s.query(Event).filter(Event.run_id == run_id).all()
 
 
 def test_hook_compacts_when_threshold_is_reached(monkeypatch) -> None:
@@ -168,9 +179,9 @@ def test_failed_summarization_does_not_kill_the_node(monkeypatch) -> None:
     assert result.content == "完成"
     assert "context_compacted" not in _event_types("hook-h")
     assert seen[-1][1].content == "字" * 900              # 原始提示原样还在，没有留下半截摘要
-    # 之后每一步仍在阈值之上，所以每一步都会再试一次、各记一条告警（每条都是压缩告警）
-    logs = _node_logs("hook-h")
-    assert logs and all(level == "warn" and "压缩" in message for level, message in logs)
+    # 之后仍在阈值之上，所以每次重试都会再失败一次、各记一条压缩告警（另有进度日志，级别是 info）
+    warnings = [message for level, message in _node_logs("hook-h") if level == "warn"]
+    assert warnings and all("压缩" in message for message in warnings)
 
 
 def test_extra_messages_skip_the_compaction_hook(monkeypatch) -> None:
@@ -193,6 +204,56 @@ def test_extra_messages_skip_the_compaction_hook(monkeypatch) -> None:
     assert result.content == "完成"
     assert touched == []                                     # 钩子一次都没有被调用
     assert seen[-1][1].content == "字" * 900                  # 原始上下文原样还在
+
+
+def test_compaction_cools_down_after_a_compaction_that_stays_above_the_trigger(monkeypatch) -> None:
+    # 压完仍高于触发线时每一步都重试，会把最近的消息反复摘要一遍。冷却几轮再试
+    node_id, attempt_id = _setup("hook-k")
+    calls: list[int] = []
+
+    async def over_trigger(**kwargs):
+        calls.append(len(kwargs["messages"]))
+        messages = kwargs["messages"]
+        return ([messages[0], Message(role="user", content="【较早对话的摘要】\n摘要")]
+                + messages[-2:], 900, 900)
+
+    monkeypatch.setattr(agent_loop, "maybe_compact", over_trigger)
+    _install_fake_stream(monkeypatch, [], tool_calls=4)
+    asyncio.run(run_agent(
+        run_id="hook-k", node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
+        system_prompt="系统", user_prompt="字" * 900,
+        toolbox=Toolbox(workspace_dir("hook-k"), allow_shell=False), max_steps=6, quiet=True))
+    assert len(calls) == 2                                   # 第 2 步压一次，冷却结束后第 5 步再试
+
+
+def test_successful_compaction_does_not_start_a_cooldown(monkeypatch) -> None:
+    node_id, attempt_id = _setup("hook-l")
+    calls: list[int] = []
+
+    async def below_trigger(**kwargs):
+        calls.append(len(kwargs["messages"]))
+        messages = kwargs["messages"]
+        return ([messages[0], Message(role="user", content="【较早对话的摘要】\n摘要")]
+                + messages[-2:], 900, 300)
+
+    monkeypatch.setattr(agent_loop, "maybe_compact", below_trigger)
+    _install_fake_stream(monkeypatch, [], tool_calls=4)
+    asyncio.run(run_agent(
+        run_id="hook-l", node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
+        system_prompt="系统", user_prompt="字" * 900,
+        toolbox=Toolbox(workspace_dir("hook-l"), allow_shell=False), max_steps=6, quiet=True))
+    assert len(calls) == 4                                   # 第 2–5 步每步都检查
+
+
+def test_compaction_progress_is_logged_between_chunks(monkeypatch) -> None:
+    node_id, attempt_id = _setup("hook-m")
+    _install_fake_stream(monkeypatch, [], tool_calls=5)
+    asyncio.run(run_agent(
+        run_id="hook-m", node_id=node_id, attempt_id=attempt_id, model=SimpleNamespace(**_MODEL),
+        system_prompt="系统", user_prompt="字" * 900,
+        toolbox=Toolbox(workspace_dir("hook-m"), allow_shell=False), max_steps=6, quiet=True))
+    messages = [message for _, message in _node_logs("hook-m")]
+    assert any("压缩上下文" in message for message in messages)
 
 
 def test_budget_exhausted_during_summarization_still_stops_the_run(monkeypatch) -> None:

@@ -15,7 +15,7 @@ from typing import Callable
 
 from app.artifacts.store import strip_outer_fence
 from app.conversation.builder import Segment
-from app.conversation.compact import compact_messages
+from app.conversation.compact import CompactionStats, compact_messages
 from app.conversation.policy import DEFAULT_POLICY, policy_for_run
 from app.conversation.store import record_compaction
 from app.engine.agent_loop import _extract_json, run_agent
@@ -114,10 +114,18 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
         return segments
     messages = [Message(role="system", content="系统")]
     messages += [Message(role=s.role, content=s.text) for s in append]
+    stats = CompactionStats()
+
+    async def report_progress(index: int, total: int | None) -> None:
+        done = f"/{total}" if total else ""
+        await emit(mtg.run_id, "node_log", mtg.node_id, {
+            "level": "info", "message": f"压缩上下文：第 {index}{done} 块"})
+
     try:
         compacted, before, after = await compact_messages(
             messages, summarize=lambda text: _summarize_exchanges(mtg, model, text),
-            input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy)
+            input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy,
+            stats=stats, on_progress=report_progress)
     except BudgetExceeded:
         raise
     except Exception as exc:
@@ -128,7 +136,8 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
         return segments
     await record_compaction(
         run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id, scope="meeting",
-        summary=compacted[1].content, before_tokens=before + fixed, after_tokens=after + fixed)
+        summary=compacted[1].content, before_tokens=before + fixed, after_tokens=after + fixed,
+        calls=stats.calls, summarized_tokens=stats.summarized_tokens)
     return ([s for s in segments if s.kind == "frozen"]
             + [Segment("append", m.content, role=m.role,
                        name="交锋摘要" if index == 0 else "较早发言")

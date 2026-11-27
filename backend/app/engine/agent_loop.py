@@ -5,16 +5,20 @@ import json
 from dataclasses import dataclass
 
 from app.config import settings
-from app.conversation.compact import make_summarizer, maybe_compact, summary_of
+from app.conversation.compact import (CompactionStats, make_summarizer, maybe_compact,
+                                      summary_of)
 from app.conversation.policy import policy_for_run
 from app.conversation.store import record_compaction
 from app.db.base import session_scope
 from app.db.models import Message as MessageRow
 from app.engine.events import emit, emit_token
 from app.engine.usage import BudgetExceeded, add_attempt_usage, consume_run_budget
+from app.models.budget import ContextBudget
 from app.models.pool import ModelInfo, pool
 from app.models.types import GenParams, Message, StreamEvent, Usage
 from app.tools.registry import Toolbox, ToolOutcome
+
+_COMPACT_COOLDOWN_STEPS = 3      # 压完仍在触发线之上时，隔几步再试，不每一步都重压
 
 
 class AgentExceeded(RuntimeError):
@@ -93,21 +97,32 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
     messages += extra_messages if extra_messages is not None else [
         Message(role="user", content=user_prompt)]
     total = Usage()
+    cooldown_until = 0
     for step in range(1, max_steps + 1):
         params = GenParams(
             model=model.model_name,
             temperature=temperature,
             max_tokens=min(4096, model.max_output_tokens or 4096),
         )
-        if extra_messages is None and len(messages) > 2:
+        if extra_messages is None and len(messages) > 2 and step >= cooldown_until:
             # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）。
             # 调用方给了现成的消息列表（会议）时跳过：冻结区由调用方自己管理，这里压了会破坏前缀。
             # 摘要失败时按原消息继续——压缩只是优化，不该让已经跑了很久的节点作废、从头重来。
             # 预算耗尽是例外：那是要由人处理的事，照常上抛。
+            policy = policy_for_run(run_id)
+            input_budget = ContextBudget(model.context_window,
+                                         model.max_output_tokens).input_budget
+            stats = CompactionStats()
+
+            async def report_progress(index: int, total: int | None) -> None:
+                done = f"/{total}" if total else ""
+                await emit(run_id, "node_log", node_id, {
+                    "level": "info", "message": f"压缩上下文：第 {index}{done} 块"})
+
             try:
                 compacted, before_tokens, after_tokens = await maybe_compact(
-                    run_id=run_id, node_id=node_id, model=model,
-                    policy=policy_for_run(run_id), messages=messages,
+                    run_id=run_id, node_id=node_id, model=model, policy=policy,
+                    messages=messages, stats=stats, on_progress=report_progress,
                     summarize=make_summarizer(run_id=run_id, attempt_id=attempt_id, model=model))
             except BudgetExceeded:
                 raise
@@ -120,8 +135,12 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
                 await record_compaction(
                     run_id=run_id, node_id=node_id, attempt_id=attempt_id, scope="agent_loop",
                     summary=summary_of(compacted) or "", before_tokens=before_tokens,
-                    after_tokens=after_tokens)
+                    after_tokens=after_tokens, calls=stats.calls,
+                    summarized_tokens=stats.summarized_tokens)
                 messages = compacted
+                if after_tokens >= policy.compact_at * max(1, input_budget):
+                    # 压不到触发线以下：冷却几轮再试，避免每一步都把最近的消息重新摘要一遍
+                    cooldown_until = step + _COMPACT_COOLDOWN_STEPS
         if not quiet:
             await emit(run_id, "node_log", node_id,
                        {"level": "info",

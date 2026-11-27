@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from app.conversation.policy import ContextPolicy
@@ -24,10 +25,20 @@ SUMMARY_PREFIX = "【较早对话的摘要】\n"
 _EARLIER_SUMMARY_HEADING = "【此前内容的摘要】\n"
 _LATER_CONTENT_HEADING = "【之后的内容】\n"
 _SUMMARY_CHUNK_TOKENS = 24_000   # 一次送给摘要模型的旧内容上限（估算 token）
+MAX_SUMMARY_CALLS = 8            # 一次压缩最多调用几次摘要模型
 _RECENT_MESSAGE_CAP = 2000
 _MIN_RECENT_CAP = 200
 
 Summarizer = Callable[[str], Awaitable[str]]
+ProgressCallback = Callable[[int, int | None], Awaitable[None]]
+
+
+@dataclass
+class CompactionStats:
+    """一次压缩的账：调了几次摘要、送了大约多少 token、压掉了前面多少条。"""
+    calls: int = 0
+    summarized_tokens: int = 0
+    cut: int = 0
 
 
 def _call_text(call: ToolCall) -> str:
@@ -113,14 +124,21 @@ def _cap(message: Message, cap: int = _RECENT_MESSAGE_CAP) -> Message:
 
 
 async def compact_messages(messages: list[Message], *, summarize: Summarizer,
-                           input_budget: int,
-                           policy: ContextPolicy) -> tuple[list[Message], int, int]:
+                           input_budget: int, policy: ContextPolicy,
+                           max_calls: int | None = None,
+                           stats: CompactionStats | None = None,
+                           on_progress: ProgressCallback | None = None
+                           ) -> tuple[list[Message], int, int]:
     """压缩 messages 里除系统提示与最近若干条之外的内容。
 
     返回 (压缩后的列表, 压缩前的估算 token, 压缩后的估算 token)。
     分三步：较早的消息从旧到新分块压成一条滚动摘要；压完仍高于目标占用时，把保留的
     最近消息逐级截短；都不够了才把保留部分里较早的几组也并进摘要。
     可压缩的内容不足时原样返回，后两个值相等。
+
+    max_calls 给一次压缩的摘要调用数封顶：块数超过上限时只压最近的几块，更早的内容
+    在摘要里注明没有纳入；合并保留部分的整组也不会超过这个上限。stats 收集调用次数、
+    送入的 token 量与压掉的条数，on_progress 在每个块之前报告进度。
     """
     before = estimate_messages(messages)
     head = [m for m in messages if m.role == "system"]
@@ -132,11 +150,35 @@ async def compact_messages(messages: list[Message], *, summarize: Summarizer,
     # 这样的工具结果一并交给摘要。
     while cut < len(rest) and rest[cut].role == "tool":
         cut += 1
+    if cut <= 0:
+        return messages, before, before
+    if cut == 1 and rest[0].role == "user" and (rest[0].content or "").startswith(SUMMARY_PREFIX):
+        # 可压的只剩上一版摘要：再压一次只是把摘要摘要一遍，白花一次调用
+        return messages, before, before
+    limit = max(1, int(max_calls if max_calls is not None else MAX_SUMMARY_CALLS))
+    chunks = _chunks(rest[:cut])
+    omitted = 0
+    if len(chunks) > limit:
+        omitted = len(chunks) - limit
+        chunks = chunks[-limit:]
+    planned = len(chunks)
+    counted = CompactionStats()
+
+    async def summarize_chunk(text: str) -> str:
+        if on_progress is not None:
+            await on_progress(counted.calls + 1, planned if counted.calls < planned else None)
+        counted.calls += 1
+        counted.summarized_tokens += estimate_tokens(text)
+        return await summarize(text)
+
     summary = ""
-    for chunk in _chunks(rest[:cut]):
+    for chunk in chunks:
         text = chunk if not summary else (
             _EARLIER_SUMMARY_HEADING + summary + "\n\n" + _LATER_CONTENT_HEADING + chunk)
-        summary = await summarize(text)
+        summary = await summarize_chunk(text)
+    if omitted:
+        summary = (f"【更早的 {omitted} 段内容因单次压缩的摘要调用上限未纳入摘要】\n"
+                   + summary)
     summary_message = Message(role="user", content=SUMMARY_PREFIX + summary)
     candidate = head + [summary_message] + [_cap(m) for m in rest[cut:]]
     after = estimate_messages(candidate)
@@ -151,21 +193,29 @@ async def compact_messages(messages: list[Message], *, summarize: Summarizer,
     # 每一步都得重新摘要。把保留部分里较早的几组整组并进摘要，直到落到触发线以下，
     # 或者保留部分已经并空（系统提示本身就很大时降不下去，只能带着超线的内容继续）。
     # 整组进出，工具结果不会和它回应的助手消息拆开。
-    while after >= trigger and cut < len(rest):
+    while after >= trigger and cut < len(rest) and counted.calls < limit:
         size = _group_size(rest, cut)
         group = "\n".join(_render([m]) for m in rest[cut:cut + size])
-        summary = await summarize(
+        summary = await summarize_chunk(
             _EARLIER_SUMMARY_HEADING + summary + "\n\n" + _LATER_CONTENT_HEADING + group)
         summary_message = Message(role="user", content=SUMMARY_PREFIX + summary)
         cut += size
         candidate = head + [summary_message] + [_cap(m, cap) for m in rest[cut:]]
         after = estimate_messages(candidate)
+    if stats is not None:
+        stats.calls = counted.calls
+        stats.summarized_tokens = counted.summarized_tokens
+        stats.cut = cut
     return candidate, before, after
 
 
 async def maybe_compact(*, run_id: str, node_id: int, model: ModelInfo,
                         policy: ContextPolicy, messages: list[Message],
-                        summarize: Summarizer | None = None) -> tuple[list[Message], int, int]:
+                        summarize: Summarizer | None = None,
+                        max_calls: int | None = None,
+                        stats: CompactionStats | None = None,
+                        on_progress: ProgressCallback | None = None
+                        ) -> tuple[list[Message], int, int]:
     """没压缩时（没到阈值，或者到了阈值但没有可压的内容）原样返回，后两个值为 -1。
 
     压缩过时返回新列表和压缩前后的估算占用；摘要消息的正文用 summary_of() 取。
@@ -175,7 +225,8 @@ async def maybe_compact(*, run_id: str, node_id: int, model: ModelInfo,
         return messages, -1, -1
     summarize = summarize or make_summarizer(run_id=run_id, attempt_id=0, model=model)
     result, before, after = await compact_messages(
-        messages, summarize=summarize, input_budget=input_budget, policy=policy)
+        messages, summarize=summarize, input_budget=input_budget, policy=policy,
+        max_calls=max_calls, stats=stats, on_progress=on_progress)
     if result is messages:
         return messages, -1, -1
     return result, before, after

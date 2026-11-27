@@ -61,13 +61,20 @@ def load_messages(conversation_id: int, since_seq: int = 0, limit: int = 500) ->
 
 
 async def record_compaction(*, run_id: str, node_id: int, attempt_id: int, scope: str,
-                            summary: str, before_tokens: int, after_tokens: int) -> int:
-    """把一次压缩写进会话日志，并推送 context_compacted 事件。"""
+                            summary: str, before_tokens: int, after_tokens: int,
+                            calls: int = 0, summarized_tokens: int = 0) -> int:
+    """把一次压缩写进会话日志，并推送 context_compacted 事件。
+
+    calls / summarized_tokens 是这次压缩花掉的摘要调用次数与送入的估算 token，
+    用来核对压缩的成本。
+    """
     conversation_id = get_or_create_conversation(
         run_id=run_id, node_id=node_id, scope=scope, owner=f"attempt-{attempt_id}")
     message_id = append_message(
         conversation_id, role="user", content=summary, kind="summary",
-        meta={"before_tokens": before_tokens, "after_tokens": after_tokens})
+        meta={"before_tokens": before_tokens, "after_tokens": after_tokens,
+              "calls": calls, "summarized_tokens": summarized_tokens})
     await emit(run_id, "context_compacted", node_id,
-               {"scope": scope, "before_tokens": before_tokens, "after_tokens": after_tokens})
+               {"scope": scope, "before_tokens": before_tokens, "after_tokens": after_tokens,
+                "calls": calls, "summarized_tokens": summarized_tokens})
     return message_id

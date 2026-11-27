@@ -12,6 +12,7 @@ from app.conversation import compact
 from app.conversation.compact import compact_messages, needs_compaction
 from app.conversation.policy import ContextPolicy
 from app.db.base import init_db
+from app.models.budget import estimate_tokens
 from app.models.providers.openai_chat import OpenAIChatAdapter
 from app.models.types import Message, ToolCall
 
@@ -250,6 +251,91 @@ def test_empty_summary_is_a_failure_not_a_summary(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="空正文"):
         asyncio.run(summarize("旧对话"))
+
+
+def test_summary_call_cap_drops_the_oldest_chunks_and_says_so() -> None:
+    # 一次压缩的摘要调用数设上限：块数超过上限时只压最近的几块（离保留窗口最近的最有用），
+    # 丢掉的更早内容在摘要里注明，不能悄悄少一截
+    messages = [Message(role="system", content="系统")]
+    for index in range(6):
+        messages.append(Message(role="user", content=f"第{index}段开始" + "字" * 10_000))
+        messages.append(Message(role="assistant", content=f"第{index}段结束" + "字" * 10_000))
+    messages += [Message(role="user", content="最近的问题"), Message(role="assistant", content="最近的回答")]
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return f"摘要{len(seen)}"
+
+    stats = compact.CompactionStats()
+    result, _, _ = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=1_000_000, policy=POLICY,
+        max_calls=3, stats=stats))
+    assert len(seen) == 3
+    assert "第0段开始" not in seen[0] and "第3段开始" in seen[0]
+    assert "第5段结束" in seen[-1]
+    assert "未纳入摘要" in result[1].content
+    assert stats.calls == 3
+
+
+def test_the_call_cap_also_limits_folding_groups_into_the_summary() -> None:
+    # 压完仍在触发线之上时本来会继续把整组并进摘要；上限用尽就停在那里，
+    # 不能一边设上限一边又为合并多调几次
+    def write(index: int) -> Message:
+        return Message(role="assistant", content="", tool_calls=[
+            ToolCall(id=f"c{index}", name="write_file", args={"path": "a.py", "content": "字" * 3000})])
+
+    messages = [Message(role="system", content="系统"), Message(role="user", content="任务")]
+    for index in range(5):
+        messages += [write(index), Message(role="tool", content="写好了", tool_call_id=f"c{index}")]
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return "摘要"
+
+    _, _, after = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=3000, policy=POLICY, max_calls=1))
+    assert len(seen) == 1
+    assert after >= 0.8 * 3000                    # 没有继续并入，仍高于触发线
+
+
+def test_skips_when_the_only_compressible_message_is_the_previous_summary() -> None:
+    # 上一版摘要已经是全部可压内容：再摘要一次只是把摘要摘要一遍，白花一次调用
+    messages = [Message(role="system", content="系统"),
+                Message(role="user", content=compact.SUMMARY_PREFIX + "旧摘要"),
+                Message(role="assistant", content="最近一"),
+                Message(role="user", content="最近二")]
+    seen: list[str] = []
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return "新摘要"
+
+    result, before, after = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=1000, policy=POLICY))
+    assert result is messages and seen == [] and before == after
+
+
+def test_reports_calls_summarized_tokens_and_chunk_progress() -> None:
+    messages = _messages(8, each=100)
+    seen: list[str] = []
+    progress: list[tuple[int, int]] = []
+    stats = compact.CompactionStats()
+
+    async def summarize(text: str) -> str:
+        seen.append(text)
+        return "摘要"
+
+    async def on_progress(index: int, total: int) -> None:
+        progress.append((index, total))
+
+    asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=800, policy=POLICY,
+        stats=stats, on_progress=on_progress))
+    assert stats.calls == 1 and stats.cut == 6
+    assert stats.summarized_tokens == sum(estimate_tokens(text) for text in seen)
+    assert progress == [(1, 1)]
 
 
 def test_maybe_compact_reports_no_compaction_when_there_is_nothing_to_compact() -> None:
