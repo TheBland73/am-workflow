@@ -86,10 +86,10 @@ def _window(days: int, start: str | None, end: str | None) -> dict:
         begin = datetime.combine(today - timedelta(days=days - 1), datetime.min.time())
         end_exclusive = datetime.combine(today + timedelta(days=1), datetime.min.time())
 
-    span = (end_exclusive.date() - begin.date()).days or 1
+    last_day = (end_exclusive - timedelta(microseconds=1)).date()
+    span = (last_day - begin.date()).days + 1
     if span > MAX_SPAN_DAYS:
         raise HTTPException(400, f"时间范围过大，最多 {MAX_SPAN_DAYS} 天（当前 {span} 天）")
-    last_day = (end_exclusive - timedelta(microseconds=1)).date()
     return {
         "days": span,
         "start": begin,
@@ -422,7 +422,8 @@ def analytics_status_distribution(
     window = _window(days, start, end)
     with session_scope() as s:
         counts = _status_counts(s, window)
-    total = sum(counts.values())
+    # 只统计 API 白名单内的状态：未知状态不展示，避免前端点进去被 recent-runs 400。
+    total = sum(counts.get(status, 0) for status in RUN_STATUSES)
     items = [
         {
             "status": status,
@@ -431,12 +432,6 @@ def analytics_status_distribution(
         }
         for status in RUN_STATUSES
     ]
-    items.extend(
-        {"status": key, "count": value,
-         "ratio": round(value / total, 4) if total else 0.0}
-        for key, value in counts.items()
-        if key not in RUN_STATUSES
-    )
     return {"window": window["payload"], "total": total, "items": items}
 
 
@@ -515,7 +510,8 @@ def analytics_usage(days: int = 7, start: str | None = None, end: str | None = N
             "unpriced_tokens": unpriced,
             "by_model": [
                 {"model_id": i["model_id"], "model_name": i["model_name"],
-                 "cost": i["cost"], "total_tokens": i["total"]}
+                 "provider": i["provider"], "cost": i["cost"],
+                 "total_tokens": i["total"]}
                 for i in items if i["cost"] > 0
             ],
         },
@@ -530,15 +526,18 @@ def _run_items(s, runs: list[Run], *, with_nodes: bool = True) -> list[dict]:
     tokens = _tokens_by_run(s, run_ids=run_ids)
     prices = _prices(s)
     attempt_rows = _attempt_rows(s, run_ids=run_ids)
+    priced_ids = _priced_model_ids(attempt_rows, prices)
     cost_by_run: dict[str, float] = {}
+    priced_runs: set[str] = set()
     for model_id, run_id, tin, tout, _count in attempt_rows:
         key = int(model_id) if model_id is not None else None
+        if key in priced_ids:
+            priced_runs.add(str(run_id))
         cost_by_run[str(run_id)] = cost_by_run.get(str(run_id), 0.0) + _cost(
             int(tin), int(tout), prices.get(key) if key is not None else None,
         )
     nodes = _node_counts(s, run_ids) if with_nodes else {}
     tasks = _task_counts(s, run_ids) if with_nodes else {}
-    cost_available = bool(_priced_model_ids(attempt_rows, prices))
 
     items = []
     for run in runs:
@@ -557,7 +556,7 @@ def _run_items(s, runs: list[Run], *, with_nodes: bool = True) -> list[dict]:
             "tokens_out": tout,
             "total_tokens": tin + tout,
             "cost": round(cost_by_run.get(run.id, 0.0), 8),
-            "cost_available": cost_available,
+            "cost_available": str(run.id) in priced_runs,
             "nodes_total": node_stat["total"],
             "nodes_done": node_stat["done"],
             "tasks_total": task_stat["total"],
