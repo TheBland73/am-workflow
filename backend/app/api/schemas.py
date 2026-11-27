@@ -190,3 +190,22 @@ class MemoryPatch(BaseModel):
 
 class RetryIn(BaseModel):
     feedback: str | None = None
+    # 增量字段全部带默认值：旧请求体（仅 feedback）保持兼容。
+    reset_downstream: bool = False
+    expected_status: str | None = None
+
+
+class NodeResetIn(BaseModel):
+    reset_downstream: bool = True
+    expected_status: str | None = None
+
+
+class NodeSkipIn(BaseModel):
+    reason: str | None = None
+    cascade_downstream: bool = False
+    expected_status: str | None = None
+
+
+class NodeFeedbackIn(BaseModel):
+    # 必填语义由端点校验（空/缺失 → 400 feedback_required，而不是框架 422）。
+    feedback: str = Field(default="", max_length=4000)

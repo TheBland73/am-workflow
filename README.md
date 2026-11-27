@@ -6,7 +6,7 @@
 
 引擎拥有控制流、上下文与状态；模型只是可替换的节点；人工审批是一等公民；完成与否由证据判定。
 
-[![Tests](https://img.shields.io/badge/tests-65%20passed-brightgreen.svg)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen.svg)](#开发与测试)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-18%2B-339933.svg)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -48,18 +48,20 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
-| 后端 API | 稳定 | FastAPI + SQLAlchemy + SQLite（WAL），76 个 REST 端点 |
+| 后端 API | 稳定 | FastAPI + SQLAlchemy + SQLite（WAL），85 个 REST 端点 |
 | 编排引擎 | 稳定 | 依赖就绪并发、超时、指数退避、attempt 心跳、取消收据、死锁判定、崩溃恢复 |
 | 固定 SDLC 模板 | 稳定 | 8 阶段 / 17 节点 / 6 道人工门 / 8 类工件；前半段为会议式流程 |
 | 人工门 | 稳定 | 通过 · 驳回（反馈 + 目标节点 + 级联重置）· 编辑后通过 · 交给模型判 |
 | 工件链 | 稳定 | YAML front-matter、版本递增、active/superseded/approved 状态机 |
 | 事件流 | 稳定 | SSE + `Last-Event-ID` 补发 + 15s 心跳帧 + 终态主动关闭 |
-| 前端控制台 | 稳定 | 运行列表 / 运行详情 / 编排工作台 / 供应商 / 角色模板（Vite + React 18） |
+| 前端控制台 | 稳定 | 运行列表 / 运行详情 / 编排工作台 / 数据统计 / 供应商 / 角色模板（Vite + React 18） |
 | 编排工作台 | 可用 | 生成 → 校验 → 编辑 → 画布拖拽 → 提交运行，支持快照回滚与 30 步撤销 |
 | 会议式前半段 | 已实现（真实模型验收待补） | 讨论 / 评审 / 需求确认三种会议、决策点账本、定点回流、确认点（人工或模型判定）、会话与上下文模块；Mock 端到端通过，验收数字待回填 |
+| 节点交互与动作 | 稳定 | 节点详情、重试 / 重置 / 跳过 / 注入反馈的矩阵与审计；人工门不可跳过 |
+| 数据统计 | 可用 | 全局运行量 / 成功率 / 耗时 / Token / 成本 / 趋势 / 状态分布（只读聚合，6 个接口） |
 | 代码评审 + 验收门 | 实验 | 启发式静态评审（文件摘要 + 验收清单），无 diff / AST / 覆盖率分析 |
 | 多进程 / 分布式 | 设计封存 | 见 [`docs/分布式执行模式设计.md`](docs/分布式执行模式设计.md) |
-| 单元测试 | 通过 | `316 passed`（pytest，约 21 秒）；前端 `tsc --noEmit` 无错误 |
+| 单元测试 | 通过 | `375 passed`（pytest，约 61 秒）；前端 `tsc --noEmit` 无错误 |
 
 > W1 的目标是**把控制流跑通并证明它可靠**，不是把生成质量做到可交付。质量与规模的边界见 [已知限制](#已知限制)。
 
@@ -127,6 +129,15 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 - SSE 事件流：状态迁移先写事件（`events(run_id, seq)` 唯一），再广播；`node_token` 只走内存，不落库。
 - `GET /runs/{id}/metrics`：wall time、节点状态计数、attempt 次数 / 重试 / 忙碌时长 / P95、token 用量与估算成本、人工门等待、逐节点明细、评审指标。
 - 运行详情页的 STATE 面板直接展示重试、P95 与门等待，用于定位慢节点与卡点。
+
+### 9. 全局数据统计（Analytics）
+
+- **只读聚合**：`/api/analytics/*` 六个接口全部从 `runs` / `nodes` / `node_attempts` / `tasks` / `model_entries` 现算，不新建表、不写任何行、不碰编排逻辑。
+- **统一口径**：六个接口共用同一个时间窗解析（`days=7/30/90`，或 `start`/`end` 自定义区间），按 `runs.created_at` 过滤、UTC 自然日切桶；非法参数一律 400，不静默纠正。
+- **定义明确**：成功只算 `finished`，失败只算 `failed`（`stopped` 是人工停止，不算失败）；成功率 = 成功 / 总数，总数为 0 时返回 0；平均耗时只统计 `finished` 且 `finished_at` 齐全的运行，无样本返回 `null`（前端显示 `--`）。
+- **不编造数据**：成本复用 `metrics` 的同一算法（`price_in` / `price_out` 按每百万 token 折算，只算已归因模型的 attempt）；当前范围内没有已计价模型时 `available=false`，页面显示「暂无成本数据」，绝不用 token 数估一个数。
+- **图元零依赖**：趋势柱、状态环形图、占比条都是原生 SVG / CSS（配色取自 `endfield.css` 变量），没有引入任何图表库；点击环形图或图例即按状态筛选最近运行记录。
+- **查询数固定**：卡片、趋势、模型分布、最近运行全部用 `group by` 聚合，不做 per-run 查询（无 N+1）。
 
 ---
 
@@ -214,7 +225,7 @@ flowchart LR
 | 存储 | SQLite（WAL + `synchronous=NORMAL` + 单连接池 `pool_size=1`） |
 | 前端 | Vite · React 18 · TypeScript · Ant Design 5 · TanStack Query · React Router · @xyflow/react · zustand |
 | 视觉 | 终末地控制台风格（纸白 / 墨黑 / 单一信号黄），Saira 字体（SIL OFL） |
-| 测试 | pytest（后端 · 65 用例）· `tsc --noEmit`（前端类型检查） |
+| 测试 | pytest（后端 · 119 用例）· `tsc --noEmit`（前端类型检查） |
 
 ---
 
@@ -403,6 +414,7 @@ netsh int ipv4 show excludedportrange protocol=tcp
 | 人工门 | `GET /gates` · `GET /gates/{id}` · `POST /gates/{id}/approve` · `POST /gates/{id}/reject` |
 | 任务 / 节点 | `GET/POST /runs/{id}/tasks` · `PATCH/DELETE /runs/{id}/tasks/{uid}` · `GET /nodes/{id}` · `POST /nodes/{id}/retry` |
 | 记忆 | `GET /memories` · `PATCH /memories/{id}` |
+| 统计 | `GET /analytics/overview` · `GET /analytics/trends` · `GET /analytics/status-distribution` · `GET /analytics/usage` · `GET /analytics/recent-runs` · `GET /analytics/failed-runs`（均支持 `days=7/30/90` 或 `start`/`end`） |
 | 编排 | `POST/GET /plans` · `GET /plans/{id}` · `GET /plans/{id}/phases` · `GET /plans/{id}/activity` · `POST /plans/{id}/generate` · `GET /plans/{id}/events`（SSE）· `POST /plans/{id}/validate` · `POST /plans/{id}/commit` · `POST /plans/{id}/cancel` · `POST /plans/{id}/archive` · `PATCH /plans/{id}/layout` · `POST/DELETE /plans/{id}/deps` · `GET /plans/{id}/snapshots` · `POST /plans/{id}/restore/{version}` · `POST /plans/{id}/tasks` · `PATCH/DELETE /plans/{id}/tasks/{uid}` |
 
 SSE 约定：响应带 `id: <seq>` 与 `event: <type>`；断线重连带 `Last-Event-ID` 先补发历史再订阅实时队列；服务端每 15s 发注释帧保活，终态事件后主动关闭。
@@ -419,7 +431,7 @@ am-workflow/
 │   │   ├── config.py                路径、并发、超时、退避、预算等配置
 │   │   ├── db/                      engine/session（SQLite WAL + 单连接池）与 16 张 ORM 表
 │   │   ├── api/                     providers · models · agent-templates · runs · artifacts ·
-│   │   │                            gates · tasks · nodes · memories · plans
+│   │   │                            gates · tasks · nodes · memories · plans · analytics
 │   │   ├── engine/
 │   │   │   ├── orchestrator.py      调度循环、并发闸门、超时、退避、心跳、门禁、恢复
 │   │   │   ├── runners.py           节点执行器（PASS / AGENT / VERIFY / REVIEW / TASKGRAPH）
@@ -440,7 +452,8 @@ am-workflow/
 │   ├── scripts/                     mock_provider · e2e_demo · drive_run · check_sse ·
 │   │                                smoke_plan · setup_real_model
 │   └── tests/                       core · gates · api · planner · plans_api · durability ·
-│                                    model_discovery · review · discussion · seed_templates
+│                                    model_discovery · review · discussion · seed_templates ·
+│                                    analytics
 ├── frontend/                        Vite + React 18 + TS + AntD 5 + @xyflow/react + zustand
 │   └── src/{pages,panels,canvas,api,store,styles}
 ├── templates/sdlc_workflow.json     固定 SDLC 模板（8 阶段 17 节点 6 门）
@@ -459,10 +472,10 @@ am-workflow/
 ```powershell
 cd backend
 ..\.venv\Scripts\python.exe -m pytest tests -q
-# 65 passed in ~5s
+# 119 passed in ~6s
 ```
 
-覆盖范围：图与任务解析、front-matter、预算估算、门禁通过 / 驳回 / 升级重试、供应商与模型 CRUD、模板绑定校验、计划章节索引 / 错误码 / 波次 / 关键路径 / 环路径、计划 API（生成 / 编辑 / save 与 run 提交 / 幂等 / 归档）、并发闸门 / 节点超时 / 退避重试 / seq 缓存 / 取消收据 / metrics、模型发现与导入去重、评审节点 / 阻塞回退 / 轮次用尽 / 评审 API 与指标、三方讨论。
+覆盖范围：图与任务解析、front-matter、预算估算、门禁通过 / 驳回 / 升级重试、供应商与模型 CRUD、模板绑定校验、计划章节索引 / 错误码 / 波次 / 关键路径 / 环路径、计划 API（生成 / 编辑 / save 与 run 提交 / 幂等 / 归档）、并发闸门 / 节点超时 / 退避重试 / seq 缓存 / 取消收据 / metrics、模型发现与导入去重、评审节点 / 阻塞回退 / 轮次用尽 / 评审 API 与指标、三方讨论、数据统计（空窗口不除零 / 成功率 / 失败计数 / 平均耗时 / Token / 成本空态 / 时间筛选 / 趋势补零 / 状态分布 / 非法参数 400）。
 
 ### 前端检查
 

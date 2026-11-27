@@ -63,7 +63,64 @@ export interface NodeMessage {
 export type NodeDetail = Omit<Node, "attempts"> & {
   attempts: NodeAttemptDetail[];
   messages: NodeMessage[];
+  order_index: number;
+  run_status: string;
+  upstream: NodeDownstreamRef[];
+  downstream: NodeDownstreamRef[];
+  open_gate: NodeGateRef | null;
+  can_retry: boolean;
+  can_reset: boolean;
+  can_skip: boolean;
+  can_feedback: boolean;
+  can_edit_config: boolean;
+  events: StreamEvent[];
+  artifact_kinds: string[];
 };
+
+/** 上下游节点的轻量引用（GET /nodes/{id}）。 */
+export interface NodeDownstreamRef {
+  node_key: string;
+  name: string;
+  status: string;
+}
+
+/** 节点当前挂起的人工门（GET /nodes/{id}）；无门时为 null。 */
+export interface NodeGateRef {
+  id: number;
+  node_id: number;
+  node_key: string;
+  status: string;
+}
+
+/** POST /nodes/{id}/retry 请求体。expected_status 用于幂等保护。 */
+export interface RetryNodeBody {
+  feedback?: string;
+  reset_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** POST /nodes/{id}/reset 请求体。 */
+export interface ResetNodeBody {
+  reset_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** POST /nodes/{id}/skip 请求体。 */
+export interface SkipNodeBody {
+  reason?: string;
+  cascade_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** 节点动作端点的统一响应（feedback 响应没有 run_id）。 */
+export interface NodeActionResponse {
+  node_id: number;
+  status: string;
+  run_id?: string;
+  reset_nodes?: string[];
+  closed_gates?: number;
+  feedback?: string;
+}
 
 export interface Task {
   task_uid: string;
@@ -659,3 +716,163 @@ export interface PlanEvent {
   type: "plan_token" | "plan_generated" | "plan_failed";
   payload: { token?: string; status?: string; plan_id?: string; error?: string; [key: string]: unknown };
 }
+
+/** 缁熻鏃堕棿绐楋細鍚庣鎸?runs.created_at銆乁TC 鑷劧鏃ュ垏妗躲€?*/
+export interface AnalyticsWindow {
+  days: number;
+  start: string;
+  end: string;
+  start_date: string;
+  end_date: string;
+  basis: string;
+  timezone: string;
+}
+
+export type AnalyticsRange = 7 | 30 | 90;
+
+export interface AnalyticsCostModel {
+  model_id: number | null;
+  model_name: string;
+  provider: string;
+  cost: number;
+  total_tokens: number;
+}
+
+export interface AnalyticsCost {
+  /** false = 褰撳墠鑼冨洿鍐呮病鏈夈€岄厤浜嗗崟浠蜂笖鎴愪氦杩囥€嶇殑妯″瀷锛氬彧灞曠ず绌虹姸鎬侊紝涓嶅睍绀?0 鍏冪粨璁恒€?*/
+  available: boolean;
+  currency: string | null;
+  priced_models: number;
+  note: string;
+  estimated_cost: number;
+  unpriced_tokens: number;
+  by_model?: AnalyticsCostModel[];
+}
+
+export interface AnalyticsOverview {
+  window: AnalyticsWindow;
+  runs: {
+    total: number;
+    finished: number;
+    failed: number;
+    running: number;
+    waiting_human: number;
+    stopped: number;
+    created: number;
+  };
+  success_rate: number;
+  duration: {
+    avg_ms: number | null;
+    min_ms: number | null;
+    max_ms: number | null;
+    total_ms: number;
+    samples: number;
+    basis: string;
+  };
+  tokens: { input: number; output: number; total: number };
+  cost: AnalyticsCost;
+}
+
+export interface AnalyticsTrendPoint {
+  date: string;
+  runs: number;
+  finished: number;
+  failed: number;
+  tokens_in: number;
+  tokens_out: number;
+  total_tokens: number;
+}
+
+export interface AnalyticsTrends {
+  window: AnalyticsWindow;
+  items: AnalyticsTrendPoint[];
+  totals: {
+    runs: number;
+    finished: number;
+    failed: number;
+    tokens_in: number;
+    tokens_out: number;
+    total_tokens: number;
+  };
+}
+
+export interface AnalyticsStatusItem {
+  status: string;
+  count: number;
+  ratio: number;
+}
+
+export interface AnalyticsDistribution {
+  window: AnalyticsWindow;
+  total: number;
+  items: AnalyticsStatusItem[];
+}
+
+export interface AnalyticsModelUsage {
+  model_id: number | null;
+  model_name: string;
+  provider: string;
+  tokens_in: number;
+  tokens_out: number;
+  total: number;
+  attempts: number;
+  cost: number;
+  ratio: number;
+}
+
+export interface AnalyticsUsage {
+  window: AnalyticsWindow;
+  tokens: { input: number; output: number; total: number };
+  by_model: AnalyticsModelUsage[];
+  cost: AnalyticsCost;
+}
+
+export interface AnalyticsRunItem {
+  id: string;
+  idea: string;
+  status: RunStatus;
+  current_phase: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  tokens_in: number;
+  tokens_out: number;
+  total_tokens: number;
+  cost: number;
+  cost_available: boolean;
+  nodes_total: number;
+  nodes_done: number;
+  tasks_total: number;
+  tasks_done: number;
+  error: string | null;
+}
+
+export interface AnalyticsRecentRuns {
+  window: AnalyticsWindow;
+  limit: number;
+  status: string | null;
+  items: AnalyticsRunItem[];
+}
+
+export interface AnalyticsFailedItem {
+  id: string;
+  idea: string;
+  status: RunStatus;
+  current_phase: string | null;
+  created_at: string | null;
+  finished_at: string | null;
+  failed_at: string | null;
+  error: string;
+  error_truncated: boolean;
+  node_key: string | null;
+  node_name: string | null;
+  node_phase: string | null;
+  node_error: string | null;
+}
+
+export interface AnalyticsFailedRuns {
+  window: AnalyticsWindow;
+  limit: number;
+  items: AnalyticsFailedItem[];
+}
+

@@ -1,9 +1,11 @@
 import type {
-  AgentTemplate, ArtifactRecord, DecisionPoint, GateListItem, MaterialIn, MaterialRecord,
-  MeetingDetail, MeetingSummary, MeetingTurn, ModelEntry, Participant, ParticipantIn, PlanActivity,
+  AgentTemplate, AnalyticsDistribution, AnalyticsFailedRuns, AnalyticsOverview, AnalyticsRange,
+  AnalyticsRecentRuns, AnalyticsTrends, AnalyticsUsage, ArtifactRecord, DecisionPoint,
+  GateListItem, MaterialIn, MaterialRecord, MeetingDetail, MeetingSummary, MeetingTurn,
+  ModelEntry, NodeActionResponse, NodeDetail, Participant, ParticipantIn, PlanActivity,
   PlanDetail, PlanEvent, PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider,
-  RemoteModel, Run, RunConfig, RunMetrics, RunReview, Snapshot, StreamEvent, Task,
-  TemplateDefinition, TestResult,
+  RemoteModel, ResetNodeBody, RetryNodeBody, Run, RunConfig, RunMetrics, RunReview,
+  SkipNodeBody, Snapshot, StreamEvent, Task, TemplateDefinition, TestResult,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -158,9 +160,29 @@ export const api = {
   deleteTask: (runId: string, uid: string) =>
     request<void>(`/runs/${runId}/tasks/${uid}`, { method: "DELETE" }),
 
-  getNode: (nodeId: number) => request<import("./types").NodeDetail>(`/nodes/${nodeId}`),
-  retryNode: (nodeId: number) =>
-    request<Record<string, unknown>>(`/nodes/${nodeId}/retry`, { method: "POST" }),
+  getNode: (nodeId: number, params?: { messages?: number; events?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.messages != null) query.set("messages", String(params.messages));
+    if (params?.events != null) query.set("events", String(params.events));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request<NodeDetail>(`/nodes/${nodeId}${suffix}`);
+  },
+  retryNode: (nodeId: number, body: RetryNodeBody = {}) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/retry`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  resetNode: (nodeId: number, body: ResetNodeBody = {}) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/reset`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  skipNode: (nodeId: number, body: SkipNodeBody = {}) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/skip`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  injectFeedback: (nodeId: number, feedback: string) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/feedback`, {
+      method: "POST", body: JSON.stringify({ feedback }),
+    }),
 
   presets: () => request<{ presets: Preset[] }>("/presets"),
   providers: () => request<{ items: Provider[] }>("/providers"),
@@ -271,6 +293,23 @@ export const api = {
   planPhases: (planId: string) => request<PlanPhases>(`/plans/${planId}/phases`),
   planActivity: (planId: string, limit = 50) =>
     request<PlanActivity>(`/plans/${planId}/activity?limit=${limit}`),
+
+  /* ---------- 数据统计（ANALYTICS） ---------- */
+  /** 六个接口共用同一个 `days` 参数，保证卡片、图表、列表的统计范围一致。 */
+  analyticsOverview: (range: AnalyticsRange) =>
+    request<AnalyticsOverview>(`/analytics/overview?days=${range}`),
+  analyticsTrends: (range: AnalyticsRange) =>
+    request<AnalyticsTrends>(`/analytics/trends?days=${range}`),
+  analyticsDistribution: (range: AnalyticsRange) =>
+    request<AnalyticsDistribution>(`/analytics/status-distribution?days=${range}`),
+  analyticsUsage: (range: AnalyticsRange) =>
+    request<AnalyticsUsage>(`/analytics/usage?days=${range}`),
+  analyticsRecentRuns: (range: AnalyticsRange, status?: string | null, limit = 10) =>
+    request<AnalyticsRecentRuns>(
+      `/analytics/recent-runs?days=${range}&limit=${limit}${status ? `&status=${status}` : ""}`,
+    ),
+  analyticsFailedRuns: (range: AnalyticsRange, limit = 10) =>
+    request<AnalyticsFailedRuns>(`/analytics/failed-runs?days=${range}&limit=${limit}`),
 };
 
 /** 订阅 run 的 SSE；返回取消订阅函数。事件类型逐个注册（后端用的是命名事件）。 */

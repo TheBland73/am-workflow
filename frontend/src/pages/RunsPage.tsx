@@ -10,18 +10,12 @@ import { api } from "../api/client";
 import type {
   MaterialIn, ParamSpec, Run, RunConfig, RunStatus, TemplateDefinition,
 } from "../api/types";
+import { StatusTag, runStatusLabel } from "../components/RunStatusTag";
 import {
   CHECKPOINT_DECIDERS, CHECKPOINT_LABEL, canJoinDiscussion, deciderLabel,
 } from "../panels/meetingLabels";
 
-const STATUS: Record<RunStatus, { color: string; label: string }> = {
-  created: { color: "default", label: "已创建" },
-  running: { color: "processing", label: "运行中" },
-  waiting_human: { color: "warning", label: "等待人工" },
-  finished: { color: "success", label: "已完成" },
-  failed: { color: "error", label: "失败" },
-  stopped: { color: "default", label: "已停止" },
-};
+export { StatusTag, runStatusLabel } from "../components/RunStatusTag";
 
 const PHASE_LABELS: Record<string, string> = {
   idea: "想法",
@@ -112,11 +106,6 @@ function paramItem(name: string, spec: ParamSpec) {
       {paramField(spec)}
     </Form.Item>
   );
-}
-
-export function StatusTag({ status }: { status: RunStatus }) {
-  const item = STATUS[status] ?? { color: "default", label: status };
-  return <span className={`status-pill is-${status}`}>{item.label}</span>;
 }
 
 export default function RunsPage() {

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  BarChartOutlined,
   CloudServerOutlined,
   DeploymentUnitOutlined,
   MenuFoldOutlined,
@@ -14,10 +15,12 @@ import PlansPage from "./pages/PlansPage";
 import PlanPage from "./pages/PlanPage";
 import ProvidersPage from "./pages/ProvidersPage";
 import TemplatesPage from "./pages/TemplatesPage";
+import AnalyticsPage from "./pages/AnalyticsPage";
 
 const NAV = [
   { to: "/runs", label: "运行", en: "RUNS", icon: <PlayCircleOutlined /> },
   { to: "/plans", label: "编排", en: "PLANS", icon: <DeploymentUnitOutlined /> },
+  { to: "/analytics", label: "数据统计", en: "ANALYTICS", icon: <BarChartOutlined /> },
   { to: "/providers", label: "供应商", en: "PROVIDERS", icon: <CloudServerOutlined /> },
   { to: "/templates", label: "角色", en: "AGENTS", icon: <TeamOutlined /> },
 ];
@@ -110,6 +113,7 @@ export default function App() {
           <Route path="/runs/:runId" element={<RunPage />} />
           <Route path="/plans" element={<PlansPage />} />
           <Route path="/plans/:planId" element={<PlanPage />} />
+          <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/providers" element={<ProvidersPage />} />
           <Route path="/templates" element={<TemplatesPage />} />
           <Route path="*" element={<Navigate to="/runs" replace />} />
