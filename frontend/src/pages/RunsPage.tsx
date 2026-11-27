@@ -7,15 +7,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import type { Run, RunStatus } from "../api/types";
+import { StatusTag, runStatusLabel } from "../components/RunStatusTag";
 
-const STATUS: Record<RunStatus, { color: string; label: string }> = {
-  created: { color: "default", label: "已创建" },
-  running: { color: "processing", label: "运行中" },
-  waiting_human: { color: "warning", label: "等待人工" },
-  finished: { color: "success", label: "已完成" },
-  failed: { color: "error", label: "失败" },
-  stopped: { color: "default", label: "已停止" },
-};
+export { StatusTag, runStatusLabel } from "../components/RunStatusTag";
 
 const PHASE_LABELS: Record<string, string> = {
   idea: "想法",
@@ -27,16 +21,6 @@ const PHASE_LABELS: Record<string, string> = {
   execution: "执行",
   delivery: "交付",
 };
-
-export function StatusTag({ status }: { status: RunStatus }) {
-  const item = STATUS[status] ?? { color: "default", label: status };
-  return <span className={`status-pill is-${status}`}>{item.label}</span>;
-}
-
-/** 状态中文名：数据统计页复用同一份定义，避免两个页面说法不一致。 */
-export function runStatusLabel(status: string): string {
-  return STATUS[status as RunStatus]?.label ?? status;
-}
 
 export default function RunsPage() {
   const navigate = useNavigate();

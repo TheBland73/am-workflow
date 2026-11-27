@@ -11,7 +11,7 @@ import type {
   AnalyticsTrendPoint,
 } from "../api/types";
 import { RatioRows, StatusDonut, TrendBars } from "../canvas/AnalyticsCharts";
-import { StatusTag, runStatusLabel } from "./RunsPage";
+import { StatusTag, runStatusLabel } from "../components/RunStatusTag";
 import "../styles/analytics.css";
 
 const RANGE_OPTIONS: Array<{ label: string; value: AnalyticsRange }> = [
@@ -433,7 +433,10 @@ export default function AnalyticsPage() {
               <p className="an-hint">{usage.data?.cost.note}</p>
               <RatioRows
                 rows={(usage.data?.cost.by_model ?? []).map((item) => ({
-                  label: item.model_name,
+                  key: item.model_id ?? "unknown",
+                  label: item.provider
+                    ? `${item.model_name} · ${item.provider}`
+                    : item.model_name,
                   value: item.total_tokens,
                   ratio: (usage.data?.tokens.total ?? 0) > 0
                     ? item.total_tokens / (usage.data?.tokens.total ?? 1)

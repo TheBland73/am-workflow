@@ -531,6 +531,7 @@ export type AnalyticsRange = 7 | 30 | 90;
 export interface AnalyticsCostModel {
   model_id: number | null;
   model_name: string;
+  provider: string;
   cost: number;
   total_tokens: number;
 }

@@ -110,6 +110,7 @@ export function StatusDonut({
 }
 
 export interface RatioRow {
+  key?: string | number;
   label: string;
   value: number;
   ratio: number;
@@ -121,7 +122,7 @@ export function RatioRows({ rows, unit }: { rows: RatioRow[]; unit?: string }) {
   return (
     <ul className="an-ratio">
       {rows.map((row) => (
-        <li key={row.label} className="an-ratio-row">
+        <li key={row.key ?? row.label} className="an-ratio-row">
           <div className="an-ratio-head">
             <b title={row.label}>{row.label}</b>
             <span>
