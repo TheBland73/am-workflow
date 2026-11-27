@@ -35,7 +35,9 @@
       "proposal_check_rounds": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "方案复核轮次上限"},
       "closure_rule": {"type": "str", "default": "unanimous", "choices": ["unanimous", "no_objection", "facilitator_rules"],
                        "title": "闭合规则"},
-      "proxy_enabled": {"type": "bool", "default": false, "title": "启用需求方代理"}
+      "proxy_enabled": {"type": "bool", "default": false, "title": "启用需求方代理"},
+      "full_history": {"type": "bool", "default": false, "title": "全量历史",
+                       "hint": "仅供对照实验：每一轮带上此前所有轮次的逐字发言；关闭时为拼装视图"}
     },
     "review": {
       "reviewers_min": {"type": "int", "default": 0, "min": 0, "max": 99, "title": "评审者人数下限",

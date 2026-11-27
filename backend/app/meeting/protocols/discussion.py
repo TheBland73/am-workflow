@@ -408,12 +408,20 @@ def _feedback_segments(mtg) -> list[Segment]:
 
 
 def _view(mtg, kinds: list[str] | None = None) -> list[Segment]:
-    """人设之后发给模型的段：账本快照在前，用户反馈/插话随后，本轮的逐字发言最后。"""
+    """人设之后发给模型的段：账本快照在前，用户反馈/插话随后，逐字发言最后。
+
+    默认只带本轮的逐字发言：轮次切换时上一轮的发言由表态矩阵与交锋摘要取代（详设 §7.7）。
+    `full_history` 打开时改带截至当前轮的全部发言、跨轮不清理，仅供 H1 的对照实验使用。
+    """
     points = _points(mtg)
     index_of = {point["id"]: point["index"] for point in points}
     segments = [render.ledger_segment(points, round_no=mtg.meeting_round())]
     segments += _feedback_segments(mtg)
-    for turn in store.round_turns(mtg.meeting_id, round=mtg.meeting_round(), kinds=kinds):
+    if mtg.params().get("full_history"):
+        turns = store.turns_upto(mtg.meeting_id, upto_round=mtg.meeting_round(), kinds=kinds)
+    else:
+        turns = store.round_turns(mtg.meeting_id, round=mtg.meeting_round(), kinds=kinds)
+    for turn in turns:
         turn["decision_point"] = index_of.get(turn["decision_point_id"])
         segments.append(render.turn_segment(turn))
     return segments

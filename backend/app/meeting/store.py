@@ -354,16 +354,19 @@ def round_turns(meeting_id: int, *, round: int, kinds: list[str] | None = None) 
         return [_turn_dict(r) for r in rows]
 
 
-def turns_upto(meeting_id: int, *, upto_round: int, kinds: list[str]) -> list[dict]:
-    """截至某一轮（含）的指定类型发言，按序号升序。用一条查询取跨多轮的反馈/插话。"""
+def turns_upto(meeting_id: int, *, upto_round: int,
+               kinds: list[str] | None = None) -> list[dict]:
+    """截至某一轮（含）的发言，按序号升序。用一条查询取跨多轮的内容。
+
+    kinds 给出时只取这些类型；不给时取全部类型（对照实验的全量历史视图）。
+    """
     with session_scope() as s:
-        rows = (
-            s.query(MeetingTurn)
-            .filter(MeetingTurn.meeting_id == meeting_id, MeetingTurn.round <= upto_round,
-                    MeetingTurn.content != "", MeetingTurn.kind.in_(kinds))
-            .order_by(MeetingTurn.seq.asc())
-            .all()
-        )
+        query = s.query(MeetingTurn).filter(
+            MeetingTurn.meeting_id == meeting_id, MeetingTurn.round <= upto_round,
+            MeetingTurn.content != "")
+        if kinds:
+            query = query.filter(MeetingTurn.kind.in_(kinds))
+        rows = query.order_by(MeetingTurn.seq.asc()).all()
         return [_turn_dict(r) for r in rows]
 
 

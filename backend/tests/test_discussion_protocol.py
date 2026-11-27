@@ -514,6 +514,28 @@ def test_reopen_feedback_reaches_the_participants(monkeypatch) -> None:
     assert all("必须保证" in text for text in stances)          # 复议轮仍看得到原始立场
 
 
+def test_full_history_switch_keeps_previous_rounds_verbatim(monkeypatch) -> None:
+    """对照实验开关：打开时第二轮的提示里带着第一轮的原话，默认只带本轮。"""
+    claim, challenge = _replies()["claim"], _replies()["challenge"]
+    once = {"exchanges_per_point": 1}                         # 每轮每个决策点只交锋一次
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run({"params": {"discussion": dict(once)}})
+    drive(run_id, node_id, _approve, idea=IDEA)
+    claims = [call["text"] for call in seen if call["kind"] == "claim"]
+    assert len(claims) == 2                                   # 两轮交锋各一次主张
+    assert claim not in claims[1] and challenge not in claims[1]
+
+    seen = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run({"params": {"discussion": {**once, "full_history": True}}})
+    drive(run_id, node_id, _approve, idea=IDEA)
+    claims = [call["text"] for call in seen if call["kind"] == "claim"]
+    assert len(claims) == 2
+    assert claim in claims[1] and challenge in claims[1]      # 第一轮的主张与质疑仍在
+
+
 def test_continue_at_an_all_closed_consensus_finishes(monkeypatch) -> None:
     """全部了结时人仍选了"继续讨论"：忽略它直接成稿，不能卡死在空交锋/空表态。"""
     install(monkeypatch, _replies(restance=_agree))
