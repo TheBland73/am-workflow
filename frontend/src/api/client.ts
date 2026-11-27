@@ -1,5 +1,7 @@
 import type {
-  AgentTemplate, ArtifactRecord, Gate, ModelEntry, PlanActivity, PlanDetail, PlanEvent,
+  AgentTemplate, AnalyticsDistribution, AnalyticsFailedRuns, AnalyticsOverview,
+  AnalyticsRange, AnalyticsRecentRuns, AnalyticsTrends, AnalyticsUsage,
+  ArtifactRecord, Gate, ModelEntry, PlanActivity, PlanDetail, PlanEvent,
   PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider, RemoteModel, Run, RunMetrics,
   RunReview, Snapshot, StreamEvent, Task, TestResult,
 } from "./types";
@@ -126,6 +128,23 @@ export const api = {
   templates: () => request<{ items: AgentTemplate[] }>("/agent-templates"),
   patchTemplate: (id: number, body: Record<string, unknown>) =>
     request<AgentTemplate>(`/agent-templates/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+
+  /* ---------- 数据统计（ANALYTICS） ---------- */
+  /** 六个接口共用同一个 `days` 参数，保证卡片、图表、列表的统计范围一致。 */
+  analyticsOverview: (range: AnalyticsRange) =>
+    request<AnalyticsOverview>(`/analytics/overview?days=${range}`),
+  analyticsTrends: (range: AnalyticsRange) =>
+    request<AnalyticsTrends>(`/analytics/trends?days=${range}`),
+  analyticsDistribution: (range: AnalyticsRange) =>
+    request<AnalyticsDistribution>(`/analytics/status-distribution?days=${range}`),
+  analyticsUsage: (range: AnalyticsRange) =>
+    request<AnalyticsUsage>(`/analytics/usage?days=${range}`),
+  analyticsRecentRuns: (range: AnalyticsRange, status?: string | null, limit = 10) =>
+    request<AnalyticsRecentRuns>(
+      `/analytics/recent-runs?days=${range}&limit=${limit}${status ? `&status=${status}` : ""}`,
+    ),
+  analyticsFailedRuns: (range: AnalyticsRange, limit = 10) =>
+    request<AnalyticsFailedRuns>(`/analytics/failed-runs?days=${range}&limit=${limit}`),
 
   /* ---------- 编排工作台（ORCH-01） ---------- */
   plans: (status?: string) =>

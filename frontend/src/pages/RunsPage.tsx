@@ -33,6 +33,11 @@ export function StatusTag({ status }: { status: RunStatus }) {
   return <span className={`status-pill is-${status}`}>{item.label}</span>;
 }
 
+/** 状态中文名：数据统计页复用同一份定义，避免两个页面说法不一致。 */
+export function runStatusLabel(status: string): string {
+  return STATUS[status as RunStatus]?.label ?? status;
+}
+
 export default function RunsPage() {
   const navigate = useNavigate();
   const client = useQueryClient();
