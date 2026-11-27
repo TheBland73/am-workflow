@@ -16,7 +16,7 @@ from app.db.base import session_scope
 from app.db.models import (MEETING_ABANDONED, MEETING_ACTIVE, MEETING_COMPLETED,
                            MEETING_SUSPENDED, MEETING_WAITING_REWORK, Gate, Node, Run)
 from app.engine.events import emit
-from app.engine.feedback import REOPEN_KINDS
+from app.engine.feedback import REOPEN_KINDS, with_feedback
 from app.engine.gates import gate_payload
 from app.engine.runners import NodeContext, NodeFailure
 from app.meeting import store
@@ -30,6 +30,14 @@ def _checkpoint_decided(state: dict) -> bool:
     return bool(gate_id) and state.get("handled_gate_id") != gate_id and get_decision(gate_id) is not None
 
 
+def _disposition_recorded(state: dict) -> bool:
+    """确认点的处置已经认领落账（决定被消费、处置记录与认领同一事务写下）：
+    会议从挂起态重入时照"决定已读"续开，按记录重放结果，不会归档重开。"""
+    gate_id = state.get("awaiting_gate_id")
+    record = state.get("gate_disposition")
+    return bool(gate_id) and isinstance(record, dict) and record.get("gate_id") == gate_id
+
+
 def _checkpoint_open(state: dict) -> bool:
     """会议在等的那个确认点是否还开着：既没有决定，也没有被重置关掉。"""
     gate_id = state.get("awaiting_gate_id")
@@ -41,16 +49,24 @@ def _checkpoint_open(state: dict) -> bool:
 
 
 def _keep_waiting(ctx: NodeContext, meeting_id: int, state: dict) -> dict:
-    """节点在确认点还开着时又被调度了一次：把节点与运行放回"等待人工"，原样返回那个确认点。"""
+    """节点在确认点还开着时又被调度了一次：把节点与运行放回"等待人工"，原样返回那个确认点。
+
+    already_waiting 告诉编排器这不是一次新的挂起：meeting_suspended 事件不再重复发。
+    """
     with session_scope() as s:
         node = s.get(Node, ctx.node_id)
         if node is not None:
             node.status = "waiting_human"
+            # 滞留的超时反馈（auto_retry）在这里不会被消费：进等待时清掉，只留序号
+            config = dict(node.config_json or {})
+            if config.get("feedback_kind") == "auto_retry":
+                node.config_json = with_feedback(config, None)
         run = s.get(Run, ctx.run_id)
         if run is not None:
             run.status = "waiting_human"
         body = gate_payload(s, s.get(Gate, state["awaiting_gate_id"]))
-    return {"suspended": True, "meeting_id": meeting_id, "checkpoint": body, "summary": ""}
+    return {"suspended": True, "already_waiting": True, "meeting_id": meeting_id,
+            "checkpoint": body, "summary": ""}
 
 
 def _enter(ctx: NodeContext, protocol: str) -> tuple[int, str]:
@@ -92,7 +108,7 @@ def _enter(ctx: NodeContext, protocol: str) -> tuple[int, str]:
     if existing["status"] in (MEETING_ACTIVE, MEETING_WAITING_REWORK):
         return existing["id"], "resume"
     if existing["status"] == MEETING_SUSPENDED:
-        if _checkpoint_decided(existing["state"]):
+        if _checkpoint_decided(existing["state"]) or _disposition_recorded(existing["state"]):
             return existing["id"], "decided"
         if _checkpoint_open(existing["state"]):
             # 确认点还开着、还没有决定：继续等它。只有确认点被重置关闭才归档重开——

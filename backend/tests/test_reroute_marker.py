@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from app.db.base import init_db, session_scope
 from app.db.models import Node, Run, Workflow
+from app.engine import orchestrator as orchestrator_module
 from app.engine.orchestrator import orchestrator
 from app.engine.templates import seed_defaults
 from app.meeting import store
@@ -50,7 +53,7 @@ def test_marker_written_after_targets_reopen() -> None:
     run_id, review_id, meeting_id = _reroute_setup("done")
     _reroute(run_id, review_id)
     state = store.get_state(meeting_id)
-    assert state.get("rework_pending") is True and state.get("awaiting_rework") is True
+    assert state.get("rework_pending") is True
 
 
 def test_marker_skipped_when_targets_not_reopened() -> None:
@@ -58,4 +61,38 @@ def test_marker_skipped_when_targets_not_reopened() -> None:
     run_id, review_id, meeting_id = _reroute_setup("running")
     _reroute(run_id, review_id)
     state = store.get_state(meeting_id)
-    assert "rework_pending" not in state and "awaiting_rework" not in state
+    assert "rework_pending" not in state
+
+
+def test_interrupted_acceptance_leaves_no_half_applied_state(monkeypatch) -> None:
+    """接受回流的写库动作在同一个事务里：目标重开被中断，发起节点的轮次也不会先加上。"""
+    run_id, review_id, meeting_id = _reroute_setup("done")
+    original = orchestrator_module.with_feedback
+    armed = {"on": True}
+
+    def flaky(config, feedback, kind=None):
+        if armed["on"] and kind == "reroute":        # 目标重开刚要落库：进程在这里被杀
+            armed["on"] = False
+            raise asyncio.CancelledError()
+        return original(config, feedback, kind)
+
+    monkeypatch.setattr(orchestrator_module, "with_feedback", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        _reroute(run_id, review_id)
+
+    with session_scope() as s:
+        review = s.get(Node, review_id)
+        discuss = s.query(Node).filter(Node.node_key == "discuss",
+                                       Node.run_id == run_id).one()
+        assert review.status == "running" and int(review.config_json["round"]) == 1
+        assert "feedback" not in (discuss.config_json or {})
+    assert store.get_state(meeting_id).get("rework_pending") is None
+
+    _reroute(run_id, review_id)                      # 重入（不再中断）：整体生效
+    with session_scope() as s:
+        review = s.get(Node, review_id)
+        discuss = s.query(Node).filter(Node.node_key == "discuss",
+                                       Node.run_id == run_id).one()
+        assert int(review.config_json["round"]) == 2
+        assert discuss.config_json.get("feedback") == "复议 D2 的结论"
+    assert store.get_state(meeting_id).get("rework_pending") is True

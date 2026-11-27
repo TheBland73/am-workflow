@@ -52,6 +52,13 @@ async def reroute_or_escalate(mtg: "MeetingSession", targets: list[str], feedbac
     """
     if mtg.round_no() < mtg.max_rounds():
         return reroute(targets, feedback, self_feedback=self_feedback, summary=summary)
+    # 认领过的处置（认领与记录同一事务）：按记录重放结果，不重新开一扇门、不丢人的决定。
+    record = mtg.gate_disposition()
+    if record is not None and record.get("kind") == "escalation":
+        if record.get("action") == "approve":
+            return None
+        return reroute(targets, str(record.get("feedback") or feedback),
+                       self_feedback=self_feedback, summary=summary, extra_round=True)
     decision = mtg.decision()
     if decision is None:
         return suspend(await mtg.open_checkpoint(
@@ -59,12 +66,13 @@ async def reroute_or_escalate(mtg: "MeetingSession", targets: list[str], feedbac
             payload={"targets": list(targets), "feedback": feedback[:2000],
                      "round": mtg.round_no(), "max_rounds": mtg.max_rounds()}))
     if decision["action"] == "approve":
-        mtg.ack_decision(decision)
+        mtg.ack_decision(decision, disposition={"kind": "escalation", "action": "approve"})
         return None
     note = str(decision.get("feedback") or "").strip()
     if note:
         feedback = f"{feedback}\n\n用户在确认点上的意见：{note}"
-    mtg.ack_decision(decision)
+    mtg.ack_decision(decision, disposition={"kind": "escalation", "action": "reroute",
+                                            "feedback": feedback})
     return reroute(targets, feedback, self_feedback=self_feedback, summary=summary,
                    extra_round=True)
 

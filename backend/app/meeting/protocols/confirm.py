@@ -380,24 +380,29 @@ class ConfirmProtocol(MeetingProtocol):
         text = str(state.get("reopen_feedback") or "").strip()
         if text and not state.get("intake_feedback"):
             flow = _flow(mtg) + 1
-            speaker = "评审意见" if state.get("feedback_kind") == "reroute" else "用户"
-            store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
-                           speaker_name=speaker, kind="user_feedback", content=text)
-            # 轮次、反馈的移交与滞留标记、旧报告字段的清理一次写完：中途崩溃不会重复加轮
+            speaker = ("评审意见" if state.get("feedback_kind") in ("reroute", "reroute_self")
+                       else "用户")
+            # 断点保护：反馈发言已经落盘就不再重复写（按轮次与内容去重，复议分支的记法）
+            existing = {turn["content"] for turn in store.round_turns(
+                mtg.meeting_id, round=flow, kinds=["user_feedback"])}
+            if text not in existing:
+                store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
+                               speaker_name=speaker, kind="user_feedback", content=text)
+            # 轮次、反馈的移交与滞留标记、旧报告字段、旧处置记录的清理一次写完：中途崩溃不会重复加轮
             store.update_meeting(mtg.meeting_id, round=flow, phase="intake", state_json={
                 **state, "reopen_feedback": "", "intake_feedback": text,
                 "last_items": list(state.get("items") or []),
-                "rework_pending": False, "awaiting_rework": False,
+                "rework_pending": False,
                 "verdict": None, "accepted_by_user": False,
-                "summary": None, "blocking": None})
+                "summary": None, "blocking": None, "gate_disposition": None})
             mtg.reset_builder()
             return
         if state.get("rework_pending"):
             flow = _flow(mtg) + 1
             store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
                 **state, "rework_pending": False, "verdict": None,
-                "accepted_by_user": False, "awaiting_rework": False,
-                "summary": None, "blocking": None})
+                "accepted_by_user": False,
+                "summary": None, "blocking": None, "gate_disposition": None})
             mtg.reset_builder()
 
     # ---------- 受理 ----------
@@ -422,17 +427,29 @@ class ConfirmProtocol(MeetingProtocol):
             turn_round=_flow(mtg)))["data"]
         items = _items(mtg)
         number = _next_number(items, list(mtg.state().get("last_items") or []))
+        # 追加前按（轮次、出处、需求、问题）签名去重：崩溃重入按已落盘的发言重跑入账时，
+        # 同一批条目不会以新编号重复入账。
+        signatures = {(item.get("round"), item.get("origin"),
+                       item.get("requirement") or item.get("index"),
+                       item.get("problem")) for item in items}
         for raw in data["items"]:
             kind = str(raw.get("kind") or "quality")
             if kind not in KIND_NAMES:
                 kind = "quality"
             severity = raw.get("severity") if raw.get("severity") in _RANK else "blocker"
+            requirement = str(raw.get("requirement") or "").strip()
+            index = str(raw.get("index") or "").strip()
+            problem = str(raw.get("problem") or "").strip()
+            signature = (_flow(mtg), "user", requirement or index, problem)
+            if signature in signatures:
+                continue
+            signatures.add(signature)
             items.append({
                 "id": f"C{number}", "kind": kind,
-                "requirement": str(raw.get("requirement") or "").strip(),
-                "index": str(raw.get("index") or "").strip(),
+                "requirement": requirement,
+                "index": index,
                 "severity": severity if kind == "quality" else "blocker",
-                "problem": str(raw.get("problem") or "").strip(),
+                "problem": problem,
                 "suggestion": str(raw.get("suggestion") or "").strip(),
                 "origin": "user", "round": _flow(mtg)})
             number += 1
@@ -508,7 +525,8 @@ class ConfirmProtocol(MeetingProtocol):
             raise NodeFailure("需求确认会议缺少质量评审者，无法继续", fatal=True)
 
     def _quality_sources(self, mtg, base: list[dict]) -> list[dict]:
-        """质量评审者取评审会议的评审者各行；没有评审会议时按评审协议的名单规则取。"""
+        """质量评审者取评审会议的评审者各行；没有评审会议时按评审协议的名单规则取
+        （reviewers_max、reviewers_min 与固定人数与评审协议同一口径）。"""
         review = _review_meeting(mtg)
         if review is not None:
             reviewers = [row for row in store.list_participants(review["id"])
@@ -519,6 +537,7 @@ class ConfirmProtocol(MeetingProtocol):
         spec = (mtg.run_config().get("rosters") or {}).get("reviewers") or {}
         configured = [str(key) for key in (spec.get("role_keys") or [])]
         count = int(spec.get("count") or 0)
+        limit = int(mtg.params().get("reviewers_max") or 0)   # 0 表示不限制
         if configured:
             problems = [f"已不存在：{key}" for key in configured if key not in library]
             problems += [f"不适合参加评审会议：{key}" for key in configured
@@ -526,18 +545,26 @@ class ConfirmProtocol(MeetingProtocol):
             if problems:
                 raise NodeFailure("运行级配置点名的评审角色有问题：" + "；".join(problems)
                                   + "，请修改运行级配置", fatal=True)
-            return [{"role_key": key, "display_name": library[key]["name"],
-                     "system_prompt": library[key]["system_prompt"], "model_id": None}
-                    for key in configured]
-        reviewers = [row for row in base if row["mode"] == "participant"]
-        if reviewers:
-            return reviewers[:count] if count else reviewers
-        suitable = [row for row in library.values()
-                    if "review" in ((row.get("meta") or {}).get("meeting_roles") or [])]
-        picked = suitable[:count] if count else suitable[:3]
-        return [{"role_key": row["role_key"], "display_name": row["name"],
-                 "system_prompt": row["system_prompt"], "model_id": None}
-                for row in picked]
+            reviewers = [{"role_key": key, "display_name": library[key]["name"],
+                          "system_prompt": library[key]["system_prompt"], "model_id": None}
+                         for key in configured]
+        else:
+            reviewers = [row for row in base if row["mode"] == "participant"]
+            if not reviewers:
+                suitable = [row for row in library.values()
+                            if "review" in ((row.get("meta") or {}).get("meeting_roles") or [])]
+                reviewers = [{"role_key": row["role_key"], "display_name": row["name"],
+                              "system_prompt": row["system_prompt"], "model_id": None}
+                             for row in suitable[:3]]
+        if count:
+            reviewers = reviewers[:count]
+        if limit:
+            reviewers = reviewers[:limit]
+        minimum = int(mtg.params().get("reviewers_min") or 0)
+        if len(reviewers) < max(1, minimum):
+            raise NodeFailure(f"评审者人数不足：需要至少 {max(1, minimum)} 名，"
+                              f"当前只有 {len(reviewers)} 名", fatal=True)
+        return reviewers
 
     # ---------- 写预期 ----------
     async def step_expect(self, mtg):
@@ -744,12 +771,23 @@ class ConfirmProtocol(MeetingProtocol):
                 if item["kind"] in ("distorted", "missing") and not item["requirement"]:
                     item["requirement"] = fills.get(item["index"], "")
         number = _next_number(state.get("items") or [], state.get("last_items") or [])
+        # 已入账的同一批条目沿用旧编号（按轮次、出处、需求、问题签名匹配）：崩溃重入
+        # 重跑汇总时不会以新编号重复入账，也不会把已入账的条目挤掉。
+        existing = {(item.get("requirement") or "", item.get("index") or "",
+                     item.get("problem") or ""): item
+                    for item in state.get("items") or []
+                    if item.get("origin") == "program" and int(item.get("round") or 0) == flow}
+        merged: list[dict] = []
         for item in program:
-            item["id"] = f"C{number}"
-            item["origin"] = "program"
-            item["round"] = flow
+            hit = existing.get((item.get("requirement") or "", item.get("index") or "",
+                                item.get("problem") or ""))
+            if hit is not None:
+                merged.append(hit)
+                continue
+            item = {**item, "id": f"C{number}", "origin": "program", "round": flow}
             number += 1
-        _finish_step(mtg, "merge", items=list(intake_items) + program)
+            merged.append(item)
+        _finish_step(mtg, "merge", items=list(intake_items) + merged)
         return advance("verdict")
 
     async def step_verdict(self, mtg):

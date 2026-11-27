@@ -287,6 +287,39 @@ def test_chair_rulings_are_reused_after_a_crash(monkeypatch) -> None:
     assert store.get_state(mtg.meeting_id)["issues"][0]["disposition"] == "主席定夺：成立"
 
 
+def test_step_speech_is_salvaged_when_the_reuse_key_write_is_lost(monkeypatch) -> None:
+    """复用键在发言之前先认领：发言落盘、编号没写上时中断，重入按发言行找回，不重复调用。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        review_rule=lambda text: _rule(text, keep=True),
+        review_defend="这条意见成立。"), seen)
+    run_id, node_id = _review_run()
+    issue = {**ISSUE, "accepted": False, "disputed": True}
+    mtg = _review_session(run_id, node_id, phase="discuss", state={"issues": [issue]})
+    protocol = review_module.ReviewProtocol()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" \
+                and payload.get("kind") == "review_rule":
+            armed["on"] = False                    # 定夺发言刚落盘、复用键还没写上：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_discuss(mtg))
+    monkeypatch.setattr(calls_module, "emit", original_emit)
+
+    asyncio.run(protocol.step_discuss(mtg))
+
+    assert Counter(call["kind"] for call in seen)["review_rule"] == 1
+    assert store.get_state(mtg.meeting_id)["issues"][0]["disposition"] == "主席定夺：成立"
+
+
 def test_defends_are_not_repeated_after_a_crash(monkeypatch) -> None:
     """两条意见各由一名评审者辩护：第一条落盘后被中断，重入不再为它重复调用模型。"""
     seen: list[dict] = []
@@ -434,7 +467,7 @@ def test_reopen_branch_clears_stale_reroute_marks_and_last_report_fields() -> No
     run_id, node_id = _review_run()
     mtg = _review_session(run_id, node_id, phase="verdict", state={
         "pending_feedback": "范围还是不清楚",
-        "rework_pending": True, "awaiting_rework": True,
+        "rework_pending": True,
         "verdict": "conditional", "summary": "评审会议完成：结论 接受", "blocking": 2,
         "minutes_version": 1})
 
@@ -442,22 +475,143 @@ def test_reopen_branch_clears_stale_reroute_marks_and_last_report_fields() -> No
 
     state = store.get_state(mtg.meeting_id)
     assert state["intake_feedback"] == "范围还是不清楚"     # 反馈已移交给受理步
-    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["rework_pending"] is False
     assert state["summary"] is None and state["blocking"] is None
+
+
+def test_feedback_speech_is_not_repeated_after_a_crash(monkeypatch) -> None:
+    """入口反馈分支的发言与状态移交不在同一事务：中断重入按轮次与内容去重，不重复发言。"""
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="verdict", state={
+        "reopen_feedback": "把验收标准写清楚", "feedback_kind": "reroute"})
+    armed = {"on": True}
+    original_update = store.update_meeting
+
+    def flaky_update(meeting_id, **fields):
+        if armed["on"] and fields.get("phase") == "intake":
+            armed["on"] = False                        # 反馈发言刚落盘、状态还没移交：进程在这里被杀
+            raise asyncio.CancelledError()
+        return original_update(meeting_id, **fields)
+
+    monkeypatch.setattr(store, "update_meeting", flaky_update)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(review_module.ReviewProtocol().on_enter(mtg))
+    monkeypatch.setattr(store, "update_meeting", original_update)
+
+    asyncio.run(review_module.ReviewProtocol().on_enter(mtg))
+    turns = store.round_turns(mtg.meeting_id, round=2, kinds=["user_feedback"])
+    assert [t["content"] for t in turns] == ["把验收标准写清楚"]
+    state = store.get_state(mtg.meeting_id)
+    assert state["intake_feedback"] == "把验收标准写清楚" and state["reopen_feedback"] == ""
+
+
+def _land_turn(mtg, *, phase: str, kind: str, speaker: dict, content: str,
+               structured: dict) -> None:
+    """预先落一条完整发言：让步骤的 find_turn 复用它，不调模型。"""
+    turn = store.add_turn(mtg.meeting_id, round=1, phase=phase, speaker_id=speaker["id"],
+                          speaker_name=speaker["display_name"], kind=kind)
+    store.finish_turn(turn, content=content, structured=structured)
+
+
+def test_intake_accounting_is_idempotent_by_signature(monkeypatch) -> None:
+    """受理入账按（轮次、出处、位置、问题）签名去重：重跑入账不会以新编号重复入账。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _review_run()
+    seeded = {**ISSUE, "location": WORDING["location"], "origin": "user", "round": 1}
+    mtg = _review_session(run_id, node_id, phase="intake", state={
+        "intake_feedback": "把验收标准写清楚", "issues": [seeded]})
+    _land_turn(mtg, phase="intake", kind="review_intake", speaker=mtg.participants("chair")[0],
+               content="整理意见", structured={"issues": [dict(WORDING)]})
+    protocol = review_module.ReviewProtocol()
+
+    asyncio.run(protocol.step_intake(mtg))
+
+    issues = store.get_state(mtg.meeting_id)["issues"]
+    assert [issue["id"] for issue in issues] == ["I1"]
+
+
+def test_merge_accounting_is_idempotent_by_signature(monkeypatch) -> None:
+    """汇总入账按（轮次、出处、位置、问题）签名去重：重跑入账不会以新编号重复入账。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _review_run()
+    seeded = {**ISSUE, "location": WORDING["location"], "origin": "reviewer", "round": 1,
+              "raised_by": ["架构师"]}
+    mtg = _review_session(run_id, node_id, phase="merge", state={
+        "review_batch": [dict(WORDING, raised_by=["架构师"], origin="reviewer")],
+        "issues": [seeded]})
+    _land_turn(mtg, phase="merge", kind="review_merge", speaker=mtg.participants("chair")[0],
+               content="汇总意见",
+               structured={"issues": [dict(WORDING, raised_by=["架构师"])]})
+    protocol = review_module.ReviewProtocol()
+
+    asyncio.run(protocol.step_merge(mtg))
+
+    issues = store.get_state(mtg.meeting_id)["issues"]
+    assert [issue["id"] for issue in issues] == ["I1"]
+
+
+def test_reroute_self_feedback_is_recorded_as_review_voice() -> None:
+    """回流写给下一轮的自我提示也是"评审意见"的发言，不标成用户。"""
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="verdict", state={
+        "reopen_feedback": "先补齐验证的依据", "feedback_kind": "reroute_self"})
+
+    asyncio.run(review_module.ReviewProtocol().on_enter(mtg))
+
+    turns = store.round_turns(mtg.meeting_id, round=2, kinds=["user_feedback"])
+    assert [t["speaker_name"] for t in turns] == ["评审意见"]
+
+
+def test_defend_speech_is_not_repeated_when_the_marker_write_is_lost(monkeypatch) -> None:
+    """辩护发言落盘后被打断（完成标记来不及写）：重入按发言行找回，不重复辩护。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        review_rule=lambda text: _rule(text, keep=True),
+        review_defend="这条意见成立。"), seen)
+    run_id, node_id = _review_run()
+    issues = [
+        {**ISSUE, "id": "I1", "accepted": False, "disputed": True},
+        {**ISSUE, "id": "I2", "accepted": False, "disputed": True,
+         "raised_by": ["测试与质量"], "problem": "验收标准不可核对"},
+    ]
+    mtg = _review_session(run_id, node_id, phase="discuss", state={"issues": issues})
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试与质量",
+                          mode="reviewer", system_prompt="你是评审者")
+    protocol = review_module.ReviewProtocol()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" \
+                and "review_defend" in str(payload.get("kind") or ""):
+            armed["on"] = False                    # 第一条辩护发言刚落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_discuss(mtg))
+    monkeypatch.setattr(calls_module, "emit", original_emit)
+
+    asyncio.run(protocol.step_discuss(mtg))
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["review_defend"] == 2             # 每条意见恰好一次，重入从第二条继续
 
 
 def test_rework_branch_clears_last_report_fields() -> None:
     """从等待返工恢复：回流标记照旧清掉，旧报告的摘要与阻塞数也一并清掉。"""
     run_id, node_id = _review_run()
     mtg = _review_session(run_id, node_id, phase="verdict", state={
-        "rework_pending": True, "awaiting_rework": True,
+        "rework_pending": True,
         "verdict": "conditional", "summary": "评审会议完成：结论 接受", "blocking": 2,
         "minutes_version": 1})
 
     asyncio.run(review_module.ReviewProtocol().on_enter(mtg))
 
     state = store.get_state(mtg.meeting_id)
-    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["rework_pending"] is False
     assert state["summary"] is None and state["blocking"] is None
 
 

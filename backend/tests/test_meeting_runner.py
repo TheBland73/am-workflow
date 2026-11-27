@@ -235,6 +235,35 @@ def test_escalation_reject_grants_one_more_round() -> None:
     assert store.get_meeting(again["meeting_id"])["status"] == "waiting_rework"
 
 
+def test_escalation_decision_survives_a_crash_after_the_ack(monkeypatch) -> None:
+    """认领与处置记录同一事务：ack 后被打断，重入按处置记录重放，不重开升级门、不换会议。"""
+    run_id, node_id = _run("loop", round=2, max_rounds=2)
+    asyncio.run(run_meeting(_ctx(run_id, node_id, "loop")))      # 轮次用尽：挂起升级确认点
+    _decide(run_id, "reject", feedback="再查一次成本")
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+
+    armed = {"on": True}
+    original_update = store.update_meeting
+
+    def flaky_update(meeting_id_, **fields):
+        if armed["on"] and fields.get("status") == "waiting_rework":
+            armed["on"] = False                        # 处置已认领、回流还没交给编排器：进程在这里被杀
+            raise asyncio.CancelledError()
+        return original_update(meeting_id_, **fields)
+
+    monkeypatch.setattr(store, "update_meeting", flaky_update)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_meeting(_ctx(run_id, node_id, "loop")))
+    monkeypatch.setattr(store, "update_meeting", original_update)
+
+    again = asyncio.run(run_meeting(_ctx(run_id, node_id, "loop")))
+    assert again["reroute"]["extra_round"] is True
+    assert "再查一次成本" in again["reroute"]["feedback"]
+    assert again["meeting_id"] == meeting_id                     # 还是同一场会议，没有被换新
+    with session_scope() as s:
+        assert s.query(Gate).filter(Gate.run_id == run_id).count() == 1   # 没有重开第二扇门
+
+
 def test_reroute_before_rounds_run_out() -> None:
     run_id, node_id = _run("loop", round=1, max_rounds=3)
     result = asyncio.run(run_meeting(_ctx(run_id, node_id, "loop")))
@@ -305,6 +334,42 @@ def test_orchestrator_parks_the_run_at_a_checkpoint_and_resumes_after_the_decisi
         events = [e.type for e in s.query(Event).filter(Event.run_id == run_id).all()]
     assert events.index("meeting_started") < events.index("meeting_suspended") < events.index(
         "meeting_resumed") < events.index("meeting_finished") < events.index("run_finished")
+
+
+def test_redundant_scheduling_does_not_repeat_meeting_suspended() -> None:
+    """挂起中的节点被多余调度：meeting_suspended 只发一次，不刷事件流。"""
+    run_id, node_id = _run()
+    node = orchestrator._load(run_id)[1][0]
+    asyncio.run(orchestrator._run_attempt(run_id, node))      # 第一次挂起：发事件
+    with session_scope() as s:
+        s.get(Node, node_id).status = "pending"               # 多余的调度把节点摆回待执行
+        s.get(Run, run_id).status = "running"
+    node = orchestrator._load(run_id)[1][0]
+    asyncio.run(orchestrator._run_attempt(run_id, node))      # 多余调度：不再重复发
+    asyncio.run(orchestrator._run_attempt(run_id, node))
+
+    with session_scope() as s:
+        events = [e.type for e in s.query(Event).filter(Event.run_id == run_id).all()]
+    assert events.count("meeting_suspended") == 1
+
+
+def test_entering_waiting_clears_stale_auto_retry_feedback() -> None:
+    """进入等待分支时清掉滞留的 auto_retry 反馈：它不会被消费，留在节点配置里只会误导。
+    序号保留：真正的复议反馈按序号认。"""
+    run_id, node_id = _run()
+    first = asyncio.run(run_meeting(_ctx(run_id, node_id)))
+    assert first["suspended"] is True
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        node.config_json = {**(node.config_json or {}),
+                            "feedback": "模型输出不符合要求", "feedback_kind": "auto_retry",
+                            "feedback_seq": 1}
+    asyncio.run(run_meeting(_ctx(run_id, node_id)))     # 多余调度：确认点还开着，进等待分支
+
+    with session_scope() as s:
+        config = dict(s.get(Node, node_id).config_json or {})
+    assert "feedback" not in config and "feedback_kind" not in config
+    assert config.get("feedback_seq") == 1
 
 
 def test_reroute_self_note_reaches_the_protocol() -> None:

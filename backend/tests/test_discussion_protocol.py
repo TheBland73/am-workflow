@@ -773,6 +773,192 @@ def test_continue_at_an_all_closed_consensus_finishes(monkeypatch) -> None:
     assert asked == ["clarify", "roster", "consensus"]
 
 
+def _continue_answer(checkpoint: dict) -> tuple:
+    """第一次共识选"继续讨论"；重入后再问到的共识（新一轮的 stall）按分歧整合收尾。"""
+    if checkpoint["kind"] == "consensus":
+        return "reject", {"option": "continue"}, "先把登录的存储方案定下来"
+    return "approve", {}, ""
+
+
+def _integrate_answer(checkpoint: dict) -> tuple:
+    if checkpoint["kind"] == "consensus":
+        return "approve", {"option": "integrate"}, ""
+    return "approve", {}, ""
+
+
+def _clarify_answer(checkpoint: dict) -> tuple:
+    data = {"answers": ["Markdown 即可"]} if checkpoint["kind"] == "clarify" else {}
+    return "approve", data, ""
+
+
+def test_consensus_decision_survives_a_crash_after_the_ack(monkeypatch) -> None:
+    """共识确认点认领与处置记录同一事务：ack 后被打断，重入按记录重放"继续讨论"，
+    不把人的决定丢掉重新开一扇门；重放出的下一轮交锋真的发生了。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _meeting_run({"automation": {"level": "L1"}})
+    from app.meeting.session import MeetingSession
+
+    original_ack = MeetingSession.ack_decision
+    armed = {"on": True}
+
+    def flaky_ack(self, decision=None, **kwargs):
+        original_ack(self, decision, **kwargs)
+        if armed["on"] and (decision or {}).get("data", {}).get("option") == "continue":
+            armed["on"] = False                        # 处置刚认领、续开还没落地：进程在这里被杀
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(MeetingSession, "ack_decision", flaky_ack)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _continue_answer, idea=IDEA)
+    monkeypatch.setattr(MeetingSession, "ack_decision", original_ack)
+
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    guidance = [t for t in store.list_turns(meeting_id) if t["kind"] == "user_guidance"]
+    guidance_round = guidance[0]["round"]
+    result = drive(run_id, node_id, _integrate_answer, idea=IDEA)
+    assert result["done"] is True
+    guidance = [t for t in store.list_turns(meeting_id) if t["kind"] == "user_guidance"]
+    assert len(guidance) == 1 and "先把登录的存储方案定下来" in guidance[0]["content"]
+    claims = [t for t in store.round_turns(meeting_id, round=guidance_round,
+                                           kinds=["claim"])]
+    assert claims                                       # 重放真的续开了一轮交锋，不是重新问人
+
+
+def test_consensus_guidance_is_not_repeated_after_a_crash(monkeypatch) -> None:
+    """共识指导语的落盘与轮次移交不在同一事务：中断重入按轮次与内容去重，轮次不多加。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _meeting_run({"automation": {"level": "L1"}})
+
+    armed = {"on": True}
+    original_add = store.add_turn
+
+    def flaky_add(meeting_id, **kwargs):
+        turn_id = original_add(meeting_id, **kwargs)
+        if armed["on"] and kwargs.get("kind") == "user_guidance":
+            armed["on"] = False                        # 指导语刚落盘、轮次还没移交：进程在这里被杀
+            raise asyncio.CancelledError()
+        return turn_id
+
+    monkeypatch.setattr(store, "add_turn", flaky_add)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _continue_answer, idea=IDEA)
+    monkeypatch.setattr(store, "add_turn", original_add)
+
+    round_at_crash = store.latest_meeting_for_node(node_id)["round"]
+    result = drive(run_id, node_id, _integrate_answer, idea=IDEA)
+    assert result["done"] is True
+    # 轮次移交到下一轮且只加一次：重复重入不会把轮次多加
+    assert store.latest_meeting_for_node(node_id)["round"] == round_at_crash + 1
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    guidance = [t for t in store.list_turns(meeting_id) if t["kind"] == "user_guidance"]
+    assert len(guidance) == 1
+
+
+def _meeting_context(run_id: str, node_id: int) -> NodeContext:
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        return NodeContext(run_id=run_id, node_id=node_id, node_key=node.node_key,
+                           type=node.type, name=node.name, phase=node.phase,
+                           config=dict(node.config_json or {}),
+                           assignee=dict(node.assignee_json or {}), attempt_id=0,
+                           attempt_no=1, feedback=(node.config_json or {}).get("feedback"),
+                           idea=IDEA)
+
+
+def test_clarify_answers_are_not_repeated_after_a_crash(monkeypatch) -> None:
+    """澄清回答逐条落盘与状态移交不在同一事务：中断重入按轮次与内容去重，每个问题只答一次。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _meeting_run()
+    from app.meeting.runner import run_meeting
+
+    armed = {"on": True}
+    original_add = store.add_turn
+
+    def flaky_add(meeting_id, **kwargs):
+        turn_id = original_add(meeting_id, **kwargs)
+        if armed["on"] and kwargs.get("kind") == "answer":
+            armed["on"] = False                        # 第一条回答刚落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return turn_id
+
+    monkeypatch.setattr(store, "add_turn", flaky_add)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _clarify_answer, idea=IDEA)
+    monkeypatch.setattr(store, "add_turn", original_add)
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+    assert result["done"] is True
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    answers = [t for t in store.list_turns(meeting_id) if t["kind"] == "answer"]
+    questions = len(store.get_state(meeting_id)["clarifications"])
+    assert len(answers) == questions                   # 每个问题恰好一条回答
+    assert sum(1 for t in answers if "Markdown 即可" in t["content"]) == 1
+
+
+def test_early_reroute_self_feedback_is_recorded_as_review_voice(monkeypatch) -> None:
+    """还没到议题阶段时收到的 reroute_self 反馈：发言同样标"评审意见"，不标成用户。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _meeting_run()
+    from app.meeting.runner import run_meeting
+
+    first = asyncio.run(run_meeting(_meeting_context(run_id, node_id)))   # 挂起在澄清确认点
+    assert first["suspended"] is True
+    _set_feedback(node_id, "先把澄清里没答的问题补上", "reroute_self")
+    asyncio.run(run_meeting(_meeting_context(run_id, node_id)))
+
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    turns = [t for t in store.list_turns(meeting_id)
+             if t["kind"] == "user_feedback" and "先把澄清里没答的问题补上" in t["content"]]
+    assert [t["speaker_name"] for t in turns] == ["评审意见"]
+
+
+def test_reopen_feedback_from_reroute_self_is_recorded_as_review_voice(monkeypatch) -> None:
+    """复议反馈来路是 reroute_self：发言标"评审意见"，不标成用户。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)))
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    _set_feedback(node_id, "先把 D1 的存储方案定下来", "reroute_self")
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    turns = [t for t in store.list_turns(meeting_id)
+             if t["kind"] == "user_feedback" and "先把 D1 的存储方案定下来" in t["content"]]
+    assert [t["speaker_name"] for t in turns] == ["评审意见"]
+
+
+def test_early_feedback_speech_is_not_repeated_after_a_crash(monkeypatch) -> None:
+    """入口的早期反馈分支（还没到议题阶段的反馈）：发言与状态移交不在同一事务，
+    中断重入按轮次与内容去重，不重复写反馈发言。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _meeting_run()
+    from app.meeting.runner import run_meeting
+
+    first = asyncio.run(run_meeting(_meeting_context(run_id, node_id)))   # 挂起在澄清确认点
+    assert first["suspended"] is True
+    _set_feedback(node_id, "补充成本约束：两周内必须上线", "user")
+
+    armed = {"on": True}
+    original_add = store.add_turn
+
+    def flaky_add(meeting_id, **kwargs):
+        turn_id = original_add(meeting_id, **kwargs)
+        if armed["on"] and kwargs.get("kind") == "user_feedback":
+            armed["on"] = False                        # 反馈发言刚落盘、状态还没移交：进程在这里被杀
+            raise asyncio.CancelledError()
+        return turn_id
+
+    monkeypatch.setattr(store, "add_turn", flaky_add)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_meeting(_meeting_context(run_id, node_id)))
+    monkeypatch.setattr(store, "add_turn", original_add)
+
+    asyncio.run(run_meeting(_meeting_context(run_id, node_id)))           # 重入续开
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    feedbacks = [t for t in store.list_turns(meeting_id)
+                 if t["kind"] == "user_feedback" and "补充成本约束" in t["content"]]
+    assert len(feedbacks) == 1
+
+
 def test_a_proposal_missing_required_sections_is_rejected(monkeypatch) -> None:
     install(monkeypatch, _replies(proposal="## 目标与成功标准\n\n两句话。"))
     run_id, node_id = _meeting_run({"automation": {"level": "L3"}})

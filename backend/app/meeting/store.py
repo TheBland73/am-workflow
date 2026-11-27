@@ -360,17 +360,19 @@ def get_turn(meeting_id: int, turn_id: int) -> dict | None:
 
 
 def find_turn(meeting_id: int, *, phase: str, round: int, kind: str,
-              speaker_id: int) -> dict | None:
-    """取某步骤某轮里某参会者的那条发言，断点续跑时用。"""
+              speaker_id: int, after_seq: int = 0) -> dict | None:
+    """取某步骤某轮里某参会者的那条发言，断点续跑时用。
+
+    after_seq 给出时只找序号在它之后的发言："复用键认领之后才落盘"的找回用，
+    避免把认领之前同一身份的旧发言错当这一次的。
+    """
     with session_scope() as s:
-        row = (
-            s.query(MeetingTurn)
-            .filter(MeetingTurn.meeting_id == meeting_id, MeetingTurn.phase == phase,
-                    MeetingTurn.round == round, MeetingTurn.kind == kind,
-                    MeetingTurn.speaker_id == speaker_id, MeetingTurn.content != "")
-            .order_by(MeetingTurn.seq.desc())
-            .first()
-        )
+        query = s.query(MeetingTurn).filter(
+            MeetingTurn.meeting_id == meeting_id, MeetingTurn.phase == phase,
+            MeetingTurn.round == round, MeetingTurn.kind == kind,
+            MeetingTurn.speaker_id == speaker_id, MeetingTurn.content != "",
+            MeetingTurn.seq > after_seq)
+        row = query.order_by(MeetingTurn.seq.desc()).first()
         if row is None:
             return None
         return {"turn_id": row.id, "content": row.content,

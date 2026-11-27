@@ -137,12 +137,37 @@ class MeetingSession:
             return None
         return decision
 
-    def ack_decision(self, decision: dict | None = None) -> None:
-        """确认这个确认点的决定已经被消费掉（步骤已经按它做完事）。"""
+    def ack_decision(self, decision: dict | None = None,
+                     disposition: dict | None = None) -> None:
+        """确认这个确认点的决定已经被消费掉（步骤已经按它做完事）。
+
+        disposition 给出时，处置记录与认领写进同一次状态写入：进程在"认领之后、结果
+        落地之前"中断，重入按 gate_disposition() 的记录重放结果，人的决定不会丢。
+        """
         state = self.state()
         gate_id = (decision or {}).get("gate_id") or state.get("awaiting_gate_id")
-        if gate_id and state.get("handled_gate_id") != gate_id:
-            self.set_state(handled_gate_id=gate_id)
+        if not gate_id:
+            return
+        record = state.get("gate_disposition")
+        need_ack = state.get("handled_gate_id") != gate_id
+        need_record = disposition is not None and not (
+            isinstance(record, dict) and record.get("gate_id") == gate_id)
+        if need_ack or need_record:
+            changes: dict = {}
+            if need_ack:
+                changes["handled_gate_id"] = gate_id
+            if need_record:
+                changes["gate_disposition"] = {"gate_id": gate_id, **disposition}
+            self.set_state(**changes)
+
+    def gate_disposition(self) -> dict | None:
+        """当前等待的确认点的处置记录（认领时一并写下的）：没有或不是这扇门的就返回 None。"""
+        state = self.state()
+        gate_id = state.get("awaiting_gate_id")
+        record = state.get("gate_disposition")
+        if gate_id and isinstance(record, dict) and record.get("gate_id") == gate_id:
+            return record
+        return None
 
     async def open_checkpoint(self, kind: str, *, title: str, description: str,
                               payload: dict | None = None) -> dict:

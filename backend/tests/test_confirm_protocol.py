@@ -463,7 +463,7 @@ def test_reopen_branch_clears_stale_reroute_mark_and_last_report_fields() -> Non
     run_id, node_id = _confirm_run()
     mtg = _confirm_session(run_id, node_id, phase="verdict", state={
         "pending_feedback": "R1 的验收标准写得不清楚",
-        "rework_pending": True, "awaiting_rework": True,
+        "rework_pending": True,
         "verdict": "fail", "summary": "需求确认会议完成：结论 不通过", "blocking": 3,
         "minutes_version": 1})
 
@@ -471,20 +471,141 @@ def test_reopen_branch_clears_stale_reroute_mark_and_last_report_fields() -> Non
 
     state = store.get_state(mtg.meeting_id)
     assert state["intake_feedback"] == "R1 的验收标准写得不清楚"   # 反馈已移交给受理步
-    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["rework_pending"] is False
     assert state["summary"] is None and state["blocking"] is None
+
+
+def test_feedback_speech_is_not_repeated_after_a_crash(monkeypatch) -> None:
+    """入口反馈分支的发言与状态移交不在同一事务：中断重入按轮次与内容去重，不重复发言。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="verdict", state={
+        "reopen_feedback": "R1 的验收标准写得不清楚", "feedback_kind": "reroute"})
+    armed = {"on": True}
+    original_update = store.update_meeting
+
+    def flaky_update(meeting_id, **fields):
+        if armed["on"] and fields.get("phase") == "intake":
+            armed["on"] = False                        # 反馈发言刚落盘、状态还没移交：进程在这里被杀
+            raise asyncio.CancelledError()
+        return original_update(meeting_id, **fields)
+
+    monkeypatch.setattr(store, "update_meeting", flaky_update)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(confirm_module.ConfirmProtocol().on_enter(mtg))
+    monkeypatch.setattr(store, "update_meeting", original_update)
+
+    asyncio.run(confirm_module.ConfirmProtocol().on_enter(mtg))
+    turns = store.round_turns(mtg.meeting_id, round=2, kinds=["user_feedback"])
+    assert [t["content"] for t in turns] == ["R1 的验收标准写得不清楚"]
+    state = store.get_state(mtg.meeting_id)
+    assert state["intake_feedback"] == "R1 的验收标准写得不清楚" and state["reopen_feedback"] == ""
+
+
+def _land_turn(mtg, *, phase: str, kind: str, speaker: dict, content: str,
+               structured: dict) -> None:
+    """预先落一条完整发言：让步骤的 find_turn 复用它，不调模型。"""
+    turn = store.add_turn(mtg.meeting_id, round=1, phase=phase, speaker_id=speaker["id"],
+                          speaker_name=speaker["display_name"], kind=kind)
+    store.finish_turn(turn, content=content, structured=structured)
+
+
+def _chair(mtg) -> dict:
+    store.add_participant(mtg.meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    return mtg.participants("chair")[0]
+
+
+def test_intake_accounting_is_idempotent_by_signature(monkeypatch) -> None:
+    """受理入账按（轮次、出处、需求、问题）签名去重：重跑入账不会以新编号重复入账。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _confirm_run()
+    seeded = {"id": "C1", "kind": "quality", "requirement": "R1", "index": "",
+              "severity": "major", "problem": "验收标准不可核对", "suggestion": "",
+              "origin": "user", "round": 1}
+    mtg = _confirm_session(run_id, node_id, phase="intake", state={
+        "intake_feedback": "R1 的验收标准写得不清楚", "items": [seeded]})
+    _land_turn(mtg, phase="intake", kind="confirm_intake", speaker=_chair(mtg),
+               content="整理条目", structured={"items": [
+                   {"kind": "quality", "requirement": "R1", "severity": "major",
+                    "problem": "验收标准不可核对", "suggestion": ""}]})
+    protocol = confirm_module.ConfirmProtocol()
+
+    asyncio.run(protocol.step_intake(mtg))
+
+    items = store.get_state(mtg.meeting_id)["items"]
+    assert [item["id"] for item in items] == ["C1"]
+
+
+def test_merge_accounting_is_idempotent_by_signature(monkeypatch) -> None:
+    """汇总入账按（轮次、出处、需求、问题）签名去重：重跑入账沿用已入账的编号，不重复入账。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _confirm_run()
+    seeded = {"id": "C1", "kind": "distorted", "requirement": "R1", "index": "D1",
+              "severity": "blocker", "problem": "范围与账本不一致", "suggestion": "",
+              "origin": "program", "round": 1}
+    mtg = _confirm_session(run_id, node_id, phase="merge", state={
+        "fidelity": [{"index": "D1", "result": "distorted",
+                      "reason": "范围与账本不一致", "checker": "核对者"}],
+        "items": [dict(seeded)]})
+    _land_turn(mtg, phase="merge", kind="confirm_merge", speaker=_chair(mtg),
+               content="归类", structured={"items": [{"index": "D1", "requirement": "R1"}]})
+    protocol = confirm_module.ConfirmProtocol()
+
+    asyncio.run(protocol.step_merge(mtg))
+
+    items = store.get_state(mtg.meeting_id)["items"]
+    assert [item["id"] for item in items] == ["C1"]
+    assert items[0]["requirement"] == "R1"             # 归类的补充照常生效
+
+
+def test_reroute_self_feedback_is_recorded_as_review_voice() -> None:
+    """回流写给下一轮的自我提示也是"评审意见"的发言，不标成用户。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="verdict", state={
+        "reopen_feedback": "先把 R2 的度量口径写清楚", "feedback_kind": "reroute_self"})
+
+    asyncio.run(confirm_module.ConfirmProtocol().on_enter(mtg))
+
+    turns = store.round_turns(mtg.meeting_id, round=2, kinds=["user_feedback"])
+    assert [t["speaker_name"] for t in turns] == ["评审意见"]
+
+
+def test_quality_reviewer_fallback_applies_min_and_max(monkeypatch) -> None:
+    """无评审会议时的质量评审者兜底：与评审协议同样应用 reviewers_max 与 reviewers_min。"""
+    install(monkeypatch, _replies())
+    run_id, node_id = _confirm_run(with_review=False)
+    base = [{"mode": "participant", "role_key": "ux", "display_name": "用户体验",
+             "system_prompt": "p", "model_id": None, "id": 1},
+            {"mode": "participant", "role_key": "arch", "display_name": "架构师",
+             "system_prompt": "p", "model_id": None, "id": 2}]
+    protocol = confirm_module.ConfirmProtocol()
+
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        node.config_json = {**(node.config_json or {}), "params": {"reviewers_max": 1}}
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+    picked = protocol._quality_sources(mtg, base)
+    assert [row["display_name"] for row in picked] == ["用户体验"]
+
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        node.config_json = {**(node.config_json or {}),
+                            "params": {"reviewers_min": 3}}
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+    with pytest.raises(NodeFailure, match="评审者人数不足"):
+        protocol._quality_sources(mtg, base)
 
 
 def test_rework_branch_clears_last_report_fields() -> None:
     """从等待返工恢复：回流标记照旧清掉，旧报告的摘要与阻塞数也一并清掉。"""
     run_id, node_id = _confirm_run()
     mtg = _confirm_session(run_id, node_id, phase="verdict", state={
-        "rework_pending": True, "awaiting_rework": True,
+        "rework_pending": True,
         "verdict": "fail", "summary": "需求确认会议完成：结论 不通过", "blocking": 3,
         "minutes_version": 1})
 
     asyncio.run(confirm_module.ConfirmProtocol().on_enter(mtg))
 
     state = store.get_state(mtg.meeting_id)
-    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["rework_pending"] is False
     assert state["summary"] is None and state["blocking"] is None

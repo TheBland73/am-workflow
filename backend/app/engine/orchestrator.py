@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Gate, Node, NodeAttempt, Run, Task, Workflow
+from app.db.models import Gate, Meeting, Node, NodeAttempt, Run, Task, Workflow
 from app.engine.events import emit
 from app.engine.feedback import with_feedback
 from app.engine.gates import GateError, decide_gate as _decide_gate, gate_payload
@@ -206,11 +206,13 @@ class Orchestrator:
 
         self._finish_attempt(attempt_id)
         if result.get("suspended"):
-            # 会议在确认点挂起：门、节点与运行的状态已由会议运行器置好，这里只补一条事件
-            checkpoint = result.get("checkpoint") or {}
-            await emit(run_id, "meeting_suspended", node["id"], {
-                "meeting_id": result.get("meeting_id"), "gate_id": checkpoint.get("id"),
-                "kind": checkpoint.get("kind")})
+            # 会议在确认点挂起：门、节点与运行的状态已由会议运行器置好，这里只补一条事件。
+            # 挂起中的节点被多余调度时（already_waiting）不重复发，事件流不刷屏。
+            if not result.get("already_waiting"):
+                checkpoint = result.get("checkpoint") or {}
+                await emit(run_id, "meeting_suspended", node["id"], {
+                    "meeting_id": result.get("meeting_id"), "gate_id": checkpoint.get("id"),
+                    "kind": checkpoint.get("kind")})
             return
         if result.get("reroute"):
             await self._handle_reroute(run_id, node, result["reroute"])
@@ -413,32 +415,50 @@ class Orchestrator:
         if extra_round:
             bump["max_rounds"] = max(max_rounds, round_no + 1)
         self_feedback = str(instruction.get("self_feedback") or "").strip()
-        if self_feedback:
-            updated = with_feedback(config, self_feedback, "reroute_self")
-            self._update_node(node["id"], status="pending", drop=["retry_at"], extra={
-                **bump, "feedback": updated["feedback"],
-                "feedback_kind": updated["feedback_kind"],
-                "feedback_seq": updated["feedback_seq"]})
-        else:
-            self._update_node(node["id"], status="pending", extra=bump,
-                              drop=["retry_at", "feedback", "feedback_kind"])
-        _, nodes = self._load(run_id)
+        # 发起节点、目标节点与"已回流"标记放进同一个事务：进程级中断不会留下
+        # "轮次已加、目标没重开"或"目标对同一反馈重复返工"的半截状态。
         reset: list[str] = []
-        for other in nodes:
-            if other["node_key"] in targets and other["status"] != "running":
-                updated = with_feedback(other["config"], feedback, "reroute")
-                self._update_node(other["id"], status="pending",
-                                  extra={"feedback": updated["feedback"],
-                                         "feedback_kind": updated["feedback_kind"],
-                                         "feedback_seq": updated["feedback_seq"]},
-                                  drop=["retry_at", "retry_count"])
-                reset.append(other["node_key"])
-        # "已回流"的标记在目标节点确实重开之后才写（目标正在运行被跳过时不写）：
-        # 协议不再提前写，这样进程在编排器接受回流之前中断时，重入的协议会重新发起回流而不是空等返工。
-        meeting = store.latest_meeting_for_node(node["id"]) if reset else None
-        if meeting is not None:
-            store.update_meeting(meeting["id"], state_json={
-                **meeting["state"], "awaiting_rework": True, "rework_pending": True})
+        with session_scope() as s:
+            initiator = s.get(Node, node["id"])
+            if initiator is not None:
+                cfg = dict(initiator.config_json or {})
+                if self_feedback:
+                    updated = with_feedback(cfg, self_feedback, "reroute_self")
+                    cfg = {**updated, **bump}
+                    cfg.pop("retry_at", None)
+                else:
+                    cfg = {**cfg, **bump}
+                    cfg.pop("retry_at", None)
+                    cfg.pop("feedback", None)
+                    cfg.pop("feedback_kind", None)
+                initiator.config_json = cfg
+                initiator.status = "pending"
+            rows = (
+                s.query(Node)
+                .filter(Node.run_id == run_id)
+                .order_by(Node.order_index.asc(), Node.id.asc())
+                .all()
+            )
+            for other in rows:
+                if other.node_key in targets and other.status != "running":
+                    updated = with_feedback(dict(other.config_json or {}), feedback, "reroute")
+                    cfg = {**updated}
+                    cfg.pop("retry_at", None)
+                    cfg.pop("retry_count", None)
+                    other.config_json = cfg
+                    other.status = "pending"
+                    reset.append(other.node_key)
+            # "已回流"的标记在目标节点确实重开之后才写（目标正在运行被跳过时不写）：
+            # 协议不再提前写，这样进程在编排器接受回流之前中断时，重入的协议会重新发起回流而不是空等返工。
+            if reset:
+                meeting = (
+                    s.query(Meeting)
+                    .filter(Meeting.node_id == node["id"])
+                    .order_by(Meeting.id.desc())
+                    .first()
+                )
+                if meeting is not None:
+                    meeting.state_json = {**(meeting.state_json or {}), "rework_pending": True}
         await emit(run_id, "node_rerouted", node["id"], {
             "from": node["node_key"], "targets": reset, "round": round_no + 1,
             "max_rounds": bump.get("max_rounds", max_rounds), "escalated": False})

@@ -375,13 +375,23 @@ def _finish_step(mtg, step: str, **changes) -> None:
 
 
 def _add_issues(mtg, rows: list[dict], *, origin: str, round_no: int) -> list[dict]:
-    """把一批原始意见规范化、编号；返回写完的整份列表，由调用方与完成标记一起落盘。"""
+    """把一批原始意见规范化、编号；返回写完的整份列表，由调用方与完成标记一起落盘。
+
+    追加前按（轮次、出处、位置、问题）签名去重：崩溃重入按已落盘的发言重跑入账时，
+    同一批意见不会以新编号重复入账。
+    """
     issues = _issues(mtg)
+    signatures = {(issue.get("round"), issue.get("origin"), issue.get("location"),
+                   issue.get("problem")) for issue in issues}
     numbers = [int(issue["id"][1:]) for issue in issues
                if str(issue.get("id", "")).startswith("I") and str(issue.get("id"))[1:].isdigit()]
     number = max(numbers, default=0) + 1
     for raw in rows:
         normalized = review_rules.normalize_issue(raw)
+        signature = (round_no, origin, normalized.get("location"), normalized.get("problem"))
+        if signature in signatures:
+            continue
+        signatures.add(signature)
         issue_id = f"I{number}"
         number += 1
         issues.append({
@@ -417,12 +427,28 @@ def _step_key(step: str, mtg, ids: list[str], *, extra: str = "") -> str:
 
 
 async def _reuse_or_speak(mtg, key: str, *, require_data: bool = False, **kwargs) -> dict:
-    """步骤的模型调用只做一次：状态里记着这一步的发言就直接复用。"""
-    remembered = (mtg.state().get("step_turns") or {}).get(key)
-    if remembered:
-        found = store.get_turn(mtg.meeting_id, int(remembered))
+    """步骤的模型调用只做一次：状态里记着这一步的发言就直接复用。
+
+    复用键在发言之前先认领（记下当时的发言行数）：崩溃落在"发言落盘、编号写上"之间时，
+    重入按"认领之后才落盘"找回这一次的发言，不重复调用模型。
+    """
+    turns = dict(mtg.state().get("step_turns") or {})
+    remembered = turns.get(key)
+    if isinstance(remembered, int):
+        found = store.get_turn(mtg.meeting_id, remembered)
         if found is not None and (found.get("data") is not None or not require_data):
             return found
+    elif isinstance(remembered, dict):
+        found = store.find_turn(mtg.meeting_id, phase=mtg.meeting()["phase"],
+                                round=int(kwargs.get("turn_round") or mtg.round_no()),
+                                kind=kwargs.get("turn_kind"),
+                                speaker_id=kwargs["participant"]["id"],
+                                after_seq=int(remembered.get("seq") or 0))
+        if found is not None and (found.get("data") is not None or not require_data):
+            return found
+    turns = dict(mtg.state().get("step_turns") or {})
+    turns[key] = {"seq": store.count_turns(mtg.meeting_id)}     # 认领：只认这次调用之后的发言
+    mtg.set_state(step_turns=turns)
     result = await speak(mtg, **kwargs)
     turns = dict(mtg.state().get("step_turns") or {})
     turns[key] = result["turn_id"]
@@ -474,25 +500,31 @@ class ReviewProtocol(MeetingProtocol):
         text = str(state.get("reopen_feedback") or "").strip()
         if text and not state.get("intake_feedback"):
             flow = _flow(mtg) + 1
-            speaker = "评审意见" if state.get("feedback_kind") == "reroute" else "用户"
-            store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
-                           speaker_name=speaker, kind="user_feedback", content=text)
-            # 轮次、反馈的移交与滞留标记、旧报告字段的清理一次写完：中途崩溃不会重复加轮
+            speaker = ("评审意见" if state.get("feedback_kind") in ("reroute", "reroute_self")
+                       else "用户")
+            # 断点保护：反馈发言已经落盘就不再重复写（按轮次与内容去重，复议分支的记法）
+            existing = {turn["content"] for turn in store.round_turns(
+                mtg.meeting_id, round=flow, kinds=["user_feedback"])}
+            if text not in existing:
+                store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
+                               speaker_name=speaker, kind="user_feedback", content=text)
+            # 轮次、反馈的移交与滞留标记、旧报告字段、旧处置记录的清理一次写完：中途崩溃不会重复加轮
             store.update_meeting(mtg.meeting_id, round=flow, phase="intake", state_json={
                 **state, "reopen_feedback": "", "intake_feedback": text,
-                "rework_pending": False, "awaiting_rework": False,
-                "reviewed_round": None, "verdict": None, "accepted_by_user": False,
-                "summary": None, "blocking": None,
-                "unfixed": [], "discussed": [], "defended": [], "verify_retry_done": False,
+                "rework_pending": False,
+                "verdict": None, "accepted_by_user": False,
+                "summary": None, "blocking": None, "gate_disposition": None,
+                "unfixed": [], "discussed": [], "verify_retry_done": False,
                 "review_batch": []})
             mtg.reset_builder()
             return
         if state.get("rework_pending"):
             flow = _flow(mtg) + 1
             store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
-                **state, "rework_pending": False, "awaiting_rework": False, "reviewed_round": None,
+                **state, "rework_pending": False,
                 "verdict": None, "accepted_by_user": False, "summary": None, "blocking": None,
-                "unfixed": [], "discussed": [], "defended": [], "verify_retry_done": False,
+                "gate_disposition": None,
+                "unfixed": [], "discussed": [], "verify_retry_done": False,
                 "review_batch": []})
             mtg.reset_builder()
 
@@ -798,24 +830,25 @@ class ReviewProtocol(MeetingProtocol):
         if not targets:
             _patch_round(mtg, "discuss")
             return advance("verdict")
-        defended = set(mtg.state().get("defended") or [])
         for issue in targets:
-            if issue["id"] in defended:                   # 已辩护过的意见重入时跳过
-                continue
             speaker = _speaker_for(mtg, issue)
             if speaker is None:
                 continue
+            # 已辩护过的意见按发言行自证身份（每条辩护一个落盘类型，代理回答的记法）：
+            # 重入不再重复发言，也没有"标记在发言提交之后单独写"的事务窗口。
+            found = store.find_turn(mtg.meeting_id, phase=mtg.meeting()["phase"],
+                                    round=_flow(mtg), kind=f"review_defend_{issue['id']}",
+                                    speaker_id=speaker["id"])
+            if found is not None:
+                continue
             await speak(
-                mtg, speaker, kind="review_defend", turn_kind="review_defend",
+                mtg, speaker, kind="review_defend", turn_kind=f"review_defend_{issue['id']}",
                 charter=_charter(mtg),
                 segments=[Segment("append",
                                   f"## 要辩护的意见\n{issue['id']}：{issue['problem']}；"
                                   f"执笔者的回应：{issue.get('response') or '未采纳'}",
                                   name="意见")],
                 instruction=REVIEW_DEFEND_INSTRUCTION, turn_round=_flow(mtg))
-            # 每条发言落盘后立刻记下：崩溃重入时不再为它重复发言（讨论协议交锋的记法）
-            defended |= {issue["id"]}
-            mtg.set_state(defended=sorted(defended))
         ids = [issue["id"] for issue in targets]
         listing = "\n".join(f"- {issue['id']}：{issue['problem']}；执笔者回应："
                             f"{issue.get('response') or '未采纳'}" for issue in targets)

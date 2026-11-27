@@ -603,12 +603,16 @@ class DiscussionProtocol(MeetingProtocol):
         # 不能把会议直接跳到复议：否则名单、立场、议题都不会执行，会议空着就成稿。
         if not (state.get("roster_done") and _points(mtg)):
             if not state.get("early_feedback"):
-                speaker = ("评审意见" if state.get("feedback_kind") == "reroute"
-                           else "用户")
+                speaker = ("评审意见" if state.get("feedback_kind")
+                           in ("reroute", "reroute_self") else "用户")
                 phase = store.get_meeting(mtg.meeting_id)["phase"]
-                store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase=phase,
-                               speaker_id=None, speaker_name=speaker, kind="user_feedback",
-                               content=feedback)
+                # 断点保护：反馈发言已经落盘就不再重复写（按轮次与内容去重，复议分支的记法）
+                existing = {turn["content"] for turn in store.round_turns(
+                    mtg.meeting_id, round=mtg.meeting_round(), kinds=["user_feedback"])}
+                if feedback not in existing:
+                    store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase=phase,
+                                   speaker_id=None, speaker_name=speaker, kind="user_feedback",
+                                   content=feedback)
                 changes = {"early_feedback": feedback, "reopen_feedback": ""}
                 if phase == "roster":
                     changes["roster_feedback"] = feedback
@@ -700,6 +704,9 @@ class DiscussionProtocol(MeetingProtocol):
                 payload={"questions": questions}))
         answers = [str(item).strip() for item in decision["data"].get("answers") or []]
         clarifications = []
+        # 断点保护：回答已经落盘就不再重复写（按轮次与内容去重，复议分支的记法）
+        existing = {turn["content"] for turn in store.round_turns(
+            mtg.meeting_id, round=mtg.meeting_round(), kinds=["answer"])}
         for number, question in enumerate(questions, start=1):
             text = answers[number - 1] if number <= len(answers) else ""
             if text:
@@ -708,9 +715,11 @@ class DiscussionProtocol(MeetingProtocol):
                 text, source = "用户没有回答，按假设处理", "assumption"
             clarifications.append({"question": question, "answer": text,
                                    "source": source, "evidence": ""})
-            store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase="clarify",
-                           speaker_id=None, speaker_name="用户", kind="answer",
-                           content=f"问：{question}\n答：{text}")
+            content = f"问：{question}\n答：{text}"
+            if content not in existing:
+                store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase="clarify",
+                               speaker_id=None, speaker_name="用户", kind="answer",
+                               content=content)
         mtg.set_state(clarifications=clarifications)
         mtg.ack_decision(decision)
         return advance()
@@ -1038,33 +1047,52 @@ class DiscussionProtocol(MeetingProtocol):
             await _ledger_updated(mtg)
             mtg.reset_builder()
             return advance()
-        decision = mtg.decision()
-        if decision is None:
-            return suspend(await mtg.open_checkpoint(
-                "consensus", title=CONSENSUS_TITLES.get(reason, "轮次共识"),
-                description=_consensus_description(mtg, open_points, reason),
-                payload={"reason": reason, "round": mtg.meeting_round(),
-                         "options": CONSENSUS_OPTIONS,
-                         "open": [_open_brief(point) for point in open_points]}))
-        data = decision["data"] or {}
-        option = str(data.get("option") or ("integrate" if decision["action"] == "approve"
-                                            else "continue"))
+        # 认领过的处置（认领与记录同一事务）：按记录重放结果，不重新开一扇门、不丢人的决定。
+        record = mtg.gate_disposition()
+        decision = None
+        if record is not None and record.get("kind") == "consensus":
+            option = str(record.get("option") or "continue")
+            guidance = str(record.get("feedback") or "")
+            replay_round = record.get("round")
+        else:
+            decision = mtg.decision()
+            if decision is None:
+                return suspend(await mtg.open_checkpoint(
+                    "consensus", title=CONSENSUS_TITLES.get(reason, "轮次共识"),
+                    description=_consensus_description(mtg, open_points, reason),
+                    payload={"reason": reason, "round": mtg.meeting_round(),
+                             "options": CONSENSUS_OPTIONS,
+                             "open": [_open_brief(point) for point in open_points]}))
+            data = decision["data"] or {}
+            option = str(data.get("option") or ("integrate" if decision["action"] == "approve"
+                                                else "continue"))
+            guidance = str(decision.get("feedback") or "")
+            replay_round = None
         if option == "continue" and not open_points:
             # 全部了结时没有可继续讨论的点：忽略"继续讨论"，直接成稿
-            mtg.ack_decision(decision)
-            mtg.set_state(consensus_reason=None)
+            if decision is not None:
+                mtg.ack_decision(decision, disposition={"kind": "consensus", "option": option})
+            mtg.set_state(consensus_reason=None, gate_disposition=None)
             return advance()
         if option == "continue":
             # 再讨论一轮：指导语作为一条用户发言进入纪要，算在下一轮里
-            following = mtg.meeting_round() + 1
-            store.add_turn(mtg.meeting_id, round=following, phase="consensus", speaker_id=None,
-                           speaker_name="用户", kind="user_guidance",
-                           content=decision.get("feedback") or "")
+            following = int(replay_round) if replay_round else mtg.meeting_round() + 1
+            # 断点保护：指导语已经落盘就不再重复写（按轮次与内容去重，复议分支的记法）
+            existing = {turn["content"] for turn in store.round_turns(
+                mtg.meeting_id, round=following, kinds=["user_guidance"])}
+            if guidance not in existing:
+                store.add_turn(mtg.meeting_id, round=following, phase="consensus",
+                               speaker_id=None, speaker_name="用户", kind="user_guidance",
+                               content=guidance)
             store.update_meeting(mtg.meeting_id, round=following)
-            mtg.ack_decision(decision)
+            if decision is not None:
+                mtg.ack_decision(decision, disposition={
+                    "kind": "consensus", "option": option, "round": following,
+                    "feedback": guidance})
             mtg.set_state(consensus_reason=None, stall=0, exchange_done=[], exchanges={},
                           stance_snapshot=snapshot(open_points),
-                          rounds_limit=max(_rounds_max(mtg), following))
+                          rounds_limit=max(_rounds_max(mtg), following),
+                          gate_disposition=None)
             mtg.reset_builder()
             return advance("exchange")
         if option == "delegate" and open_points:
@@ -1075,8 +1103,9 @@ class DiscussionProtocol(MeetingProtocol):
                 _close(mtg, point["index"], DEFERRED, "各方未达成一致，待用户决定")
             await _ledger_updated(mtg)
             mtg.reset_builder()
-        mtg.ack_decision(decision)
-        mtg.set_state(consensus_reason=None)
+        if decision is not None:
+            mtg.ack_decision(decision, disposition={"kind": "consensus", "option": option})
+        mtg.set_state(consensus_reason=None, gate_disposition=None)
         return advance()
 
     # ---------- 复议 ----------
@@ -1088,7 +1117,8 @@ class DiscussionProtocol(MeetingProtocol):
         facilitator = _facilitator(mtg)
         round_no = mtg.meeting_round()
         following = round_no + 1
-        speaker = "评审意见" if state.get("feedback_kind") == "reroute" else "用户"
+        speaker = ("评审意见" if state.get("feedback_kind") in ("reroute", "reroute_self")
+                   else "用户")
         # 断点保护：reopen 的回复已经落盘就复用；反馈发言也按轮次与内容去重
         found = store.find_turn(mtg.meeting_id, phase="reopen", round=round_no,
                                 kind="reopen_plan", speaker_id=facilitator["id"])
@@ -1130,7 +1160,7 @@ class DiscussionProtocol(MeetingProtocol):
         # 反馈处理完之后才清空标记：模型调用或落盘失败重试时，这条反馈还在
         mtg.set_state(stance_snapshot={}, exchange_done=[], exchanges={}, stall=0,
                       consensus_reason=None, rounds_limit=None, reopen_feedback="",
-                      reopen_rounds=reopened)
+                      reopen_rounds=reopened, gate_disposition=None)
         mtg.reset_builder()
         await _ledger_updated(mtg)
         return advance("stances")
