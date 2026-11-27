@@ -1,9 +1,8 @@
 import type {
-  AgentTemplate, AnalyticsDistribution, AnalyticsFailedRuns, AnalyticsOverview,
-  AnalyticsRange, AnalyticsRecentRuns, AnalyticsTrends, AnalyticsUsage,
-  ArtifactRecord, Gate, ModelEntry, PlanActivity, PlanDetail, PlanEvent,
-  PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider, RemoteModel, Run, RunMetrics,
-  RunReview, Snapshot, StreamEvent, Task, TestResult,
+  AgentTemplate, AnalyticsDistribution, AnalyticsFailedRuns, AnalyticsOverview, AnalyticsRange, AnalyticsRecentRuns, AnalyticsTrends, AnalyticsUsage, ArtifactRecord, Gate, ModelEntry, NodeActionResponse, NodeDetail,
+  PlanActivity, PlanDetail, PlanEvent, PlanListItem, PlanPhases, PlanPoint, PlanTask,
+  Preset, Provider, RemoteModel, ResetNodeBody, RetryNodeBody, Run, RunMetrics,
+  RunReview, SkipNodeBody, Snapshot, StreamEvent, Task, TestResult,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -92,9 +91,29 @@ export const api = {
   deleteTask: (runId: string, uid: string) =>
     request<void>(`/runs/${runId}/tasks/${uid}`, { method: "DELETE" }),
 
-  getNode: (nodeId: number) => request<import("./types").NodeDetail>(`/nodes/${nodeId}`),
-  retryNode: (nodeId: number) =>
-    request<Record<string, unknown>>(`/nodes/${nodeId}/retry`, { method: "POST" }),
+  getNode: (nodeId: number, params?: { messages?: number; events?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.messages != null) query.set("messages", String(params.messages));
+    if (params?.events != null) query.set("events", String(params.events));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return request<NodeDetail>(`/nodes/${nodeId}${suffix}`);
+  },
+  retryNode: (nodeId: number, body: RetryNodeBody = {}) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/retry`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  resetNode: (nodeId: number, body: ResetNodeBody = {}) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/reset`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  skipNode: (nodeId: number, body: SkipNodeBody = {}) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/skip`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  injectFeedback: (nodeId: number, feedback: string) =>
+    request<NodeActionResponse>(`/nodes/${nodeId}/feedback`, {
+      method: "POST", body: JSON.stringify({ feedback }),
+    }),
 
   presets: () => request<{ presets: Preset[] }>("/presets"),
   providers: () => request<{ items: Provider[] }>("/providers"),
@@ -225,6 +244,7 @@ export function subscribeRun(
     "run_created", "run_finished", "run_error", "run_stopped", "run_recovered",
     "phase_entered", "node_started", "node_finished", "node_failed", "node_log",
     "node_token", "node_tool_call", "node_tool_result", "node_retried", "node_retry_scheduled", "nodes_reset",
+    "node_skipped", "node_reset", "node_feedback_injected",
     "artifact_written", "task_created", "task_updated", "gate_requested", "gate_decided",
     "memory_written",
   ];
