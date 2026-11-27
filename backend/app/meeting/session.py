@@ -1,6 +1,7 @@
 """MeetingSession：一次执行里协议用得到的全部入口。"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,20 @@ class MeetingSession:
     meeting_id: int
     ctx: "NodeContext"
     builder: ContextBuilder = field(default_factory=ContextBuilder)
+    _compaction_lock: asyncio.Lock | None = field(default=None, repr=False, compare=False)
+    _lock_loop: object | None = field(default=None, repr=False, compare=False)
+
+    def compaction_lock(self) -> asyncio.Lock:
+        """会议上下文压缩的互斥锁：并行发言串行进出，后来者直接复用已存下的摘要。
+
+        锁按正在运行的事件循环惰性创建：测试里同一场会议常用多次 asyncio.run，
+        跨循环复用一个锁会报"绑定到另一个事件循环"。
+        """
+        loop = asyncio.get_running_loop()
+        if self._compaction_lock is None or self._lock_loop is not loop:
+            self._compaction_lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._compaction_lock
 
     @property
     def run_id(self) -> str:

@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from typing import Callable
 
 from app.artifacts.store import strip_outer_fence
 from app.conversation.builder import Segment
-from app.conversation.compact import CompactionStats, compact_messages
+from app.conversation.compact import (SUMMARY_PREFIX, CompactionStats, compact_messages,
+                                      estimate_messages, summary_of)
 from app.conversation.policy import DEFAULT_POLICY, policy_for_run
 from app.conversation.store import record_compaction
 from app.engine.agent_loop import _extract_json, run_agent
@@ -104,11 +106,59 @@ async def _summarize_exchanges(mtg: MeetingSession, model, text: str) -> str:
     return summary
 
 
+def _prefix_hash(append: list[Segment]) -> str:
+    """已压进摘要的那一段追加内容的指纹：内容或顺序变了，旧摘要就不能再用。"""
+    digest = hashlib.sha256()
+    for segment in append:
+        digest.update(segment.role.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(segment.text.encode("utf-8"))
+        digest.update(b"\x01")
+    return digest.hexdigest()
+
+
+def _stored_compaction(mtg: MeetingSession) -> dict | None:
+    """这一轮存下的压缩结果；轮次不对、内容缺失或形状不对都当没有。"""
+    stored = mtg.state().get("compaction")
+    if not isinstance(stored, dict):
+        return None
+    try:
+        round_no = int(stored.get("round") or 0)
+    except (TypeError, ValueError):
+        return None
+    if round_no != mtg.meeting_round():
+        return None
+    if not isinstance(stored.get("covered_len"), int) or not stored.get("summary"):
+        return None
+    return stored
+
+
+def _covered_len(append: list[Segment], stored: dict | None) -> int | None:
+    """存下的摘要覆盖了 append 的前多少条；前缀对不上就不复用。"""
+    if stored is None:
+        return None
+    covered = stored["covered_len"]
+    if covered <= 0 or covered > len(append):
+        return None
+    if _prefix_hash(append[:covered]) != stored.get("prefix_hash"):
+        return None
+    return covered
+
+
+def _assembled(segments: list[Segment], summary: str, kept: list[Segment],
+               previous: list[Segment]) -> list[Segment]:
+    """把冻结段、一条摘要、未覆盖的追加段与上一版方案拼成这次的视图。"""
+    return ([s for s in segments if s.kind == "frozen"]
+            + [Segment("append", SUMMARY_PREFIX + summary, name="交锋摘要")]
+            + list(kept) + previous)
+
+
 async def _fit(mtg: MeetingSession, model, segments: list[Segment],
                input_budget: int) -> list[Segment]:
     """追加区占到压缩阈值时，把其中较早的发言压成一条摘要。只改这次发出的视图，不改纪要。
 
     压缩只动追加区：冻结区（章程、人设、账本快照）是前缀缓存命中的部分，本轮内逐字节不变。
+    摘要按"会议 + 轮次"存进会议状态：同一轮的并行发言与后续发言直接复用，不重复摘要。
     摘要失败时按原视图继续——压缩只是优化，不该让一次发言作废；预算耗尽是例外。
     """
     try:
@@ -121,40 +171,65 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
     fixed = estimate_tokens(BASE_SYSTEM_PROMPT) + sum(
         estimate_tokens(s.text) for s in segments if s.kind == "frozen")
     fixed += sum(estimate_tokens(s.text) for s in previous)
+    threshold = policy.compact_at * input_budget
     size = fixed + sum(estimate_tokens(s.text) for s in append) + _TAIL_RESERVE
-    if size < policy.compact_at * input_budget:
+    if size < threshold:
         return segments
-    messages = [Message(role="system", content="系统")]
-    messages += [Message(role=s.role, content=s.text) for s in append]
-    stats = CompactionStats()
+    # 并行发言会同时进来：串行进出，后来者读到刚存下的摘要就直接复用
+    async with mtg.compaction_lock():
+        stored = _stored_compaction(mtg)
+        covered = _covered_len(append, stored)
+        if covered:
+            base = [Message(role="system", content="系统"),
+                    Message(role="user", content=SUMMARY_PREFIX + stored["summary"])]
+            base += [Message(role=s.role, content=s.text) for s in append[covered:]]
+            if fixed + estimate_messages(base) + _TAIL_RESERVE < threshold:
+                # 摘要 + 尚未覆盖的发言已经装得下：不再调摘要
+                return _assembled(segments, stored["summary"], append[covered:], previous)
+        else:
+            base = [Message(role="system", content="系统")]
+            base += [Message(role=s.role, content=s.text) for s in append]
+        stats = CompactionStats()
 
-    async def report_progress(index: int, total: int | None) -> None:
-        done = f"/{total}" if total else ""
-        await emit(mtg.run_id, "node_log", mtg.node_id, {
-            "level": "info", "message": f"压缩上下文：第 {index}{done} 块"})
+        async def report_progress(index: int, total: int | None) -> None:
+            done = f"/{total}" if total else ""
+            await emit(mtg.run_id, "node_log", mtg.node_id, {
+                "level": "info", "message": f"压缩上下文：第 {index}{done} 块"})
 
-    try:
-        compacted, before, after = await compact_messages(
-            messages, summarize=lambda text: _summarize_exchanges(mtg, model, text),
-            input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy,
-            stats=stats, on_progress=report_progress)
-    except BudgetExceeded:
-        raise
-    except Exception as exc:
-        await emit(mtg.run_id, "node_log", mtg.node_id, {
-            "level": "warn", "message": f"会议上下文压缩失败，按原内容继续：{exc}"[:300]})
-        return segments
-    if compacted is messages:
-        return segments
-    await record_compaction(
-        run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id, scope="meeting",
-        summary=compacted[1].content, before_tokens=before + fixed, after_tokens=after + fixed,
-        calls=stats.calls, summarized_tokens=stats.summarized_tokens)
-    return ([s for s in segments if s.kind == "frozen"]
-            + [Segment("append", m.content, role=m.role,
-                       name="交锋摘要" if index == 0 else "较早发言")
-               for index, m in enumerate(compacted[1:])]
-            + previous)
+        try:
+            compacted, before, after = await compact_messages(
+                base, summarize=lambda text: _summarize_exchanges(mtg, model, text),
+                input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy,
+                stats=stats, on_progress=report_progress)
+        except BudgetExceeded:
+            raise
+        except Exception as exc:
+            await emit(mtg.run_id, "node_log", mtg.node_id, {
+                "level": "warn", "message": f"会议上下文压缩失败，按原内容继续：{exc}"[:300]})
+            return segments
+        if compacted is base:
+            # 没有可压的内容（例如保留条数已经覆盖全部追加段）
+            if covered:
+                return _assembled(segments, stored["summary"], append[covered:], previous)
+            return segments
+        new_covered = (covered or 0) + stats.cut - (1 if covered else 0)
+        summary = (summary_of(compacted) or "")[len(SUMMARY_PREFIX):]
+        kept_source = append[new_covered:]
+        kept = []
+        for offset, message in enumerate(compacted[2:]):
+            name = kept_source[offset].name if offset < len(kept_source) else "较早发言"
+            kept.append(Segment("append", message.content, role=message.role, name=name))
+        mtg.set_state(compaction={
+            "round": mtg.meeting_round(), "covered_len": new_covered,
+            "prefix_hash": _prefix_hash(append[:new_covered]), "summary": summary})
+        await record_compaction(
+            run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id,
+            scope="meeting", summary=summary, before_tokens=before + fixed,
+            after_tokens=after + fixed, calls=stats.calls,
+            summarized_tokens=stats.summarized_tokens)
+        return ([s for s in segments if s.kind == "frozen"]
+                + [Segment("append", SUMMARY_PREFIX + summary, name="交锋摘要")]
+                + kept + previous)
 
 
 async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind: str,

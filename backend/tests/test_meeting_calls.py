@@ -192,6 +192,69 @@ def test_charter_uses_the_meeting_budget_instead_of_fixed_caps(monkeypatch) -> N
     assert segments[1].text.count("材") == 10_000          # 大窗口下背景材料全文保留
 
 
+def _medium_model():
+    return SimpleNamespace(id=1, model_name="mock-medium", display_name="Mock Medium",
+                           context_window=8192, max_output_tokens=1024, cap_tools=True)
+
+
+def test_parallel_speakers_summarize_the_shared_history_once(monkeypatch) -> None:
+    """同一批并行发言看到的是同一段历史：摘要只做一次，后来者直接用已存下的摘要。"""
+    seen: list[dict] = []
+    install(monkeypatch, {"position": "立场", "summarize": "较早交锋的摘要"}, seen)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: _medium_model())
+    mtg, (_, speaker) = _meeting()
+    other_id = store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试",
+                                     mode="participant", system_prompt="你是测试")
+    other = next(p for p in store.list_participants(mtg.meeting_id) if p["id"] == other_id)
+    old = [Segment("append", "字" * 150, name=f"发言{index}") for index in range(40)]
+    call = {"kind": "position", "turn_kind": "position",
+            "segments": [Segment("frozen", "章程", name="章程"), *old],
+            "instruction": "请写立场"}
+
+    asyncio.run(speak_many(mtg, [{**call, "participant": speaker},
+                                 {**call, "participant": other}]))
+
+    assert [item["kind"] for item in seen].count("summarize") == 1
+    stored = store.get_state(mtg.meeting_id)["compaction"]
+    assert stored["covered_len"] > 0 and stored["summary"]
+
+
+def test_the_summary_is_reused_on_the_next_turn(monkeypatch) -> None:
+    seen: list[dict] = []
+    install(monkeypatch, {"position": "立场", "summarize": "较早交锋的摘要"}, seen)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: _medium_model())
+    mtg, (_, speaker) = _meeting()
+    charter = Segment("frozen", "章程", name="章程")
+    old = [Segment("append", "字" * 150, name=f"发言{index}") for index in range(40)]
+
+    _speak(mtg, speaker, segments=[charter, *old], instruction="请写立场")
+    first = [item["kind"] for item in seen].count("summarize")
+    assert first == 1
+    assert store.get_state(mtg.meeting_id)["compaction"]["round"] == 1
+
+    # 又多了两条发言，但替换成摘要后仍在阈值以下：不再调摘要
+    newer = old + [Segment("append", "字" * 150, name=f"发言{index}") for index in range(40, 42)]
+    _speak(mtg, speaker, segments=[charter, *newer], instruction="请写立场")
+    assert [item["kind"] for item in seen].count("summarize") == first
+
+
+def test_a_changed_prefix_invalidates_the_stored_summary(monkeypatch) -> None:
+    """迟到的更早发言会改变已覆盖的前缀：不能拿旧摘要冒充已覆盖，必须重新摘要。"""
+    seen: list[dict] = []
+    install(monkeypatch, {"position": "立场", "summarize": "较早交锋的摘要"}, seen)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: _medium_model())
+    mtg, (_, speaker) = _meeting()
+    charter = Segment("frozen", "章程", name="章程")
+    old = [Segment("append", "字" * 150, name=f"发言{index}") for index in range(40)]
+
+    _speak(mtg, speaker, segments=[charter, *old], instruction="请写立场")
+    first = [item["kind"] for item in seen].count("summarize")
+
+    inserted = [Segment("append", "迟到的发言", name="发言-1"), *old]
+    _speak(mtg, speaker, segments=[charter, *inserted], instruction="请写立场")
+    assert [item["kind"] for item in seen].count("summarize") > first
+
+
 def test_speak_compacts_old_turns_at_threshold(monkeypatch) -> None:
     """追加区占到阈值：较早的发言先压成摘要再发言。纪要不变，压缩留痕。"""
     seen: list[dict] = []
