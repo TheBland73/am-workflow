@@ -20,9 +20,12 @@ from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.main import app
+from app.meeting import store
 from app.models.crypto import encrypt_key
 from app.models.pool import ModelInfo
-from tests.meeting_fakes import install
+from app.engine.runners import NodeContext
+from app.meeting.runner import run_meeting
+from tests.meeting_fakes import drive, install
 
 IDEA = "给小团队做一个反馈收集工具"
 PROPOSAL = ("# 建设方案\n\nPROPOSAL-MARKER 目标：两周内可用。\n\n"
@@ -559,3 +562,127 @@ def test_design_gate_uses_the_generic_artifact_rubric(monkeypatch) -> None:
     assert [call["kind"] for call in seen] == ["gate_points", "gate_verdict"]
     assert all("判断这份工件是否完整" in call["text"] for call in seen)
     assert "DESIGN-MARKER" in seen[1]["text"]
+
+
+# ---------------- 真实会议之后（T6 第 4、5 项） ----------------
+# 讨论会议的最小脚本：只点名一名参会者（跳过表态与交锋），名单不再问人。
+BRIEF = '{"brief": "目标：让小团队收集并整理反馈。", "questions": ["需要导出哪些格式？"]}'
+POSITION = '{"must": ["每一步可验证"], "risks": ["范围蔓延"], "route": "先做最小闭环", "questions": []}'
+AGENDA = ('{"points": ['
+          '{"title": "首版做网页版还是桌面版", "question": "首版交付哪个平台", '
+          '"options": ["网页版", "桌面版"], "raised_by": "架构师"}, '
+          '{"title": "首版是否需要登录", "question": "多人共用时怎么区分反馈", '
+          '"options": ["需要", "不需要"], "raised_by": "架构师"}]}')
+DISCUSSION_PROPOSAL = (
+    "# 建设方案\n\n## 目标与成功标准\n\n两周内让小团队用上反馈收集。\n\n"
+    "## 范围\n\n必做：收集、整理、导出周报。\n\n## 总体方案\n\nD1：首版做网页版。"
+    "D2：首版需要登录。\n\n## 关键流程\n\n提交反馈 → 整理 → 导出。\n\n"
+    "## 里程碑与验收\n\n第一周：收集与导出可用。\n\n## 风险与缓解\n\n范围蔓延：首版功能冻结。\n")
+CHECK_OK = '{"ok": true, "issues": []}'
+
+
+def _discussion_replies() -> dict:
+    return {"brief": BRIEF, "position": POSITION, "agenda": AGENDA,
+            "proposal": DISCUSSION_PROPOSAL, "proposal_check": CHECK_OK}
+
+
+def _review_replies() -> dict:
+    """评审会议的完整脚本：独立评审没有意见，直接接受。"""
+    return {
+        "review_brief": '{"checklist": ["范围是否完整", "验收是否可核对"]}',
+        "review_points": '{"focus": ["决策点与方案是否一致"]}',
+        "review": '{"strengths": ["方案覆盖了主要决策点"], "issues": []}',
+        "review_delta": '{"strengths": [], "issues": [], "resolved": []}',
+        "review_merge": '{"issues": []}',
+        "author_response": '{"responses": []}',
+        "review_defend": "这条意见成立：不改会阻塞评审。",
+        "review_rule": '{"rulings": []}',
+        "author_revise": "## 修改说明\n\n按意见修订。\n",
+        "revision_verify": '{"verified": []}',
+        "review_intake": '{"issues": []}',
+        "answer": '{"answers": []}',
+    }
+
+
+def _approve_any(checkpoint: dict) -> tuple:
+    return "approve", {}, ""
+
+
+def _meeting_ctx(run_id: str, node_id: int) -> NodeContext:
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        return NodeContext(run_id=run_id, node_id=node_id, node_key=node.node_key,
+                           type=node.type, name=node.name, phase=node.phase,
+                           config=dict(node.config_json or {}),
+                           assignee=dict(node.assignee_json or {}), attempt_id=0, attempt_no=1,
+                           feedback=(node.config_json or {}).get("feedback"), idea=IDEA)
+
+
+def _idea_artifact(run_id: str) -> None:
+    write_artifact(run_id, "idea", "# 想法\n\n" + IDEA, created_by="user", inputs=[],
+                   status="approved")
+
+
+def _single_participant_config() -> dict:
+    return {"rosters": {"participants": {"role_keys": ["architect"]}}}
+
+
+def test_after_real_meetings_the_model_judges_the_review_gate(monkeypatch) -> None:
+    """替身驱动真跑讨论与评审会议（工件都是会议自己写的），评审裁决点交给模型判定。"""
+    seen: list[dict] = []
+    install(monkeypatch, {**_discussion_replies(), **_review_replies(),
+                          "gate_points": POINTS, "gate_verdict": APPROVE}, seen)
+    _no_kick(monkeypatch)
+    _seed_model()
+    run_id = _make_run(_single_participant_config())
+    _idea_artifact(run_id)
+    drive(run_id, _node_id(run_id, "discuss"), _approve_any, idea=IDEA)   # 纪要、账本与建设方案
+
+    result = drive(run_id, _node_id(run_id, "review"), _approve_any, idea=IDEA)   # 评审报告
+
+    assert result["done"] is True and result["verdict"] == "accept"
+    report = parse_front_matter(read_artifact(run_id, "review"))[1]
+    assert "结论：接受。" in report
+
+    gate = request_gate(run_id, _node_id(run_id, "gate_review"))
+    with TestClient(app) as client:
+        response = client.post(f"/api/gates/{gate['id']}/delegate")
+        assert response.status_code == 202, response.text
+        assert _wait(lambda: (_gate(gate["id"]) or {}).get("status") != "open"), \
+            "模型判定没有在预期时间内落下决定"
+
+    row = _gate(gate["id"])
+    assert row["status"] == "approved" and row["decided_by"].startswith("model:")
+    assert _status(run_id, "gate_review") == "done"
+    # 判定提示里是真实会议产出的方案与评审报告，不是测试手写的占位工件
+    verdict_prompt = next(call["text"] for call in seen if call["kind"] == "gate_verdict")
+    assert "首版做网页版" in verdict_prompt
+    assert "结论：接受。" in verdict_prompt
+
+
+def test_delegating_a_meeting_checkpoint_lets_the_meeting_continue_and_finish(monkeypatch) -> None:
+    """会议内确认点交给程序兜底后，会议要从决定处续开并开完，不是停在原地。"""
+    seen: list[dict] = []
+    install(monkeypatch, _discussion_replies(), seen)
+    _no_kick(monkeypatch)
+    run_id = _make_run(_single_participant_config())
+    node_id = _node_id(run_id, "discuss")
+    _idea_artifact(run_id)
+
+    first = asyncio.run(run_meeting(_meeting_ctx(run_id, node_id)))
+    assert first["suspended"] is True and first["checkpoint"]["kind"] == "clarify"
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/gates/{first['checkpoint']['id']}/delegate")
+        assert response.status_code == 202, response.text
+    row = _gate(first["checkpoint"]["id"])
+    assert row["status"] == "approved" and row["decided_by"] == "user-delegated"
+
+    result = drive(run_id, node_id, _approve_any, idea=IDEA)
+
+    assert result["done"] is True
+    meeting = store.latest_meeting_for_node(node_id)
+    assert meeting["status"] == "completed"
+    # 没答的澄清问题按假设记进会议：会议确实从那个决定处续开了
+    turns = [turn["content"] for turn in store.list_turns(meeting["id"])]
+    assert any("按假设处理" in content for content in turns)

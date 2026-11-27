@@ -6,6 +6,7 @@ from collections import Counter
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.runs import run_metrics
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
 from app.db.models import Gate, Node, Run, Workflow
@@ -711,3 +712,22 @@ def test_structured_output_validators_reject_bad_shapes() -> None:
     assert any("缺少这些未了结决策点的表态" in issue for issue in issues)
     assert any("level" in issue for issue in issues)
     assert any("options" in issue for issue in issues)
+
+
+def test_metrics_after_a_real_discussion_meeting(monkeypatch) -> None:
+    """真实跑完一场讨论会议之后，指标的会议一段反映这场会议。
+
+    放在本文件是因为驱动真实会议需要这里的替身脚本（测试模块之间不能互相导入）。
+    """
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    metrics = run_metrics(run_id)
+
+    assert metrics["meetings"]["total"] == 1
+    assert metrics["meetings"]["turns"] > 0
+    assert metrics["meetings"]["checkpoints"]["human"] == 2    # 澄清与名单都是人答的
+    assert metrics["review"]["total"] == 0                     # 讨论会议不产出评审报告
