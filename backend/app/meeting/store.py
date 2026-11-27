@@ -183,6 +183,14 @@ def add_turn(meeting_id: int, *, round: int, phase: str, speaker_id: int | None,
         return row.id
 
 
+def turn_seq(meeting_id: int, turn_id: int) -> int | None:
+    """一条发言在会议内的序号：发言增量接口（since_seq）用的就是这套编号。"""
+    with session_scope() as s:
+        return (s.query(MeetingTurn.seq)
+                .filter(MeetingTurn.meeting_id == meeting_id, MeetingTurn.id == turn_id)
+                .scalar())
+
+
 def finish_turn(turn_id: int, *, content: str, structured: dict | None = None,
                 tokens_in: int = 0, tokens_out: int = 0, cached_tokens: int = 0,
                 model_id: int | None = None) -> None:
@@ -278,6 +286,21 @@ def update_decision_point(point_id: int, **fields) -> None:
         row = _require(s, DecisionPoint, point_id, "决策点")
         for key, value in fields.items():
             setattr(row, key, value)
+
+
+def bump_ledger_version(meeting_id: int) -> None:
+    """账本有了实质变化：版本号加一。调用方随后用 ledger_snapshot 发账本事件。"""
+    state = get_state(meeting_id)
+    state["ledger_version"] = int(state.get("ledger_version") or 0) + 1
+    set_state(meeting_id, state)
+
+
+def ledger_snapshot(meeting_id: int) -> dict:
+    """账本事件（meeting_ledger_updated）的载荷：账本版本号与各决策点的编号、状态。"""
+    return {"meeting_id": meeting_id,
+            "version": int(get_state(meeting_id).get("ledger_version") or 0),
+            "decision_points": [{"index": point["index"], "status": point["status"]}
+                                for point in list_decision_points(meeting_id)]}
 
 
 # ---------------- 插话 ----------------

@@ -68,9 +68,14 @@ def test_speak_writes_turn_and_emits_events(monkeypatch) -> None:
     turns = store.list_turns(mtg.meeting_id)
     assert [(t["kind"], t["speaker_name"], t["cached_tokens"]) for t in turns] == [
         ("position", "架构", 60)]
+    assert turns[0]["seq"] == 1
     types = [e["type"] for e in load_events(mtg.run_id)]
     assert types[:2] == ["meeting_turn_started", "meeting_turn_finished"]
     assert "node_log" in types
+    # 开始发言的事件带会议内的序号：与发言增量接口（since_seq）同一套编号
+    started = load_events(mtg.run_id)[0]["payload"]
+    assert started["seq"] == turns[0]["seq"] == 1
+    assert started["turn_id"] == turns[0]["id"]
 
 
 def test_speak_validates_structured_output(monkeypatch) -> None:

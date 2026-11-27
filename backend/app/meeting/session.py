@@ -93,7 +93,8 @@ class MeetingSession:
         target = next_step or steps[index + 1]
         store.update_meeting(self.meeting_id, phase=target)
         await emit(self.run_id, "meeting_phase", self.node_id,
-                   {"meeting_id": self.meeting_id, "phase": target, "round": self.round_no()})
+                   {"meeting_id": self.meeting_id, "phase": target,
+                    "round": self.meeting_round()})      # 事件契约里的轮次是会议内部轮次
 
     # ---------- 参会者、反馈、确认点 ----------
     def participants(self, mode: str | None = None) -> list[dict]:

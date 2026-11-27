@@ -440,12 +440,10 @@ def _stance_view(mtg) -> list[Segment]:
 
 
 async def _ledger_updated(mtg) -> None:
-    version = int(mtg.state().get("ledger_version") or 0) + 1
-    mtg.set_state(ledger_version=version)
-    await emit(mtg.run_id, "meeting_ledger_updated", mtg.node_id, {
-        "meeting_id": mtg.meeting_id, "version": version,
-        "decision_points": [{"index": point["index"], "status": point["status"]}
-                            for point in _points(mtg)]})
+    # 载荷的形状与接口层（改名单、改决策点）共用同一份实现
+    store.bump_ledger_version(mtg.meeting_id)
+    await emit(mtg.run_id, "meeting_ledger_updated", mtg.node_id,
+               store.ledger_snapshot(mtg.meeting_id))
 
 
 def _mark(mtg, key: str) -> None:

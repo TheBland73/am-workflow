@@ -445,6 +445,21 @@ def _patch_round(mtg, step: str) -> None:
     _mark(mtg, step)
 
 
+async def _round_started(mtg) -> None:
+    """每一轮只发一次 review_round_started：发过的轮次号记进状态，重入时不重复发。
+
+    正常轮次在"准备"里发；用户驳回后进入的轮次从"受理"起步、跳过准备，由受理那一步发。
+    """
+    flow = _flow(mtg)
+    if int(mtg.state().get("round_started") or 0) == flow:
+        return
+    mtg.set_state(round_started=flow)
+    await emit(mtg.run_id, "review_round_started", mtg.node_id, {
+        "meeting_id": mtg.meeting_id, "round": flow,
+        "incremental": flow > 1,
+        "rounds_max": int(mtg.params().get("rounds_max") or 3)})
+
+
 # ---------------- 协议 ----------------
 @register_protocol
 class ReviewProtocol(MeetingProtocol):
@@ -502,6 +517,7 @@ class ReviewProtocol(MeetingProtocol):
             if issue["origin"] == "user" and not issue.get("raised_by"):
                 issue["raised_by"] = ["用户"]
         _finish_step(mtg, "intake", issues=_add_issues_done, intake_feedback="")
+        await _round_started(mtg)
         return advance("respond")
 
     # ---------- 准备 ----------
@@ -522,10 +538,7 @@ class ReviewProtocol(MeetingProtocol):
             mtg.set_state(checklist=list(data["checklist"]))
         store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
         mtg.reset_builder()
-        await emit(mtg.run_id, "review_round_started", mtg.node_id, {
-            "meeting_id": mtg.meeting_id, "round": _flow(mtg),
-            "incremental": _flow(mtg) > 1,
-            "rounds_max": int(mtg.params().get("rounds_max") or 3)})
+        await _round_started(mtg)
         _patch_round(mtg, "prepare")
         return advance("points")
 

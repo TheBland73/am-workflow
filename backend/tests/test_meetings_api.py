@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.db.base import init_db, session_scope
 from app.db.models import Node, Run, Workflow
+from app.engine.events import load_events
 from app.engine.runners import NodeContext
 from app.engine.templates import seed_defaults
 from app.main import app
@@ -78,6 +79,7 @@ def test_missing_meeting_returns_404(monkeypatch) -> None:
 
 def test_replace_participants_at_roster_checkpoint(monkeypatch) -> None:
     mtg = _meeting()
+    store.upsert_decision_point(mtg.meeting_id, "D1", title="先做哪个平台", status="agreed")
     payload = {"participants": [
         {"display_name": "架构", "persona": "你关注技术可行性。", "mode": "participant"},
         {"display_name": "合规顾问", "persona": "你关注数据合规。", "mode": "participant"},
@@ -92,6 +94,12 @@ def test_replace_participants_at_roster_checkpoint(monkeypatch) -> None:
         ("主持人", "facilitator"), ("架构", "participant"), ("合规顾问", "participant")]
     assert rows[2]["source"] == "user" and rows[2]["role_key"] is None
     assert rows[2]["system_prompt"] == "你关注数据合规。"
+    # 账本事件带当时的账本，不是一个空占位；改名单不动账本，版本号不变
+    updates = [e["payload"] for e in load_events(mtg.run_id)
+               if e["type"] == "meeting_ledger_updated"]
+    assert updates[-1]["roster"] is True
+    assert updates[-1]["decision_points"] == [{"index": "D1", "status": "agreed"}]
+    assert updates[-1]["version"] == 0
 
 
 def test_invalid_participant_mode_changes_nothing(monkeypatch) -> None:
@@ -150,6 +158,23 @@ def test_patch_decision_point_while_suspended(monkeypatch) -> None:
             json={"status": "deferred", "conclusion": "留待用户决定"})
     assert response.status_code == 200, response.text
     assert store.list_decision_points(mtg.meeting_id)[0]["status"] == "deferred"
+    # 用户改了账本要发账本事件：事件流里看得到，前端据此刷新会议详情
+    updates = [e["payload"] for e in load_events(mtg.run_id)
+               if e["type"] == "meeting_ledger_updated"]
+    assert updates[-1]["version"] == 1
+    assert updates[-1]["decision_points"] == [{"index": "D1", "status": "deferred"}]
+
+
+def test_a_decision_point_patch_that_changes_nothing_emits_no_event(monkeypatch) -> None:
+    mtg = _meeting()
+    point_id = store.upsert_decision_point(mtg.meeting_id, "D1", title="先做哪个平台",
+                                           status="open", conclusion="选网页版")
+    with _client(monkeypatch) as client:
+        response = client.patch(
+            f"/api/runs/{mtg.run_id}/meetings/{mtg.meeting_id}/decision-points/{point_id}",
+            json={"status": "open", "conclusion": "选网页版"})
+    assert response.status_code == 200, response.text
+    assert not [e for e in load_events(mtg.run_id) if e["type"] == "meeting_ledger_updated"]
 
 
 def test_decision_point_patch_requires_suspension(monkeypatch) -> None:

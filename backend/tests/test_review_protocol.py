@@ -11,6 +11,7 @@ import pytest
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
 from app.db.models import Gate, Node, Run, Workflow
+from app.engine.events import load_events
 from app.engine.feedback import with_feedback
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
@@ -415,6 +416,10 @@ def test_user_rejection_becomes_an_issue_and_a_new_report(monkeypatch) -> None:
     issue = _issues(node_id)[0]
     assert issue["origin"] == "user" and issue["raised_by"] == ["用户"]
     assert parse_front_matter(read_artifact(run_id, "review"))[0]["version"] == 2
+    # 用户驳回后进入的第二轮从"受理"起步、跳过准备，同样要有轮次开始事件，且每轮只发一次
+    rounds = [e["payload"]["round"] for e in load_events(run_id)
+              if e["type"] == "review_round_started"]
+    assert rounds == [1, 2]
 
 
 def test_author_can_ask_the_requester_proxy(monkeypatch) -> None:

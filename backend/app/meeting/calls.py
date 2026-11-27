@@ -274,6 +274,7 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
     await emit(mtg.run_id, "meeting_turn_started", mtg.node_id, {
         "meeting_id": mtg.meeting_id, "turn_id": turn_id, "speaker": speaker_name,
         "speaker_id": speaker_id, "kind": turn_kind, "decision_point_id": decision_point_id,
+        "seq": store.turn_seq(mtg.meeting_id, turn_id),        # 会议内的序号，与发言增量接口同一套
         "call": kind})
     result = await run_agent(
         run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id, model=model,

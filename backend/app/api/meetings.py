@@ -128,29 +128,37 @@ async def replace_participants(run_id: str, meeting_id: int, payload: RosterIn) 
         {"role_key": item.role_key, "display_name": item.display_name, "mode": item.mode,
          "system_prompt": prompt, "model_id": item.model_id}
         for item, prompt in zip(payload.participants, prompts)], EDITABLE_MODES)
+    # 改名单不动账本：账本版本不变，事件带上当时的账本，前端据此刷新会议详情
     await emit(run_id, "meeting_ledger_updated", meeting["node_id"],
-               {"meeting_id": meeting_id, "version": 0, "decision_points": [], "roster": True})
+               {**store.ledger_snapshot(meeting_id), "roster": True})
     return {"meeting_id": meeting_id, "participants": store.list_participants(meeting_id)}
 
 
 @router.patch("/runs/{run_id}/meetings/{meeting_id}/decision-points/{point_id}")
-def patch_decision_point(run_id: str, meeting_id: int, point_id: int,
-                         payload: PointPatch) -> dict:
+async def patch_decision_point(run_id: str, meeting_id: int, point_id: int,
+                               payload: PointPatch) -> dict:
     meeting = _meeting_or_404(run_id, meeting_id)
     if meeting["status"] != "suspended":
         raise HTTPException(400, "决策点只能在会议挂起时修改")
     points = store.list_decision_points(meeting_id)
-    if not any(p["id"] == point_id for p in points):
+    current = next((p for p in points if p["id"] == point_id), None)
+    if current is None:
         raise HTTPException(404, "决策点不存在")
+    # 只改真的变了的字段：原样提交不算一次账本变化，不发事件
     changes: dict = {}
     if payload.status is not None:
         if payload.status not in EDITABLE_POINT_STATUSES:
             raise HTTPException(400, f"状态只能是 {EDITABLE_POINT_STATUSES}")
-        changes["status"] = payload.status
-    if payload.conclusion is not None:
+        if payload.status != current["status"]:
+            changes["status"] = payload.status
+    if payload.conclusion is not None and payload.conclusion != (current.get("conclusion") or ""):
         changes["conclusion"] = payload.conclusion
     if changes:
         store.update_decision_point(point_id, **changes)
+        # 用户改了账本：账本版本加一并发事件，事件流与前端据此刷新
+        store.bump_ledger_version(meeting_id)
+        await emit(run_id, "meeting_ledger_updated", meeting["node_id"],
+                   store.ledger_snapshot(meeting_id))
     return next(p for p in store.list_decision_points(meeting_id) if p["id"] == point_id)
 
 

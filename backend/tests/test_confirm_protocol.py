@@ -11,6 +11,7 @@ import pytest
 from app.artifacts.store import parse_front_matter, read_artifact, write_artifact
 from app.db.base import init_db, session_scope
 from app.db.models import Node, Run, Workflow
+from app.engine.events import load_events
 from app.engine.feedback import with_feedback
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
@@ -375,3 +376,7 @@ def test_user_rejection_becomes_a_checklist_item_and_reroutes(monkeypatch) -> No
     assert items[0]["origin"] == "user" and items[0]["kind"] == "quality"
     assert items[0]["requirement"] == "R1"
     assert "R1" in result["reroute"]["feedback"]
+    # 每一轮各发一次轮次开始事件（用户驳回后进入的第二轮也要有）
+    rounds = [e["payload"]["round"] for e in load_events(run_id)
+              if e["type"] == "review_round_started"]
+    assert rounds == [1, 2]
