@@ -349,6 +349,42 @@ def test_blocking_decision_issue_reroutes_and_then_incremental_review(monkeypatc
     assert all("改动的决策点" in text for text in delta_prompts)
 
 
+def test_reroute_is_reissued_after_an_interruption_before_the_orchestrator_accepts(
+        monkeypatch) -> None:
+    """协议写完状态、返回回流指令之前被中断：重入要重新发起回流，而不是加一轮去等返工。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        review=json.dumps({"strengths": [], "issues": [DECISION]}),
+        review_merge=_merge(DECISION), author_response=_respond), seen)
+    run_id, node_id = _review_run()
+
+    original = review_module.ReviewProtocol.step_verdict
+    armed = {"on": True}
+
+    async def flaky(self, mtg):
+        result = await original(self, mtg)
+        if armed["on"] and result.action == "reroute":
+            armed["on"] = False
+            raise asyncio.CancelledError()
+        return result
+
+    monkeypatch.setattr(review_module.ReviewProtocol, "step_verdict", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _never, idea=IDEA)
+
+    meeting_id = _meeting(node_id)["id"]
+    round_before = store.get_meeting(meeting_id)["round"]
+
+    second = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert second["reroute"]["targets"] == ["discuss"]
+    assert _meeting(node_id)["id"] == meeting_id          # 同一场会议续开，没有归档重开
+    assert store.get_meeting(meeting_id)["round"] == round_before  # 中断没有多加轮次
+    kinds = Counter(call["kind"] for call in seen)
+    # 裁决是程序判定的：重入只重发指令，不重跑评审、汇总与回应
+    assert kinds["review"] == 2 and kinds["review_merge"] == 1 and kinds["author_response"] == 1
+
+
 def test_chair_keeps_a_rejected_issue(monkeypatch) -> None:
     install(monkeypatch, _replies(
         review=json.dumps({"strengths": [], "issues": [WORDING]}),

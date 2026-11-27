@@ -857,9 +857,10 @@ class ReviewProtocol(MeetingProtocol):
             return advance("revise")
         if result.action == "suspend":                # 回流轮次用尽：等人决定，决定前不推进
             return result
-        mtg.set_state(awaiting_rework=True, rework_pending=True,
-                      ledger_snapshot=_ledger_snapshot(mtg))
-        _patch_round(mtg, "verdict")
+        # 回流标记（rework_pending/awaiting_rework）由编排器在接受回流之后写进会议状态：
+        # 这里提前写的话，进程在编排器接受之前中断，重入会加一轮去等一场没有发起的返工。
+        # 裁决这步也不记完成标记：重入时从本步重跑，程序重新裁决并再次发出回流指令。
+        mtg.set_state(ledger_snapshot=_ledger_snapshot(mtg))
         return result
 
     async def step_revise(self, mtg):

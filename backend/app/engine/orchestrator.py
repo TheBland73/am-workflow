@@ -18,6 +18,7 @@ from app.engine.gates import GateError, decide_gate as _decide_gate, gate_payloa
 from app.engine.runners import NodeContext, NodeFailure, classify_failure, execute_node, lesson_for
 from app.engine.templates import phase_names
 from app.engine import judge
+from app.meeting import store
 
 TERMINAL = {"finished", "failed", "stopped"}
 
@@ -432,6 +433,12 @@ class Orchestrator:
                                          "feedback_seq": updated["feedback_seq"]},
                                   drop=["retry_at", "retry_count"])
                 reset.append(other["node_key"])
+        # "已回流"的标记在目标节点确实重开之后才写：协议不再提前写，
+        # 这样进程在编排器接受回流之前中断时，重入的协议会重新发起回流而不是空等返工。
+        meeting = store.latest_meeting_for_node(node["id"])
+        if meeting is not None:
+            store.update_meeting(meeting["id"], state_json={
+                **meeting["state"], "awaiting_rework": True, "rework_pending": True})
         await emit(run_id, "node_rerouted", node["id"], {
             "from": node["node_key"], "targets": reset, "round": round_no + 1,
             "max_rounds": bump.get("max_rounds", max_rounds), "escalated": False})
