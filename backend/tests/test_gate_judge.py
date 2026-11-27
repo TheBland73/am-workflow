@@ -71,10 +71,32 @@ def _seed_model(name: str = "mock-fast", *, bind_judge: bool = True,
                            context_window=context_window, max_output_tokens=max_output_tokens)
         s.add(model)
         s.flush()
+        _seeded_providers.append(provider.id)
         if bind_judge:
             row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "judge").one()
             row.default_model_id = model.id
         return model.id
+
+
+# 测试共用一个临时库：这里建的供应商/模型行与 judge 的绑定改动用完必须还原，
+# 否则后面的用例会按残留的模型行（或被绑死的 judge）得出依赖执行顺序的结果。
+_seeded_providers: list[int] = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_seeded_models():
+    init_db()
+    with session_scope() as s:
+        judge_row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "judge").one()
+        original_binding = judge_row.default_model_id
+    yield
+    with session_scope() as s:
+        judge_row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "judge").one()
+        judge_row.default_model_id = original_binding
+        for provider in s.query(ProviderConfig).filter(
+                ProviderConfig.id.in_(_seeded_providers)).all():
+            s.delete(provider)                # 级联删掉它下面的模型行
+    _seeded_providers.clear()
 
 
 def _bind_judge(model_id: int) -> None:
