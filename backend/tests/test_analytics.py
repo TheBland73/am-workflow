@@ -428,6 +428,45 @@ def test_days_window_is_accepted_and_used() -> None:
     assert distribution["total"] == overview["runs"]["total"]
 
 
+def test_window_includes_end_day_for_non_midnight_end() -> None:
+    with TestClient(app) as client:
+        body = client.get(f"{_URL}/overview", params={
+            "start": "2032-10-01T00:00:00", "end": "2032-10-02T01:00:00",
+        }).json()
+    assert body["window"]["days"] == 2
+    assert body["window"]["end_date"] == "2032-10-02"
+
+
+def test_recent_runs_cost_available_is_per_run() -> None:
+    base, start, end = month(2032, 11, days=3)
+    priced = seed_model(price_in=1.0, name="priced-model")
+    unpriced = seed_model(name="unpriced-model")
+    priced_run = seed_run(created=base, idea="priced")
+    unpriced_run = seed_run(created=base + timedelta(hours=1), idea="unpriced")
+    seed_attempt(priced_run, model_id=priced, tokens_in=10, tokens_out=2)
+    seed_attempt(unpriced_run, model_id=unpriced, tokens_in=10, tokens_out=2)
+    with TestClient(app) as client:
+        items = client.get(f"{_URL}/recent-runs", params={
+            "start": start, "end": end,
+        }).json()["items"]
+    by_id = {item["id"]: item for item in items}
+    assert by_id[priced_run]["cost_available"] is True
+    assert by_id[unpriced_run]["cost_available"] is False
+
+
+def test_status_distribution_hides_unknown_statuses() -> None:
+    base, start, end = month(2032, 12, days=2)
+    seed_run(status="archived", created=base)
+    with TestClient(app) as client:
+        body = client.get(f"{_URL}/status-distribution", params={
+            "start": start, "end": end,
+        }).json()
+    assert all(item["status"] in {"created", "running", "waiting_human",
+                                  "finished", "failed", "stopped"}
+               for item in body["items"])
+    assert body["total"] == 0
+
+
 def test_time_window_only_counts_runs_inside_it() -> None:
     inside, start, end = month(2032, 9, days=2)
     outside = inside + timedelta(days=10)
