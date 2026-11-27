@@ -19,11 +19,13 @@ import re
 import threading
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 import scripts.mock_provider as mock_provider
 from app.db.base import init_db, session_scope
-from app.db.models import (Meeting, ModelEntry, Node, NodeAttempt, ProviderConfig, Run)
+from app.db.models import (AgentTemplate, Meeting, ModelEntry, Node, NodeAttempt,
+                           ProviderConfig, Run)
 from app.engine import agent_loop
 from app.engine.orchestrator import Orchestrator, orchestrator
 from app.engine.templates import seed_defaults
@@ -44,7 +46,7 @@ CONFIG = {
 
 
 # ---------------------------------------------------------------- 夹具
-def _seed_model() -> None:
+def _seed_model() -> int:
     init_db()
     seed_defaults()
     with session_scope() as s:
@@ -61,9 +63,35 @@ def _seed_model() -> None:
                          ModelEntry.model_name == MODEL_NAME)
                  .first())
         if model is None:
-            s.add(ModelEntry(provider_id=provider.id, model_name=MODEL_NAME,
-                             display_name="Mock E2E", context_window=32768,
-                             max_output_tokens=4096, cap_tools=True, cap_json=True))
+            model = ModelEntry(provider_id=provider.id, model_name=MODEL_NAME,
+                               display_name="Mock E2E", context_window=32768,
+                               max_output_tokens=4096, cap_tools=True, cap_json=True)
+            s.add(model)
+            s.flush()
+        return model.id
+
+
+@pytest.fixture()
+def e2e_model():
+    """端到端自己的模型行，外加把所有角色显式绑到它上，结束后恢复原绑定。
+
+    没绑模型的角色按"库里 id 最小的启用模型"选模型：排在前面的测试文件只要留下
+    一条启用的小窗口模型行，端到端就会按错误的窗口算上下文预算而失败。
+    显式绑定之后模型解析不再依赖执行顺序；恢复绑定是为了保住后面用例
+    "角色没绑模型"的前提。模型行本身不删：窗口够大（32768），留着无害。
+    """
+    model_id = _seed_model()
+    with session_scope() as s:
+        originals = {row.id: row.default_model_id
+                     for row in s.query(AgentTemplate).all()}
+        for row in s.query(AgentTemplate).all():
+            row.default_model_id = model_id
+    yield model_id
+    with session_scope() as s:
+        for row_id, original in originals.items():
+            row = s.get(AgentTemplate, row_id)
+            if row is not None:
+                row.default_model_id = original
 
 
 class ScriptedCalls:
@@ -287,8 +315,7 @@ def _wait_until(predicate, *, timeout: float, message: str) -> None:
 
 
 # ---------------------------------------------------------------- 用例
-def test_offline_front_half_with_reroute_interrupt_and_rejection(monkeypatch) -> None:
-    _seed_model()
+def test_offline_front_half_with_reroute_interrupt_and_rejection(monkeypatch, e2e_model) -> None:
     fake = ScriptedCalls(inject_review_issue=True, cancel_second_merge=True)
     _install(monkeypatch, fake)
 
@@ -455,9 +482,8 @@ def test_offline_front_half_with_reroute_interrupt_and_rejection(monkeypatch) ->
         assert design["status"] != "pending" and design["attempts"] >= 1
 
 
-def test_offline_front_half_fully_automatic(monkeypatch) -> None:
+def test_offline_front_half_fully_automatic(monkeypatch, e2e_model) -> None:
     """仅兜底等级（L3）：没有任何人工确认点，直接跑到设计节点。"""
-    _seed_model()
     fake = ScriptedCalls(inject_review_issue=False, cancel_second_merge=False)
     _install(monkeypatch, fake)
 
