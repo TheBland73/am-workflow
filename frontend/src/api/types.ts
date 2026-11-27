@@ -59,10 +59,68 @@ export interface NodeMessage {
   tool_call_id?: string | null;
 }
 
+/** 上下游节点的轻量引用（GET /nodes/{id}）。 */
+export interface NodeDownstreamRef {
+  node_key: string;
+  name: string;
+  status: string;
+}
+
+/** 节点当前挂起的人工门（GET /nodes/{id}）；无门时为 null。 */
+export interface NodeGateRef {
+  id: number;
+  node_id: number;
+  node_key: string;
+  status: string;
+}
+
 export type NodeDetail = Omit<Node, "attempts"> & {
   attempts: NodeAttemptDetail[];
   messages: NodeMessage[];
+  max_attempts: number;
+  order_index: number;
+  run_status: string;
+  upstream: NodeDownstreamRef[];
+  downstream: NodeDownstreamRef[];
+  open_gate: NodeGateRef | null;
+  can_retry: boolean;
+  can_reset: boolean;
+  can_skip: boolean;
+  can_feedback: boolean;
+  can_edit_config: boolean;
+  events: StreamEvent[];
+  artifact_kinds: string[];
 };
+
+/** POST /nodes/{id}/retry 请求体。expected_status 用于幂等保护（契约 §4）。 */
+export interface RetryNodeBody {
+  feedback?: string;
+  reset_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** POST /nodes/{id}/reset 请求体。 */
+export interface ResetNodeBody {
+  reset_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** POST /nodes/{id}/skip 请求体。 */
+export interface SkipNodeBody {
+  reason?: string;
+  cascade_downstream?: boolean;
+  expected_status?: string;
+}
+
+/** 节点动作端点的统一响应（契约 §4；feedback 响应没有 run_id）。 */
+export interface NodeActionResponse {
+  node_id: number;
+  status: string;
+  run_id?: string;
+  reset_nodes?: string[];
+  closed_gates?: number;
+  feedback?: string;
+}
 
 export interface Task {
   task_uid: string;
@@ -314,7 +372,7 @@ export interface Preset {
   }>;
 }
 
-/* ---------- 编排工作台（ORCH-01） ---------- */
+/* ---------- 缂栨帓宸ヤ綔鍙帮紙ORCH-01锛?---------- */
 
 export type PlanStatus =
   | "draft" | "generating" | "generated" | "validating"
@@ -513,9 +571,9 @@ export interface PlanListItem {
   updated_at: string | null;
 }
 
-/* ---------- 数据统计（ANALYTICS） ---------- */
+/* ---------- 鏁版嵁缁熻锛圓NALYTICS锛?---------- */
 
-/** 统计时间窗：后端按 runs.created_at、UTC 自然日切桶。 */
+/** 缁熻鏃堕棿绐楋細鍚庣鎸?runs.created_at銆乁TC 鑷劧鏃ュ垏妗躲€?*/
 export interface AnalyticsWindow {
   days: number;
   start: string;
@@ -537,7 +595,7 @@ export interface AnalyticsCostModel {
 }
 
 export interface AnalyticsCost {
-  /** false = 当前范围内没有「配了单价且成交过」的模型：只展示空状态，不展示 0 元结论。 */
+  /** false = 褰撳墠鑼冨洿鍐呮病鏈夈€岄厤浜嗗崟浠蜂笖鎴愪氦杩囥€嶇殑妯″瀷锛氬彧灞曠ず绌虹姸鎬侊紝涓嶅睍绀?0 鍏冪粨璁恒€?*/
   available: boolean;
   currency: string | null;
   priced_models: number;

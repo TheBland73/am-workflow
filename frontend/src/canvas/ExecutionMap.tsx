@@ -1,20 +1,23 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback, useLayoutEffect, useMemo, useRef, useState, type MouseEvent,
+} from "react";
 import type { Node, Snapshot } from "../api/types";
+import { collectLineage, heldKeys, isDone, nodeNumbers, phaseColumns } from "./graphLayout";
 
 interface EdgePath {
   d: string;
   held: boolean;
 }
 
-function isDone(status: string) {
-  return status === "done" || status === "skipped";
-}
-
 export default function ExecutionMap({
-  snapshot, onNodeClick,
+  snapshot, onNodeClick, selectedNodeId = null, onNodeSelect,
 }: {
   snapshot: Snapshot;
   onNodeClick: (node: Node) => void;
+  /** 当前选中节点 id（由 RunPage 的 selectedNodeId 驱动）。 */
+  selectedNodeId?: number | null;
+  /** 选中回调：点击节点传节点、点击图内空白传 null（页面据此取消选中）。 */
+  onNodeSelect?: (node: Node | null) => void;
 }) {
   const { nodes, workflow, phase_names: phaseNames, run, gates } = snapshot;
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -28,52 +31,25 @@ export default function ExecutionMap({
     return gateNode ? gatesOnly.findIndex((node) => node.id === gateNode.id) + 1 : 0;
   }, [gateNode, nodes]);
 
-  const held = useMemo(() => {
-    const result = new Set<string>();
-    if (!gateNode) return result;
-    const byKey = new Map(nodes.map((node) => [node.node_key, node]));
-    const queue = nodes.filter((node) => node.deps.includes(gateNode.node_key));
-    while (queue.length) {
-      const node = queue.shift()!;
-      if (result.has(node.node_key)) continue;
-      result.add(node.node_key);
-      for (const candidate of nodes) {
-        if (candidate.deps.includes(node.node_key) && !result.has(candidate.node_key)) {
-          queue.push(candidate);
-        }
-      }
-    }
-    // 被门直接或间接挡住、但尚未完成的节点
-    for (const key of [...result]) {
-      const node = byKey.get(key);
-      if (!node || isDone(node.status)) result.delete(key);
-    }
-    return result;
-  }, [gateNode, nodes]);
+  const held = useMemo(() => heldKeys(nodes, openGate ?? null), [nodes, openGate]);
 
   const columns = useMemo(
-    () => workflow.phases.map((phase) => ({
-      phase,
-      nodes: nodes.filter((node) => node.phase === phase),
-    })),
+    () => phaseColumns(nodes, workflow.phases),
     [nodes, workflow.phases],
   );
 
-  const numbers = useMemo(() => {
-    const map = new Map<number, string>();
-    let index = 0;
-    let gateNo = 0;
-    for (const node of nodes) {
-      if (node.type === "HUMAN_GATE") {
-        gateNo += 1;
-        map.set(node.id, `G${gateNo}`);
-      } else {
-        index += 1;
-        map.set(node.id, String(index).padStart(2, "0"));
-      }
-    }
-    return map;
-  }, [nodes]);
+  const numbers = useMemo(() => nodeNumbers(nodes), [nodes]);
+
+  const selectedNode = useMemo(
+    () => nodes.find((node) => node.id === selectedNodeId) ?? null,
+    [nodes, selectedNodeId],
+  );
+
+  // 选中节点的祖先 + 自身 + 后代；其余节点变暗（lineage 为 null 表示无选中）。
+  const lineage = useMemo(
+    () => (selectedNode ? collectLineage(selectedNode.node_key, nodes) : null),
+    [nodes, selectedNode],
+  );
 
   const nodeByKey = useMemo(
     () => new Map(nodes.map((node) => [node.node_key, node])),
@@ -142,7 +118,15 @@ export default function ExecutionMap({
     if (held.has(node.node_key)) classes.push("is-held");
     if (node.type === "HUMAN_GATE") classes.push("is-gate");
     if (node.status === "waiting_human" && run.status === "waiting_human") classes.push("is-here");
+    if (node.id === selectedNodeId) classes.push("is-selected");
+    if (lineage && !lineage.has(node.node_key)) classes.push("is-dim");
     return classes.join(" ");
+  };
+
+  const handleBodyClick = (event: MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest(".map-node")) return;
+    onNodeSelect?.(null);
   };
 
   return (
@@ -170,7 +154,7 @@ export default function ExecutionMap({
         })}
       </div>
 
-      <div className="map-body" ref={wrapRef} style={{ height: mapHeight }}>
+      <div className="map-body" ref={wrapRef} style={{ height: mapHeight }} onClick={handleBodyClick}>
         {firstHeldPhase >= 0 && (
           <>
             <div className="map-heldzone" style={{ left: `${(firstHeldPhase / 8) * 100}%` }} />
@@ -207,7 +191,12 @@ export default function ExecutionMap({
                   }}
                   className={statusClass(node)}
                   title={`${node.node_key} · ${node.status} · ${node.name}`}
-                  onClick={() => onNodeClick(node)}
+                  aria-pressed={node.id === selectedNodeId}
+                  data-testid="map-node"
+                  onClick={() => {
+                    onNodeClick(node);
+                    onNodeSelect?.(node);
+                  }}
                 >
                   <span className="no">{numbers.get(node.id)}</span>
                   <span className="nm">{node.name}</span>

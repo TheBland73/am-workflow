@@ -2237,3 +2237,432 @@ body {
   cursor: pointer;
 }
 .ef-crash-actions button:first-child { background: #f0c400; }
+
+/* ---------- 运行图节点交互（节点交互增量） ---------- */
+/* 选中：信号黄底 + 墨色发丝框 + 3px 偏移硬阴影；暗化 .38。只作用于 .map-node。 */
+.map-node.is-selected {
+  background: var(--ef-signal);
+  border: 1px solid var(--ef-ink);
+  box-shadow: 3px 3px 0 var(--ef-ink);
+  color: var(--ef-on-signal);
+  font-weight: 700;
+}
+
+.map-node.is-selected .no {
+  color: var(--ef-on-signal);
+}
+
+.map-node.is-selected.is-gate {
+  border-left-width: 3px;
+}
+
+.map-node.is-dim {
+  opacity: 0.38;
+}
+
+.map-node:focus-visible {
+  outline: 2px solid var(--ef-ink);
+  outline-offset: 2px;
+}
+
+/* ---------- 节点检查器（NodeInspector） ---------- */
+.node-inspector {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 100%;
+  color: var(--ef-ink);
+  font-size: 0.76rem;
+}
+
+.node-inspector-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--ef-ink);
+  font-family: var(--ef-font-ui);
+}
+
+.node-inspector-meta .ef-eyebrow {
+  color: var(--ef-ink-2);
+  font-size: 0.58rem;
+  letter-spacing: 0.14em;
+}
+
+.node-inspector-meta b {
+  font-size: 0.94rem;
+}
+
+.node-inspector-meta .mono {
+  font-family: var(--ef-font-mono);
+  font-size: 0.66rem;
+  color: var(--ef-ink-2);
+}
+
+.node-inspector-loading {
+  display: grid;
+  place-items: center;
+  min-height: 240px;
+}
+
+.node-inspector-section {
+  padding-top: 2px;
+}
+
+.node-inspector-section + .node-inspector-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--ef-rule);
+}
+
+.node-inspector-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+
+.node-inspector-section-head h4 {
+  margin: 0;
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.6rem;
+  font-stretch: 125%;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.node-inspector-count {
+  min-width: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--ef-rule);
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.6rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.node-inspector-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 18px;
+  margin: 0;
+}
+
+.node-inspector-facts > div {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  line-height: 1.6;
+}
+
+.node-inspector-facts dt {
+  flex: none;
+  color: var(--ef-ink-2);
+  font-size: 0.66rem;
+}
+
+.node-inspector-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.node-inspector-facts dd.mono {
+  font-family: var(--ef-font-mono);
+  font-weight: 500;
+}
+
+.node-inspector-empty {
+  color: var(--ef-ink-2);
+  font-size: 0.7rem;
+  font-style: normal;
+}
+
+.node-inspector-hint {
+  margin: 6px 0 0;
+  color: var(--ef-ink-2);
+  font-size: 0.66rem;
+}
+
+.node-inspector-chain {
+  display: grid;
+  gap: 8px;
+}
+
+.node-inspector-chain-group {
+  display: grid;
+  gap: 4px;
+}
+
+.node-inspector-chain-label {
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.56rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.node-inspector-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.node-inspector-ref,
+.node-inspector-artifact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--ef-ink);
+  background: var(--ef-panel);
+  color: var(--ef-ink);
+  font: inherit;
+  font-size: 0.7rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.node-inspector-ref:hover,
+.node-inspector-artifact:hover {
+  background: var(--ef-signal);
+  color: var(--ef-on-signal);
+}
+
+.node-inspector-ref .nm {
+  max-width: 200px;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-inspector-ref .key {
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-mono);
+  font-size: 0.6rem;
+}
+
+.node-inspector-ref .st {
+  color: var(--ef-ink-2);
+  font-size: 0.6rem;
+}
+
+.node-inspector-ref:hover .key,
+.node-inspector-ref:hover .st,
+.node-inspector-artifact:hover span {
+  color: inherit;
+}
+
+.node-inspector-artifact b {
+  font-weight: 700;
+}
+
+.node-inspector-artifact span {
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.62rem;
+}
+
+.node-inspector-config {
+  display: grid;
+  gap: 10px;
+}
+
+.node-inspector-config-group {
+  display: grid;
+  gap: 2px;
+}
+
+.node-inspector-config-label {
+  margin-bottom: 3px;
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.56rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.node-inspector-config-group.is-readonly {
+  opacity: 0.62;
+}
+
+.node-inspector-config-row {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 12px;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--ef-rule);
+}
+
+.node-inspector-config-row .k {
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-mono);
+  font-size: 0.64rem;
+}
+
+.node-inspector-config-row .v {
+  max-height: 140px;
+  overflow: auto;
+  font-family: var(--ef-font-mono);
+  font-size: 0.66rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.node-inspector-errors {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.node-inspector-duration {
+  font-family: var(--ef-font-mono);
+  font-size: 0.62rem;
+  line-height: 1.45;
+  color: var(--ef-ink-2);
+}
+
+.node-inspector-error {
+  max-height: 160px;
+  margin: 0;
+  padding: 6px 9px;
+  overflow: auto;
+  background: color-mix(in srgb, #b00020 6%, transparent);
+  border-left: 3px solid #b00020;
+  font-family: var(--ef-font-mono);
+  font-size: 0.66rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.node-inspector-error b {
+  margin-right: 6px;
+}
+
+.node-inspector-messages {
+  display: grid;
+  gap: 8px;
+}
+
+.node-inspector-msg {
+  padding: 3px 0 3px 9px;
+  border-left: 3px solid var(--ef-ink);
+}
+
+.node-inspector-msg.is-assistant {
+  border-left-color: #e6d600;
+}
+
+.node-inspector-msg.is-tool {
+  border-left-style: dashed;
+}
+
+.node-inspector-msg b {
+  display: block;
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-ui);
+  font-size: 0.56rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.node-inspector-msg pre {
+  max-height: 180px;
+  margin: 4px 0 0;
+  overflow: auto;
+  font-family: var(--ef-font-mono);
+  font-size: 0.68rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.node-inspector-events {
+  display: grid;
+  gap: 2px;
+  max-height: 220px;
+  padding-top: 5px;
+  overflow: auto;
+  border-top: 1px solid var(--ef-rule);
+}
+
+.node-inspector-event {
+  display: grid;
+  grid-template-columns: 56px 132px minmax(0, 1fr);
+  gap: 8px;
+  padding: 2px 0;
+  border-bottom: 1px solid var(--ef-rule);
+  font-size: 0.66rem;
+  line-height: 1.5;
+}
+
+.node-inspector-event time {
+  color: var(--ef-ink-2);
+  font-family: var(--ef-font-mono);
+}
+
+.node-inspector-event .type {
+  font-family: var(--ef-font-ui);
+  font-size: 0.58rem;
+  letter-spacing: 0.04em;
+}
+
+.node-inspector-event .text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.node-inspector-event-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.node-inspector-actions {
+  position: sticky;
+  bottom: -14px;
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 10px 0 4px;
+  background: var(--ef-panel);
+  border-top: 2px solid var(--ef-ink);
+  box-shadow: 0 -8px 14px color-mix(in srgb, var(--ef-panel) 92%, transparent);
+}
+
+.node-inspector-action-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.node-inspector-action-hint {
+  margin: 0;
+  color: var(--ef-ink-2);
+  font-size: 0.66rem;
+}
+
+.node-inspector-modal {
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.node-inspector-modal p {
+  margin: 0;
+  color: var(--ef-ink-2);
+  font-size: 0.74rem;
+  line-height: 1.6;
+}
