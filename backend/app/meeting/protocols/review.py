@@ -405,6 +405,31 @@ def _targets(mtg, predicate) -> list[dict]:
     return [issue for issue in _issues(mtg) if predicate(issue)]
 
 
+def _issue_states(targets: list[dict]) -> str:
+    """这组意见当前的处置状态：同一步骤重跑前与重跑后状态不同，键也必须不同。"""
+    return "|".join(f"{row['id']}={row.get('disposition') or ''}"
+                    for row in sorted(targets, key=lambda row: str(row["id"])))
+
+
+def _step_key(step: str, mtg, ids: list[str], *, extra: str = "") -> str:
+    """同一步骤、同一轮、同一组意见（同一状态）共用一个键：据此找回已落盘的发言。"""
+    return f"{step}:{_flow(mtg)}:{','.join(sorted(ids))}:{extra}"
+
+
+async def _reuse_or_speak(mtg, key: str, *, require_data: bool = False, **kwargs) -> dict:
+    """步骤的模型调用只做一次：状态里记着这一步的发言就直接复用。"""
+    remembered = (mtg.state().get("step_turns") or {}).get(key)
+    if remembered:
+        found = store.get_turn(mtg.meeting_id, int(remembered))
+        if found is not None and (found.get("data") is not None or not require_data):
+            return found
+    result = await speak(mtg, **kwargs)
+    turns = dict(mtg.state().get("step_turns") or {})
+    turns[key] = result["turn_id"]
+    mtg.set_state(step_turns=turns)
+    return result
+
+
 def _speaker_for(mtg, issue: dict) -> dict | None:
     """这条意见的提出者：按 raised_by 里的显示名找评审者，找不到就用第一名评审者。"""
     names = set(issue.get("raised_by") or [])
@@ -761,8 +786,10 @@ class ReviewProtocol(MeetingProtocol):
         ids = [issue["id"] for issue in targets]
         listing = "\n".join(f"- {issue['id']}：{issue['problem']}；执笔者回应："
                             f"{issue.get('response') or '未采纳'}" for issue in targets)
-        data = (await speak(
-            mtg, _chair(mtg), kind="review_rule", turn_kind="review_rule",
+        data = (await _reuse_or_speak(
+            mtg, _step_key("rule", mtg, ids, extra=_issue_states(targets)),
+            require_data=True,
+            participant=_chair(mtg), kind="review_rule", turn_kind="review_rule",
             charter=_charter(mtg),
             segments=[Segment("append", f"## 需要定夺的意见\n{listing}", name="意见清单")],
             instruction=REVIEW_RULE_INSTRUCTION, structured=_validate_rulings(ids),
@@ -843,8 +870,9 @@ class ReviewProtocol(MeetingProtocol):
         listing = "\n".join(f"- {issue['id']} [{issue.get('location') or '—'}] "
                             f"{issue['problem']}；建议：{issue.get('suggestion') or '—'}"
                             for issue in targets)
-        result = await speak(
-            mtg, _author(mtg), kind="author_revise", turn_kind="author_revise",
+        result = await _reuse_or_speak(
+            mtg, _step_key("revise", mtg, ids, extra=_issue_states(targets)),
+            participant=_author(mtg), kind="author_revise", turn_kind="author_revise",
             charter=_charter(mtg),
             segments=[Segment("append", f"## 文字级修改意见\n{listing}", name="修改意见")],
             instruction=AUTHOR_REVISE_INSTRUCTION, turn_round=_flow(mtg))
@@ -861,8 +889,11 @@ class ReviewProtocol(MeetingProtocol):
         clarifications = (discussion["state"].get("clarifications") or []) if discussion else []
         body = proposal.compose(draft, points=_ledger_points(mtg),
                                 clarifications=clarifications)
-        write_artifact(mtg.run_id, "proposal", body, created_by="author",
-                       inputs=["discussion"], status="draft")
+        current = read_artifact(mtg.run_id, "proposal")
+        existing = parse_front_matter(current)[1].strip() if current else ""
+        if existing != body.strip():              # 重试用同一份稿：不再写出重复的一版
+            write_artifact(mtg.run_id, "proposal", body, created_by="author",
+                           inputs=["discussion"], status="draft")
         for issue_id in ids:
             _update_issue(mtg, issue_id, disposition="已修订，待验证", revised_round=_flow(mtg))
         store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
@@ -893,8 +924,10 @@ class ReviewProtocol(MeetingProtocol):
         ids = [issue["id"] for issue in targets]
         listing = "\n".join(f"- {issue['id']} [{issue.get('location') or '—'}] "
                             f"{issue['problem']}" for issue in targets)
-        data = (await speak(
-            mtg, _chair(mtg), kind="revision_verify", turn_kind="revision_verify",
+        version = int((latest_artifact(mtg.run_id, "proposal") or {}).get("version") or 0)
+        data = (await _reuse_or_speak(
+            mtg, _step_key("verify", mtg, ids, extra=f"v{version}"), require_data=True,
+            participant=_chair(mtg), kind="revision_verify", turn_kind="revision_verify",
             charter=_charter(mtg),
             segments=[Segment("append", f"## 本轮的修订意见\n{listing}", name="修订意见")],
             instruction=REVISION_VERIFY_INSTRUCTION, structured=_validate_verified(ids),

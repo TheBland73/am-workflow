@@ -14,8 +14,11 @@ from app.db.models import Gate, Node, Run, Workflow
 from app.engine.feedback import with_feedback
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
+from app.engine.runners import NodeContext
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.meeting import store
+from app.meeting.protocols import review as review_module
+from app.meeting.session import MeetingSession
 from tests.meeting_fakes import drive, install
 
 IDEA = "给小团队做一个反馈收集工具"
@@ -166,6 +169,92 @@ def test_review_without_issues_accepts(monkeypatch) -> None:
     assert "author_response" not in kinds and "author_revise" not in kinds
     report = parse_front_matter(read_artifact(run_id, "review"))[1]
     assert "结论：接受。" in report and "方案覆盖了主要决策点" in report
+
+
+ISSUE = {"id": "I1", "standing": True, "accepted": True, "category": "wording",
+         "severity": "major", "problem": "范围写得不够清楚", "suggestion": "分别列出必做与不做",
+         "disposition": "", "raised_by": ["架构师"], "disputed": False, "response": ""}
+
+
+def _review_session(run_id: str, node_id: int, *, phase: str,
+                    state: dict | None = None) -> MeetingSession:
+    """直接建一场评审会议与它的会话，用来单独驱动某个步骤（不经 run_meeting）。"""
+    meeting_id = store.create_meeting(run_id=run_id, node_id=node_id, node_key="review",
+                                      protocol="review", charter={}, config={})
+    store.update_meeting(meeting_id, phase=phase, round=1)
+    store.set_state(meeting_id, dict(state or {}))
+    store.add_participant(meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    store.add_participant(meeting_id, role_key="author", display_name="执笔者",
+                          mode="author", system_prompt="你是执笔者")
+    store.add_participant(meeting_id, role_key="architect", display_name="架构师",
+                          mode="reviewer", system_prompt="你是评审者")
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        ctx = NodeContext(run_id=run_id, node_id=node_id, node_key="review", type="MEETING",
+                          name="评审会议", phase=phase, config=dict(node.config_json or {}),
+                          assignee={}, attempt_id=0, attempt_no=1)
+    return MeetingSession(meeting_id=meeting_id, ctx=ctx)
+
+
+def test_revising_the_same_issues_twice_reuses_the_recorded_turn(monkeypatch) -> None:
+    """崩溃重试会重跑修订步骤：已落盘的发言要复用，不能再写出一版方案。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="revise", state={"issues": [dict(ISSUE)]})
+    protocol = review_module.ReviewProtocol()
+
+    asyncio.run(protocol._revise(mtg, [dict(ISSUE)]))
+    asyncio.run(protocol._revise(mtg, [dict(ISSUE)]))
+
+    assert Counter(call["kind"] for call in seen)["author_revise"] == 1
+    assert parse_front_matter(read_artifact(run_id, "proposal"))[0]["version"] == 2
+
+
+def test_verifying_the_same_issues_twice_reuses_the_recorded_turn(monkeypatch) -> None:
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        revision_verify=lambda text: _verify(text, fixed=True)), seen)
+    run_id, node_id = _review_run()
+    issue = {**ISSUE, "disposition": "已修订，待验证"}
+    mtg = _review_session(run_id, node_id, phase="verify", state={"issues": [issue]})
+    protocol = review_module.ReviewProtocol()
+
+    asyncio.run(protocol._verify(mtg, [issue]))
+    asyncio.run(protocol._verify(mtg, [issue]))
+
+    assert Counter(call["kind"] for call in seen)["revision_verify"] == 1
+    assert [row["disposition"] for row in store.get_state(mtg.meeting_id)["issues"]] == [
+        "已修订并验证"]
+
+
+def test_chair_rulings_are_reused_after_a_crash(monkeypatch) -> None:
+    """发言已经落盘、意见还没更新时中断：重跑讨论步骤直接用已落盘的定夺。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        review_rule=lambda text: _rule(text, keep=True),
+        review_defend="这条意见成立。"), seen)
+    run_id, node_id = _review_run()
+    issue = {**ISSUE, "accepted": False, "disputed": True}
+    mtg = _review_session(run_id, node_id, phase="discuss", state={"issues": [issue]})
+    protocol = review_module.ReviewProtocol()
+    original = review_module._update_issue
+    armed = {"on": True}
+
+    def flaky(mtg_, issue_id: str, **fields):
+        if armed["on"] and str(fields.get("disposition") or "").startswith("主席定夺"):
+            armed["on"] = False
+            raise RuntimeError("进程在更新意见前中断")
+        return original(mtg_, issue_id, **fields)
+
+    monkeypatch.setattr(review_module, "_update_issue", flaky)
+    with pytest.raises(RuntimeError):
+        asyncio.run(protocol.step_discuss(mtg))
+    asyncio.run(protocol.step_discuss(mtg))
+
+    assert Counter(call["kind"] for call in seen)["review_rule"] == 1
+    assert store.get_state(mtg.meeting_id)["issues"][0]["disposition"] == "主席定夺：成立"
 
 
 def test_wording_issues_are_revised_and_verified(monkeypatch) -> None:

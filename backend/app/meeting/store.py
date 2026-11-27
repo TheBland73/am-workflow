@@ -321,6 +321,21 @@ def count_turns(meeting_id: int) -> int:
             MeetingTurn.meeting_id == meeting_id).scalar() or 0
 
 
+def get_turn(meeting_id: int, turn_id: int) -> dict | None:
+    """按编号取一条有内容的发言；步骤用状态里记下的编号找回自己那一步的发言。"""
+    with session_scope() as s:
+        row = (
+            s.query(MeetingTurn)
+            .filter(MeetingTurn.meeting_id == meeting_id, MeetingTurn.id == turn_id,
+                    MeetingTurn.content != "")
+            .first()
+        )
+        if row is None:
+            return None
+        return {"turn_id": row.id, "content": row.content,
+                "data": dict(row.structured_json) if row.structured_json else None}
+
+
 def find_turn(meeting_id: int, *, phase: str, round: int, kind: str,
               speaker_id: int) -> dict | None:
     """取某步骤某轮里某参会者的那条发言，断点续跑时用。"""
