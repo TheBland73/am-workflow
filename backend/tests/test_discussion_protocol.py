@@ -28,6 +28,8 @@ ANSWER = '{"answers": [{"text": "需要导出周报", "source": ""}]}'
 ROSTER = ('{"participants": [{"role_key": "architect", "reason": "把握技术路线"}, '
           '{"role_key": "ux", "reason": "把关核心任务路径"}]}')
 ROSTER_ONE = '{"participants": [{"role_key": "architect", "reason": "唯一参会者"}]}'
+ROSTER_SECURITY = ('{"participants": [{"role_key": "security", "reason": "把关授权与数据边界"}, '
+                   '{"role_key": "ux", "reason": "把关核心任务路径"}]}')
 POSITION = '{"must": ["每一步可验证"], "risks": ["范围蔓延"], "route": "先做最小闭环", "questions": []}'
 AGENDA = ('{"points": ['
           '{"title": "首版做网页版还是桌面版", "question": "首版交付哪个平台", '
@@ -321,6 +323,118 @@ def test_a_fixed_headcount_is_enforced(monkeypatch) -> None:
     run_id, node_id = _meeting_run({"rosters": {"participants": {"count": 3}}})
     with pytest.raises(NodeFailure, match="固定人数"):
         drive(run_id, node_id, _approve, idea=IDEA)
+
+
+def _participants(meeting_id: int) -> list[tuple[str | None, str]]:
+    """这场会议里参会者的 (角色键, 状态)，含已撤掉的；主持人、需求方代理不算。"""
+    rows = store.list_participants(meeting_id, active_only=False)
+    return [(row["role_key"], row["status"]) for row in rows if row["mode"] == "participant"]
+
+
+def test_participants_named_in_the_run_config_take_effect_without_a_proposal_or_a_checkpoint(
+        monkeypatch) -> None:
+    """运行级配置只点名角色：按用户的来。主持人不再挑名单，也不开名单确认点，会议照常走完。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run({"rosters": {"participants": {"role_keys": ["ux", "architect"]}}})
+    asked: list[str] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint["kind"])
+        data = {"answers": ["Markdown 即可"]} if checkpoint["kind"] == "clarify" else {}
+        return "approve", data, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True and asked == ["clarify"]         # 名单没有拿来问人
+    assert "roster" not in {call["kind"] for call in seen}         # 主持人没有被叫去挑名单
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    rows = [row for row in store.list_participants(meeting_id) if row["mode"] == "participant"]
+    assert [(row["role_key"], row["display_name"], row["source"]) for row in rows] == [
+        ("ux", "用户体验", "user"), ("architect", "架构师", "user")]  # 按配置里的顺序，名称取自角色库
+    assert {index: point["status"] for index, point in _ledger(node_id).items()} == {
+        "D1": "agreed", "D2": "agreed"}
+
+
+def test_named_participants_that_no_longer_exist_fail_the_meeting_with_a_clear_message(
+        monkeypatch) -> None:
+    """点名的角色后来被删了：带着明确的错误失败，不悄悄换人，也不空着名单往下走。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run({"rosters": {"participants": {"role_keys": ["deleted_role"]}}})
+
+    with pytest.raises(NodeFailure, match="点名的参会角色都已不存在"):
+        drive(run_id, node_id, _approve, idea=IDEA)
+    assert "roster" not in {call["kind"] for call in seen}         # 没有退回去让主持人另挑一份
+
+
+def test_a_fixed_headcount_overrides_the_participant_range_in_the_prompt_and_at_the_checkpoint(
+        monkeypatch) -> None:
+    """只给固定人数：主持人被要求正好挑这么多（参数表的人数范围让位），确认点上也写明人数是用户定的。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(roster=ROSTER_ONE), seen)
+    run_id, node_id = _meeting_run({"rosters": {"participants": {"count": 1}}})
+    asked: list[dict] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint)
+        return "approve", {}, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True
+    (prompt,) = [call["text"] for call in seen if call["kind"] == "roster"]
+    assert "请正好挑选 1 名" in prompt and "2 到 2 名" not in prompt   # 参数表的范围是 2 到 2
+    checkpoint = next(item for item in asked if item["kind"] == "roster")
+    assert checkpoint["payload"]["fixed"] == 1
+    assert (checkpoint["payload"]["min"], checkpoint["payload"]["max"]) == (1, 1)
+    assert "用户指定了固定人数。" in checkpoint["description"]
+
+
+def test_a_rejected_roster_is_proposed_again_with_the_feedback_and_the_old_one_withdrawn(
+        monkeypatch) -> None:
+    """人在名单确认点上驳回并写明意见：旧名单撤掉，主持人带着这份意见重新提议，再请人确认新名单。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(roster=_first_then(ROSTER, ROSTER_SECURITY)), seen)
+    run_id, node_id = _meeting_run()
+    asked: list[str] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint["kind"])
+        assert asked.count("roster") <= 2, "名单确认点反复出现"     # drive 会一直等到会议结束
+        if checkpoint["kind"] == "roster" and asked.count("roster") == 1:
+            return "reject", {}, "换掉架构师，让安全与合规参加"     # 只驳回第一份名单
+        return "approve", {}, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True and asked.count("roster") == 2
+    first, second = [call["text"] for call in seen if call["kind"] == "roster"]
+    assert "用户对上一份名单的意见" not in first
+    assert "换掉架构师，让安全与合规参加" in second
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    assert _participants(meeting_id) == [("architect", "removed"), ("ux", "removed"),
+                                         ("security", "active"), ("ux", "active")]
+
+
+def test_a_fixed_headcount_still_binds_the_roster_proposed_after_a_rejection(monkeypatch) -> None:
+    """驳回后重新提议，人数要求不变：仍然必须正好是用户指定的名数。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(roster=_first_then(ROSTER_ONE, ROSTER)), seen)   # 第二次提了 2 名
+    run_id, node_id = _meeting_run({"rosters": {"participants": {"count": 1}}})
+    asked: list[str] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint["kind"])
+        assert asked.count("roster") <= 1, "名单确认点反复出现"
+        if checkpoint["kind"] == "roster":
+            return "reject", {}, "换一个人"
+        return "approve", {}, ""
+
+    with pytest.raises(NodeFailure, match="固定人数"):
+        drive(run_id, node_id, answer, idea=IDEA)
+    _first, second = [call["text"] for call in seen if call["kind"] == "roster"]
+    assert "请正好挑选 1 名" in second and "换一个人" in second   # 重新提议时仍按固定人数，并带着意见
 
 
 def test_feedback_reopens_points_and_produces_a_new_version(monkeypatch) -> None:
