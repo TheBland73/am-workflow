@@ -15,7 +15,8 @@ import GateConsole from "../panels/GateConsole";
 import NodeInspector from "../panels/NodeInspector";
 import type { NodeActionRequest } from "../panels/NodeInspector";
 import {
-  decidedByLabel, phaseLabel, statusLabel as pointStatusLabel, verdictLabel,
+  decidedByLabel, isSameFamilyDecision, phaseLabel, SAME_FAMILY_HINT,
+  statusLabel as pointStatusLabel, verdictLabel,
 } from "../panels/meetingLabels";
 
 const ARTIFACT_LABELS: Record<string, string> = {
@@ -117,8 +118,12 @@ function eventText(event: StreamEvent) {
     case "meeting_intervention_queued": return "插话已排队";
     case "meeting_intervention_injected": return "插话已注入";
     case "meeting_finished": return "会议完成";
-    case "checkpoint_decided":
-      return `确认点已由${decidedByLabel(String(payload.decided_by ?? ""))}决定`;
+    case "checkpoint_decided": {
+      const text = `确认点已由${decidedByLabel(String(payload.decided_by ?? ""))}决定`;
+      return isSameFamilyDecision(payload.decision)
+        ? `${text}（${SAME_FAMILY_HINT}）`
+        : text;
+    }
     case "review_round_started": return `评审第 ${String(payload.round ?? "")} 轮开始`;
     case "review_verdict": return `结论：${verdictLabel(String(payload.verdict ?? ""))}`;
     case "context_compacted":

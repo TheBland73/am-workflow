@@ -209,6 +209,9 @@ class Gate(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
     node_id: Mapped[int] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"))
+    # 会议内确认点所属的会议；人工门与兜底转人工的门为空。不加外键：老库靠启动时 ALTER TABLE 补列，
+    # SQLite 不能给已有的表补外键，加了会让新旧库的约束不一致
+    meeting_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="open")
     feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
     kind: Mapped[str | None] = mapped_column(String(40), nullable=True)   # 确认点类型；旧门为空

@@ -17,7 +17,7 @@ from app.engine.runners import NodeContext
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.main import app
 from app.meeting import store
-from app.meeting.checkpoints import open_checkpoint
+from app.meeting.checkpoints import open_checkpoint, record_auto_decision
 from app.meeting.session import MeetingSession
 
 _counter = iter(range(1, 1000))
@@ -76,6 +76,28 @@ def test_open_checkpoint_suspends_node_and_run() -> None:
     with session_scope() as s:
         assert s.get(Node, mtg.node_id).status == "waiting_human"
     assert store.get_meeting(mtg.meeting_id)["status"] == "suspended"
+
+
+def test_checkpoint_gate_records_the_meeting_it_belongs_to() -> None:
+    # 会议归档或重开后同一节点上会有新旧两代门：门上记下所属会议，才分得清哪条是哪场会议的
+    mtg = _open_checkpoint()
+    gate = get_gate(store.get_state(mtg.meeting_id)["awaiting_gate_id"])
+    assert gate["meeting_id"] == mtg.meeting_id
+    with session_scope() as s:
+        assert s.get(Gate, gate["id"]).meeting_id == mtg.meeting_id
+
+
+def test_auto_decision_gate_records_the_meeting() -> None:
+    mtg = _open_checkpoint()
+    gate_id = asyncio.run(record_auto_decision(mtg, "roster", decided_by="program",
+                                               decision={"action": "approve"}))
+    assert get_gate(gate_id)["meeting_id"] == mtg.meeting_id
+
+
+def test_artifact_gates_are_not_tied_to_a_meeting() -> None:
+    _run_id, node_id = _template_run()
+    gate = request_gate(_run_id, node_id)
+    assert gate["kind"] == "" and gate["meeting_id"] is None
 
 
 def test_reject_needs_no_target_and_lets_meeting_resume() -> None:

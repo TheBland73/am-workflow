@@ -3,7 +3,9 @@ import { Button, Input, Modal, Select, Tag, message } from "antd";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { Gate, Snapshot } from "../api/types";
-import { CHECKPOINT_LABEL, canJoinDiscussion, decidedByLabel } from "./meetingLabels";
+import {
+  CHECKPOINT_LABEL, canJoinDiscussion, decidedByLabel, isSameFamilyDecision, SAME_FAMILY_HINT,
+} from "./meetingLabels";
 
 function durationText(seconds: number) {
   if (!Number.isFinite(seconds) || seconds <= 0) return "—";
@@ -270,6 +272,7 @@ export default function GateConsole({
           {" · 由"}
           {decidedByLabel(item.decided_by)}
           决定
+          {isSameFamilyDecision(item.decision) ? ` · ${SAME_FAMILY_HINT}` : ""}
         </li>
       ))}
     </ul>

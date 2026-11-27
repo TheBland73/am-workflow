@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from app.artifacts.store import artifacts_dir, parse_front_matter, read_artifact
+from app.artifacts.store import artifacts_dir, parse_front_matter, read_artifact, set_status
 from app.conversation.builder import Segment
 from app.db.base import init_db, session_scope
 from app.db.models import Node, Run, Workflow
@@ -135,16 +135,17 @@ def test_table_cells_show_levels_for_every_voter() -> None:
 
 
 # ---------------- 纪要 ----------------
-def _run() -> str:
+def _run(suffix: str = "") -> str:
     init_db()
     seed_defaults()
+    run_id = f"minutes-run{suffix}"                      # 测试共用一个库：各用各的运行
     with session_scope() as s:
         workflow_id = s.query(Workflow).filter(Workflow.template_key == "sdlc_v1").one().id
-        s.add(Run(id="minutes-run", workflow_id=workflow_id, status="running", idea_text="做一个工具"))
+        s.add(Run(id=run_id, workflow_id=workflow_id, status="running", idea_text="做一个工具"))
         s.flush()
-        s.add(Node(node_key="discuss", type="MEETING", name="讨论会议", run_id="minutes-run",
+        s.add(Node(node_key="discuss", type="MEETING", name="讨论会议", run_id=run_id,
                    status="running"))
-    return "minutes-run"
+    return run_id
 
 
 def _fixture() -> dict:
@@ -183,6 +184,20 @@ def test_write_minutes_writes_artifact_and_ledger_json() -> None:
     assert "## 决策点账本" in body
     ledger = json.loads((artifacts_dir(run_id) / "discussion.ledger.json").read_text(encoding="utf-8"))
     assert [point["index"] for point in ledger] == ["D1", "D2"]
+
+
+def test_write_minutes_can_carry_a_report_type_that_survives_a_status_change() -> None:
+    # 评审报告与需求确认报告共用 review 工件：靠 review_type 区分，改状态时不丢
+    run_id = _run("-report")
+    minutes.write_minutes(run_id, kind="review", created_by="chair", inputs=["proposal"],
+                          meta={"review_type": "proposal"}, **_fixture())
+    meta, _body = parse_front_matter(read_artifact(run_id, "review"))
+    assert meta["review_type"] == "proposal" and meta["kind"] == "review"
+
+    set_status(run_id, "review", "approved")
+
+    meta, _body = parse_front_matter(read_artifact(run_id, "review"))
+    assert meta["status"] == "approved" and meta["review_type"] == "proposal"
 
 
 # ---------------- 断点评审的回归用例 ----------------

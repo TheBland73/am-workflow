@@ -21,6 +21,7 @@ from app.engine.params import apply_run_config
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.main import app
 from app.models.crypto import encrypt_key
+from app.models.pool import ModelInfo
 from tests.meeting_fakes import install
 
 IDEA = "给小团队做一个反馈收集工具"
@@ -471,6 +472,76 @@ def test_different_family_has_no_hint() -> None:
         from app.engine.gates import gate_payload
         description = gate_payload(s, s.get(Gate, gate["id"]))["description"]
     assert "同一家族" not in description
+
+
+# ---------------- 异构默认（详设 §5.3） ----------------
+def _info(model_id: int, name: str) -> ModelInfo:
+    return ModelInfo(id=model_id, provider_id=1, model_name=name, display_name=name)
+
+
+def _judge_gate_review(monkeypatch, *, judge_model: str) -> tuple[str, dict]:
+    """裁决模型绑定 judge_model，参会者全用 gpt-4o；由模型判定评审裁决点，返回 (运行 id, 决定的 data)。"""
+    seen: list[dict] = []
+    install(monkeypatch, {"gate_points": POINTS, "gate_verdict": APPROVE}, seen)
+    _no_kick(monkeypatch)
+    participant_model = _seed_model("gpt-4o", bind_judge=False)
+    _seed_model(judge_model)                               # 这一个绑定给 judge
+    run_id = _make_run({"automation": {"level": "L3"}})
+    _artifact(run_id, "proposal", PROPOSAL)
+    _artifact(run_id, "review", REVIEW_REPORT)
+    _meeting(run_id, "review", "review", state={"verdict": "accept", "precheck_ok": True},
+             participants=[{"role_key": "architect", "display_name": "架构师",
+                            "model_id": participant_model}])
+
+    _run_node(run_id, "gate_review")
+
+    with session_scope() as s:
+        gate = (s.query(Gate).filter(Gate.node_id == _node_id(run_id, "gate_review"))
+                .order_by(Gate.id.desc()).first())
+        assert gate.status == "approved"                    # 两种情况都不阻断：决定照常生效
+        return run_id, dict(gate.decision_json["data"])
+
+
+def test_judge_prefers_a_candidate_from_another_family() -> None:
+    # 裁决模型没显式绑定时：只要有一个候选与全部参会者都不同家族，就选它，而不是排在最前的那个
+    gpt, deepseek = _info(1, "gpt-4o"), _info(2, "deepseek-chat")
+    assert judge.choose_judge_model([gpt, deepseek], ["gpt-4o", "gpt-4o-mini"]) is deepseek
+
+
+def test_judge_falls_back_to_the_first_candidate_when_all_share_the_family() -> None:
+    gpt, mini = _info(1, "gpt-4o"), _info(2, "gpt-4o-mini")
+    assert judge.choose_judge_model([gpt, mini], ["gpt-4o"]) is gpt
+    assert judge.choose_judge_model([], ["gpt-4o"]) is None
+
+
+def test_explicitly_bound_judge_is_not_replaced() -> None:
+    # 用户给 judge 角色绑了模型就照用：即使它与全部参会者同家族，也只标注、不擅自换人
+    bound_id = _seed_model("gpt-4o")
+    _seed_model("deepseek-chat", bind_judge=False)
+
+    model = judge.pick_judge_model(["gpt-4o"])
+
+    assert model is not None and model.id == bound_id
+
+
+def test_same_family_model_decision_is_flagged_for_review(monkeypatch) -> None:
+    run_id, data = _judge_gate_review(monkeypatch, judge_model="gpt-4o")
+
+    assert data["heterogeneity"] == "same_family"
+    assert "同一家族" in data["heterogeneity_hint"]
+    decided = _events(run_id, "checkpoint_decided")
+    assert decided[-1]["payload"]["decided_by"].startswith("model:")
+    assert decided[-1]["payload"]["decision"]["heterogeneity"] == "same_family"
+    assert any("同一家族" in str(event["payload"].get("message"))
+               for event in _events(run_id, "node_log"))
+
+
+def test_different_family_model_decision_is_not_flagged(monkeypatch) -> None:
+    run_id, data = _judge_gate_review(monkeypatch, judge_model="deepseek-chat")
+
+    assert "heterogeneity" not in data
+    assert not any("同一家族" in str(event["payload"].get("message"))
+                   for event in _events(run_id, "node_log"))
 
 
 # ---------------- 设计之后的门 ----------------

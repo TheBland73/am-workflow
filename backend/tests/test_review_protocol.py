@@ -167,8 +167,9 @@ def test_review_without_issues_accepts(monkeypatch) -> None:
                for section in _meeting(node_id)["charter"].get("sections") or [])
     kinds = Counter(call["kind"] for call in seen)
     assert "author_response" not in kinds and "author_revise" not in kinds
-    report = parse_front_matter(read_artifact(run_id, "review"))[1]
-    assert "结论：接受。" in report and "方案覆盖了主要决策点" in report
+    report = parse_front_matter(read_artifact(run_id, "review"))
+    assert report[0]["review_type"] == "proposal"      # 与需求确认报告共用 review 工件，靠它区分
+    assert "结论：接受。" in report[1] and "方案覆盖了主要决策点" in report[1]
 
 
 ISSUE = {"id": "I1", "standing": True, "accepted": True, "category": "wording",

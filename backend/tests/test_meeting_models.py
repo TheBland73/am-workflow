@@ -74,12 +74,13 @@ def test_old_database_gets_new_columns_on_startup(monkeypatch) -> None:
         inspector = inspect(old_engine)
         names = lambda table: {column["name"] for column in inspector.get_columns(table)}
         assert {"config_json"} <= names("runs")
-        assert {"kind", "payload_json", "decision_json"} <= names("gates")
+        assert {"kind", "payload_json", "decision_json", "meeting_id"} <= names("gates")
         assert {"meta_json"} <= names("agent_templates")
         with old_engine.connect() as conn:
             old_gate = conn.execute(
-                text("SELECT kind, payload_json, decision_json FROM gates WHERE id = 1")).one()
+                text("SELECT kind, payload_json, decision_json, meeting_id FROM gates "
+                     "WHERE id = 1")).one()
     finally:
         old_engine.dispose()
-    # 旧行不会填默认值：读这三列的地方要自己兜底
-    assert tuple(old_gate) == (None, None, None)
+    # 旧行不会填默认值：读这几列的地方要自己兜底
+    assert tuple(old_gate) == (None, None, None, None)

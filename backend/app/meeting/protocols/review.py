@@ -987,4 +987,4 @@ class ReviewProtocol(MeetingProtocol):
             mtg.run_id, kind="review", created_by="chair", inputs=["proposal"],
             meeting=mtg.meeting(), participants=mtg.participants(),
             points=_ledger_points(mtg), turns=store.list_turns(mtg.meeting_id, limit=100_000),
-            extra_sections=sections)
+            extra_sections=sections, meta={"review_type": "proposal"})

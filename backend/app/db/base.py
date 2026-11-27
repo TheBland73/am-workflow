@@ -90,7 +90,8 @@ def _ensure_columns() -> None:
         "plans": {"layout_json": "JSON"},
         "plan_snapshots": {"coverage_json": "JSON"},
         "runs": {"config_json": "JSON"},
-        "gates": {"kind": "VARCHAR(40)", "payload_json": "JSON", "decision_json": "JSON"},
+        "gates": {"kind": "VARCHAR(40)", "payload_json": "JSON", "decision_json": "JSON",
+                  "meeting_id": "INTEGER"},
     }
     # 先在事务之外把已有列读出来：SQLite 连接池 size=1，事务内再 inspect 会自锁。
     existing_by_table = {

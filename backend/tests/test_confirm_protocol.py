@@ -203,8 +203,9 @@ def test_faithful_spec_passes(monkeypatch) -> None:
     assert any(section["title"] == "需求规格（当前版本）"
                for section in _meeting(node_id)["charter"].get("sections") or [])
     assert _items(node_id) == []
-    report = parse_front_matter(read_artifact(run_id, "review"))[1]
-    assert "结论：通过。" in report and "全部通过" in report
+    report = parse_front_matter(read_artifact(run_id, "review"))
+    assert report[0]["review_type"] == "requirement"   # 与方案评审报告共用 review 工件，靠它区分
+    assert "结论：通过。" in report[1] and "全部通过" in report[1]
     kinds = Counter(call["kind"] for call in seen)
     assert kinds["expect"] == 1 and kinds["fidelity"] == 1 and kinds["quality"] == 1
     assert kinds["confirm_intake"] == 0 and kinds["confirm_merge"] == 0

@@ -137,6 +137,8 @@ export interface Gate {
   id: number;
   node_id: number;
   node_key: string;
+  /** 会议内确认点所属的会议；人工门为 null。 */
+  meeting_id?: number | null;
   status: string;
   feedback: string | null;
   decided_by: string | null;

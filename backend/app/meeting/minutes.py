@@ -59,12 +59,16 @@ def minutes_markdown(*, meeting: dict, participants: list[dict], points: list[di
 
 def write_minutes(run_id: str, *, kind: str, created_by: str, inputs: list[str],
                   meeting: dict, participants: list[dict], points: list[dict],
-                  turns: list[dict], extra_sections: list[tuple[str, str]] = ()) -> dict:
-    """写会议纪要工件（新版本），并另存账本的 JSON。返回工件的记录。"""
+                  turns: list[dict], extra_sections: list[tuple[str, str]] = (),
+                  meta: dict | None = None) -> dict:
+    """写会议纪要工件（新版本），并另存账本的 JSON。返回工件的记录。
+
+    meta 是这份纪要自己的附加字段：评审报告与需求确认报告共用 review 工件，靠 review_type 区分。
+    """
     body = minutes_markdown(meeting=meeting, participants=participants, points=points,
                             turns=turns, extra_sections=extra_sections)
     record = write_artifact(run_id, kind, body, created_by=created_by, inputs=inputs,
-                            status="reviewed")
+                            status="reviewed", extra_meta=meta)
     ledger = [{field: point.get(field) for field in LEDGER_FIELDS} for point in points]
     path = artifacts_dir(run_id) / f"{kind}.ledger.json"
     tmp = path.with_suffix(path.suffix + ".tmp")       # 中断不会留下半个 JSON

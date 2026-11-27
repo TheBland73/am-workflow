@@ -5,6 +5,10 @@
 判不了、输出不合格、连续驳回达到上限时，门留给人——这条路径不可配置关闭。
 
 确认点先用程序做前置检查：上游会议留下了 precheck_ok 且为假时，不调模型直接驳回。
+
+异构默认：judge 角色没有显式绑定模型时，在可用模型里优先选与全部参会者都不同家族的；
+用户绑定了模型就照用。裁决模型与全部参会者同家族时判定照常生效，但在决定、事件与日志里
+标注，提示用户复核（同一家族的模型评审自己的产出不可靠，见详设 §3.1 的 E6）。
 """
 from __future__ import annotations
 
@@ -60,12 +64,44 @@ def gate_decider(run_id: str, config: dict, node_key: str) -> str:
                        checkpoint_key(config, node_key))
 
 
+SAME_FAMILY = "same_family"
+SAME_FAMILY_HINT = "裁决模型与全部参会者属于同一家族，这次判定请复核；有异议可以重置节点否决"
+
+
 def family_of(model_name: str) -> str:
     name = str(model_name or "").strip().lower()
     for family, keywords in _FAMILIES:
         if any(keyword in name for keyword in keywords):
             return family
     return name
+
+
+def same_family(participant_models: list[str], judge_model: str) -> bool:
+    """裁决模型与全部参会者同属一个家族。参会者或裁决模型不明时不算。"""
+    names = [str(name) for name in participant_models or [] if str(name or "").strip()]
+    judge = str(judge_model or "").strip()
+    if not names or not judge:
+        return False
+    return all(family_of(name) == family_of(judge) for name in names)
+
+
+def choose_judge_model(candidates: list[ModelInfo],
+                       participant_models: list[str]) -> ModelInfo | None:
+    """在候选里优先取与全部参会者都不同家族的模型；都不满足时取排在最前的那个，没有候选返回 None。"""
+    if not candidates:
+        return None
+    families = {family_of(name) for name in participant_models or [] if str(name or "").strip()}
+    for model in candidates:
+        if family_of(model.model_name) not in families:
+            return model
+    return candidates[0]
+
+
+def pick_judge_model(participant_models: list[str]) -> ModelInfo | None:
+    """裁决模型：用户给 judge 角色绑了模型就照用；没绑定时异构优先。"""
+    if pool.role_default_model_id("judge") is not None:
+        return pool.pick_role_model("judge")
+    return choose_judge_model(pool.role_model_candidates("judge"), participant_models)
 
 
 def rubric_for(definition: dict, config: dict) -> str:
@@ -76,22 +112,17 @@ def rubric_for(definition: dict, config: dict) -> str:
 
 def heterogeneity_hint(participant_models: list[str], judge_model: str) -> str:
     """裁决模型与全部参会者同一家族时给一句提示，不阻断判定。"""
-    names = [str(name) for name in participant_models or [] if str(name or "").strip()]
-    judge = str(judge_model or "").strip()
-    if not names or not judge:
-        return ""
-    family = family_of(judge)
-    if all(family_of(name) == family for name in names):
-        return "裁决模型与全部参会者属于同一家族，建议换一家的模型做裁决"
-    return ""
+    return "裁决模型与全部参会者属于同一家族，建议换一家的模型做裁决" if same_family(
+        participant_models, judge_model) else ""
 
 
 def hint_for_gate(run_id: str, node: dict) -> str:
     """人工门打开时的"同一家族"提示。取上游会议全部参会者的模型与裁决模型比较。"""
-    model = pool.pick_role_model("judge")
+    names = _participant_models(run_id, node)
+    model = pick_judge_model(names)
     if model is None:
         return ""
-    return heterogeneity_hint(_participant_models(run_id, node), model.model_name)
+    return heterogeneity_hint(names, model.model_name)
 
 
 def _participant_models(run_id: str, node: dict) -> list[str]:
@@ -140,9 +171,11 @@ async def judge_gate(run_id: str, node: dict, deps: list[dict], attempt_id: int)
             "level": "warn", "message": f"确认点转交人工：{reason}"[:300]})
         return {"action": "open", "reason": reason}
 
-    model = pool.pick_role_model("judge")
+    participants = _participant_models(run_id, node)
+    model = pick_judge_model(participants)
     if model is None:
         return await open_("没有可用的裁决模型：请先配置供应商与模型")
+    homogeneous = same_family(participants, model.model_name)
 
     definition = definition_of(run_id)
     rubric = rubric_for(definition, config)
@@ -151,9 +184,10 @@ async def judge_gate(run_id: str, node: dict, deps: list[dict], attempt_id: int)
         if not config.get("reject_target"):
             return await open_(precheck)
         # 前置检查是程序的结论，不是模型的：不算一次模型驳回
-        return await _decide(node_id, gate_id, model, config, "reject", precheck,
+        return await _decide(run_id, node_id, gate_id, model, config, "reject", precheck,
                              reasons=[precheck], concerns=[], rubric=rubric,
-                             decided_by="program", count=False)
+                             kind=checkpoint_key(config, node["node_key"]), decided_by="program",
+                             count=False)
 
     max_rejects = _max_auto_rejects(run_id)
     rejects = int(config.get("auto_rejects") or 0)
@@ -184,8 +218,10 @@ async def judge_gate(run_id: str, node: dict, deps: list[dict], attempt_id: int)
             return await open_("裁决模型驳回，但没有给出反馈，需要人来决定")
         if not config.get("reject_target"):
             return await open_("裁决模型建议驳回，但这个确认点没有配置退回的目标节点")
-    return await _decide(node_id, gate_id, model, config, verdict, feedback,
-                         reasons=reasons, concerns=concerns, rubric=rubric)
+    return await _decide(run_id, node_id, gate_id, model, config, verdict, feedback,
+                         reasons=reasons, concerns=concerns, rubric=rubric,
+                         kind=checkpoint_key(config, node["node_key"]),
+                         same_family_judge=homogeneous)
 
 
 # ---------------- 判定路径 ----------------
@@ -297,17 +333,37 @@ async def _verdict(run_id: str, node: dict, attempt_id: int, model: ModelInfo,
     return data, str(data.get("verdict") or "").strip().lower()
 
 
-async def _decide(node_id: int, gate_id: int, model: ModelInfo, config: dict,
+async def _decide(run_id: str, node_id: int, gate_id: int, model: ModelInfo, config: dict,
                   action: str, feedback: str, *, reasons: list[str],
-                  concerns: list[str], rubric: str, decided_by: str | None = None,
-                  count: bool = True) -> dict:
+                  concerns: list[str], rubric: str, kind: str,
+                  decided_by: str | None = None, count: bool = True,
+                  same_family_judge: bool = False) -> dict:
+    """落下判定并留痕。每次判定都推一条 checkpoint_decided（与程序自动通过、会议内确认点同口径）。
+
+    same_family_judge：裁决模型与全部参会者同家族。决定照常生效，但在决定、事件与日志里标注，
+    提示用户复核（详设 §5.3 的"异构默认"：标注并提示，不静默通过，也不阻断）。
+    """
     from app.engine.orchestrator import orchestrator       # 延迟导入：避免与编排器循环导入
 
+    decider = decided_by or f"model:{model.display_name}"
+    decision: dict = {"action": action, "feedback": feedback or "",
+                      "reasons": reasons, "concerns": concerns}
+    if same_family_judge:
+        decision["heterogeneity"] = SAME_FAMILY
+        decision["heterogeneity_hint"] = SAME_FAMILY_HINT
     await orchestrator.decide_gate(
         gate_id=gate_id, action=action, feedback=feedback or None,
         target_node=(config.get("reject_target") if action == "reject" else None),
-        decided_by=decided_by or f"model:{model.display_name}",
-        data={"reasons": reasons, "concerns": concerns, "rubric": rubric})
+        decided_by=decider,
+        data={"reasons": reasons, "concerns": concerns, "rubric": rubric,
+              **({key: decision[key] for key in ("heterogeneity", "heterogeneity_hint")}
+                 if same_family_judge else {})})
+    await emit(run_id, "checkpoint_decided", node_id, {
+        "gate_id": gate_id, "kind": kind, "decided_by": decider, "decision": decision})
+    if same_family_judge:
+        await emit(run_id, "node_log", node_id, {
+            "level": "warn",
+            "message": f"裁决模型与全部参会者属于同一家族（{model.display_name}），请复核这次判定"[:300]})
     with session_scope() as s:
         row = s.get(Node, node_id)
         if row is not None:

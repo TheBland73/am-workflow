@@ -34,6 +34,7 @@ async def open_checkpoint(mtg: "MeetingSession", kind: str, *, title: str, descr
         for stale in s.query(Gate).filter(Gate.node_id == mtg.node_id, Gate.status == "open").all():
             stale.status = "superseded"
         gate = Gate(run_id=mtg.run_id, node_id=mtg.node_id, status="open", kind=kind,
+                    meeting_id=mtg.meeting_id,
                     payload_json={"title": title, "description": description, **(payload or {})})
         s.add(gate)
         s.flush()
@@ -73,7 +74,7 @@ async def record_auto_decision(mtg: "MeetingSession", kind: str, *, decided_by: 
     """不是由人当场判定的确认点：直接落一条已决定的门留审计，并推 checkpoint_decided。"""
     action = "approve" if decision.get("action") == "approve" else "reject"
     with session_scope() as s:
-        gate = Gate(run_id=mtg.run_id, node_id=mtg.node_id,
+        gate = Gate(run_id=mtg.run_id, node_id=mtg.node_id, meeting_id=mtg.meeting_id,
                     status="approved" if action == "approve" else "rejected", kind=kind,
                     payload_json={"title": title, **(payload or {})},
                     decision_json={**decision, "action": action}, decided_by=decided_by,

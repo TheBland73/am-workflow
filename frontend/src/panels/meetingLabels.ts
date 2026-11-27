@@ -69,6 +69,19 @@ export function decidedByLabel(value: string | null | undefined): string {
   return value;
 }
 
+/** 裁决模型与全部参会者同一家族：决定照常生效，但要提示用户复核（详设 §5.3"异构默认"）。 */
+export const SAME_FAMILY_HINT = "裁决模型与参会者同一家族，请复核";
+
+/** 决定（门的 decision_json 或 checkpoint_decided 事件里的 decision）是否带同家族标注。 */
+export function isSameFamilyDecision(decision: unknown): boolean {
+  if (!decision || typeof decision !== "object") return false;
+  const flagged = (value: unknown) =>
+    !!value && typeof value === "object" &&
+    (value as { heterogeneity?: unknown }).heterogeneity === "same_family";
+  // 门上的决定把内容放在 data 下；事件里的 decision 是平铺的
+  return flagged((decision as { data?: unknown }).data) || flagged(decision);
+}
+
 /** 确认点的判定者（运行级配置里的 automation.checkpoints）。 */
 export const DECIDER_LABEL: Record<string, string> = {
   human: "人工",

@@ -158,6 +158,7 @@ def gate_payload(s, gate: Gate) -> dict:
         "run_id": gate.run_id,
         "node_id": gate.node_id,
         "node_key": node_key,
+        "meeting_id": gate.meeting_id,       # 会议内确认点所属的会议；人工门为空
         "status": gate.status,
         "feedback": gate.feedback,
         "decided_by": gate.decided_by,

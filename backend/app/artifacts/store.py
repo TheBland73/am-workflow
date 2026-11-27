@@ -51,6 +51,10 @@ def render_front_matter(meta: dict, body: str) -> str:
             lines.append(f"inputs: [{', '.join(str(i) for i in items)}]")
         else:
             lines.append(f"{key}: {value}")
+    # 工件自己的附加字段（如评审报告的 review_type）跟在固定键之后
+    for key, value in meta.items():
+        if key not in _META_KEYS and value is not None:
+            lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines) + "\n\n" + body.strip() + "\n"
 
@@ -112,7 +116,9 @@ def read_artifact(run_id: str, kind: str) -> str | None:
 
 
 def write_artifact(run_id: str, kind: str, body: str, *, created_by: str | None = None,
-                   inputs: list[str] | None = None, status: str = "draft") -> dict:
+                   inputs: list[str] | None = None, status: str = "draft",
+                   extra_meta: dict | None = None) -> dict:
+    """写一个新版本。extra_meta 是工件自己的附加字段，写进 front-matter，不能覆盖固定的六个键。"""
     if kind not in ARTIFACT_KINDS:
         raise ValueError(f"未知工件类型：{kind}")
     with session_scope() as s:
@@ -139,6 +145,7 @@ def write_artifact(run_id: str, kind: str, body: str, *, created_by: str | None 
             "inputs": inputs or [],
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+        meta.update({key: value for key, value in (extra_meta or {}).items() if key not in meta})
         text = render_front_matter(meta, body)
         directory = artifacts_dir(run_id)
         versioned = directory / f"{kind}.v{version}.md"
