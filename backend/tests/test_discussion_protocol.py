@@ -1,6 +1,9 @@
 """讨论协议：人工确认点、程序结算、停滞退让、主持人裁决、复议、复核、断点续跑。"""
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 from collections import Counter
 
 import pytest
@@ -12,12 +15,15 @@ from app.db.base import init_db, session_scope
 from app.db.models import AgentTemplate, Gate, Node, Run, Workflow
 from app.engine.events import load_events
 from app.engine.feedback import with_feedback
-from app.engine.gates import get_gate, request_gate
+from app.engine.gates import decide_gate, get_gate, request_gate
+from app.engine.materials import save_material
 from app.engine.params import apply_run_config
-from app.engine.runners import NodeFailure
+from app.engine.runners import NodeContext, NodeFailure
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.main import app
 from app.meeting import store
+from app.meeting.protocols import discussion as discussion_module
+from app.meeting.session import MeetingSession
 from tests.meeting_fakes import drive, install
 
 IDEA = "给小团队做一个反馈收集工具"
@@ -64,6 +70,44 @@ PROPOSAL = (
     "## 关键流程\n\n提交反馈 → 整理 → 导出。\n\n## 里程碑与验收\n\n第一周：收集与导出可用。\n\n"
     "## 风险与缓解\n\n范围蔓延：首版功能冻结。\n")
 PROPOSAL_V2 = "## 修改说明\n\n- D2：按复议结论改为首版需要登录。\n\n" + PROPOSAL
+
+BRIEF_NOQ = '{"brief": "目标：让小团队收集并整理反馈。", "questions": []}'
+BRIEF_TWOQ = ('{"brief": "目标：让小团队收集并整理反馈。", '
+              '"questions": ["需要导出哪些格式？", "谁来维护导出模板？"]}')
+ANSWER_TWOQ = ('{"answers": [{"text": "需要导出周报", "source": "简报：两周内可用"}, '
+               '{"text": "导出模板由团队自行维护", "source": ""}]}')
+ARCHITECT_NEW = ('{"stances": ['
+                 '{"index": "D1", "level": 1, "reason": "网页版部署最简单", "choice": "网页版"}, '
+                 '{"index": "D2", "level": 5, "reason": "首版只有本机使用，登录是多余的门槛", "choice": "不需要"}], '
+                 '"new_points": [{"title": "是否支持离线填写", "question": "断网时能否先记下来", '
+                 '"options": ["支持", "不支持"], "level": 5, '
+                 '"reason": "外勤场景必须离线可用，替代建议是本地缓存"}]}')
+UX_NO_D3 = ('{"stances": ['
+            '{"index": "D1", "level": 2, "reason": "网页版够用，但手机上也要能填", "choice": "网页版"}, '
+            '{"index": "D2", "level": 1, "reason": "多人共用必须区分是谁的反馈", "choice": "需要"}]}')
+SUMMARY_TWO = ('{"summaries": [{"index": "D2", "summary": "架构主张首版不做登录，体验坚持需要。"}, '
+               '{"index": "D3", "summary": "架构师认为外勤必须离线可用，体验没有表态。"}]}')
+REOPEN_WITH_D99 = ('{"points": [{"index": "D2", "title": "", "question": "", "options": []}, '
+                   '{"index": "D99", "title": "账本里没有的点", "question": "", "options": []}], '
+                   '"note": "评审认为登录方案需要复议"}')
+ARCHITECT_RESTANCE = ('{"stances": ['
+                      '{"index": "D2", "level": 1, "reason": "被说服，首版做最简登录", "choice": "需要"}, '
+                      '{"index": "D3", "level": 5, "reason": "外勤必须离线可用"}]}')
+ROSTER_TEMP = ('{"participants": [{"role_key": "", "display_name": "运维顾问", '
+               '"persona": "你关心部署与回滚，升级前必须能一键回滚", "reason": "补部署视角"}]}')
+
+
+def _open_from_ledger(text: str) -> list[str]:
+    """从提示里的账本表格解析出仍未了结的决策点编号（讨论中/复议中）。"""
+    return [index for index, _status in
+            re.findall(r"^\| (D\d+) \| (讨论中|复议中) ", text, re.M)]
+
+
+def _summary_by_ledger(text: str) -> str:
+    """交锋摘要按当前未决点精确覆盖（校验器要求恰好覆盖）。"""
+    rows = [{"index": index, "summary": f"{index} 的分歧摘要"}
+            for index in _open_from_ledger(text)]
+    return json.dumps({"summaries": rows}, ensure_ascii=False)
 
 
 def _split(text: str) -> str:
@@ -769,3 +813,345 @@ def test_metrics_after_a_real_discussion_meeting(monkeypatch) -> None:
     assert metrics["meetings"]["turns"] > 0
     assert metrics["meetings"]["checkpoints"]["human"] == 2    # 澄清与名单都是人答的
     assert metrics["review"]["total"] == 0                     # 讨论会议不产出评审报告
+
+
+# ---------------- S5.5：补齐此前未被测试执行到的分支 ----------------
+def test_structured_output_validators_reject_the_remaining_bad_shapes() -> None:
+    """结构化输出的校验器逐个报错分支：坏的形状都要带着明确原因被拒。"""
+    from app.meeting.protocols.discussion import (_validate_answers, _validate_brief,
+                                                  _validate_check, _validate_reopen,
+                                                  _validate_rulings, _validate_stances,
+                                                  _validate_summaries)
+    from app.meeting.protocols.discussion import _validate_agenda, _validate_position
+
+    assert _validate_brief({"brief": "目标", "questions": ["合法", 5]})
+    assert _validate_brief({"brief": "目标", "questions": "导出格式"})
+    assert _validate_answers(1)({"answers": []})
+    assert _validate_answers(1)({"answers": [{"text": ""}]})
+    assert _validate_position({"must": "单一", "risks": [], "route": "路线"})
+    assert _validate_position({"must": [], "risks": [], "route": "  "})
+    assert _validate_agenda({"points": []})
+    assert _validate_agenda({"points": ["不是对象", {"title": "T", "question": 5}]})
+    assert _validate_stances(["D1"])({"stances": "不是数组"})
+    assert _validate_stances(["D1"])({"stances": []})
+    assert _validate_stances(["D1"])({"stances": ["不是对象"]})
+    assert _validate_stances(["D1"])({"stances": [{"level": 1}]})            # 缺 index
+    assert _validate_stances([])({"stances": [{"index": "D1", "level": 9}]})
+    assert _validate_stances([])({"stances": [{"index": "D1", "level": 2}]})  # 有保留没写顾虑
+    assert _validate_stances([])({"stances": [{"index": "D1", "level": 1}],
+                                  "new_points": ["不是对象"]})
+    assert _validate_stances([])({"stances": [{"index": "D1", "level": 1}],
+                                  "new_points": [{"level": 3}]})             # 缺 title
+    assert _validate_summaries(["D1"])({"summaries": "不是数组"})
+    assert _validate_summaries(["D1"])({"summaries": [{"index": "D9", "summary": "x"}]})
+    assert _validate_rulings(["D1"])({"rulings": "不是数组"})
+    assert _validate_rulings(["D1"])({"rulings": ["不是对象"]})
+    assert _validate_rulings(["D1"])({"rulings": []})
+    assert _validate_rulings(["D1"])({"rulings": [
+        {"index": "D1", "conclusion": "", "rationale": "理由"}]})
+    assert _validate_check({"ok": "是"})
+    assert _validate_check({"ok": False, "issues": []})
+    assert _validate_reopen({"points": []})
+    assert _validate_reopen({"points": ["不是对象", {"index": 5}, {"title": 6}, {"options": 3}]})
+    assert _validate_reopen({"points": [{"question": "只有问题"}]})
+
+
+def test_roster_validator_rejects_bad_rosters_and_accepts_a_temporary_role() -> None:
+    """名单校验：空表、重复、非对象、不存在的角色、不完整的临时角色都报错。"""
+    from app.meeting.protocols.discussion import _validate_roster
+
+    library = {"architect": {"role_key": "architect", "name": "架构师", "meta": {}}}
+    validator = _validate_roster(library, 2, 2)
+    assert validator({"participants": "不是数组"})
+    assert validator({"participants": []})
+    assert validator({"participants": [{"role_key": "architect"}, {"role_key": "architect"}]})
+    assert validator({"participants": ["不是对象", {"role_key": "architect"},
+                                      {"role_key": "ghost"}]})
+    assert validator({"participants": [{"display_name": "只有名字，没有 persona"}]})
+    assert _validate_roster(library, 1, 1)({"participants": [
+        {"role_key": "", "display_name": "只有名字"}]}) == [
+        "临时角色必须同时给出 display_name 与 persona"]
+    ranged = _validate_roster(library, 2, 5)
+    assert ranged({"participants": [{"role_key": "architect"}]})      # 人数不在 2 到 5 之间
+    assert not _validate_roster(library, 2, 2)({"participants": [
+        {"role_key": "", "display_name": "运维顾问", "persona": "你关心部署与回滚"},
+        {"role_key": "architect", "reason": "把握技术路线"}]})
+
+
+def test_a_new_point_raised_in_a_stance_enters_the_ledger(monkeypatch) -> None:
+    """表态里补提的决策点当场入账：提出者、候选项、表态等级都记进账本，随后照常交锋。"""
+    def architect_stance(text: str) -> str:
+        return ARCHITECT_NEW if "架构视角" in text else UX_NO_D3
+
+    def architect_restance(text: str) -> str:
+        return ARCHITECT_RESTANCE if "架构视角" in text else UX
+
+    install(monkeypatch, _replies(
+        stance=architect_stance, restance=architect_restance,
+        exchange_summary=_summary_by_ledger))
+    run_id, node_id = _meeting_run()
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True and result["decision_points"] == 3
+    ledger = _ledger(node_id)
+    assert ledger["D3"]["raised_by"] == "架构师"
+    assert ledger["D3"]["options"] == ["支持", "不支持"]
+    architect = next(stance for stance in ledger["D3"]["stances"].values()
+                     if stance["name"] == "架构师")
+    assert architect["level"] == 5
+    assert ledger["D3"]["origin_round"] == 1            # 第 1 轮表态时当场入账
+    assert ledger["D3"]["status"] == "deferred"          # 只有一人表态，直到最后也没谈拢
+    assert ledger["D2"]["status"] == "agreed"
+
+
+def test_a_temporary_role_proposed_by_the_facilitator_can_sit_in_the_meeting(
+        monkeypatch) -> None:
+    """主持人提库里没有的临时角色（display_name + persona）：照常入会，人设作为系统提示。"""
+    install(monkeypatch, _replies(roster=ROSTER_TEMP))
+    run_id, node_id = _meeting_run({"rosters": {"participants": {"count": 1}}})
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    rows = [row for row in store.list_participants(meeting_id) if row["mode"] == "participant"]
+    assert [(row["role_key"], row["display_name"], row["system_prompt"]) for row in rows] == [
+        (None, "运维顾问", "你关心部署与回滚，升级前必须能一键回滚")]
+    assert "- 运维顾问（参会者）：你关心部署与回滚" in _charter(node_id)["参会名单"]
+
+
+def test_feedback_at_the_roster_stage_is_recorded_and_not_lost(monkeypatch) -> None:
+    """名单阶段的反馈：记成一条用户发言和名单意见，名单照常确认，不跳复议也不重挑。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run()
+    first = _run_once(run_id, node_id)
+    assert first["checkpoint"]["kind"] == "clarify"
+    decide_gate(gate_id=first["checkpoint"]["id"], action="approve",
+                data={"answers": ["Markdown 即可"]})
+    second = _run_once(run_id, node_id)
+    assert second["checkpoint"]["kind"] == "roster"
+    _set_feedback(node_id, "补一名安全与合规的视角", "user")
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    feedback_turns = [t for t in store.list_turns(meeting_id) if t["kind"] == "user_feedback"]
+    assert [t["content"] for t in feedback_turns] == ["补一名安全与合规的视角"]
+    assert store.get_state(meeting_id).get("roster_feedback") == "补一名安全与合规的视角"
+    assert Counter(call["kind"] for call in seen)["roster"] == 1   # 名单已有提议：只重新确认
+
+
+def test_a_brief_without_questions_skips_the_clarify_checkpoint(monkeypatch) -> None:
+    """简报没有列出要澄清的问题：澄清确认点不开，章程如实写"没有需要澄清的问题"。"""
+    install(monkeypatch, _replies(brief=BRIEF_NOQ))
+    run_id, node_id = _meeting_run()
+    asked: list[str] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint["kind"])
+        return "approve", {}, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True and asked == ["roster"]
+    assert _charter(node_id)["已澄清的问题"] == "（没有需要澄清的问题）"
+
+
+def test_background_materials_are_read_into_the_brief(monkeypatch) -> None:
+    """运行带了背景材料：会前准备的提示里要有材料一段。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run()
+    save_material(run_id, "竞品笔记", "竞品 X 只做收集不做导出。")
+
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    brief_prompt = next(call["text"] for call in seen if call["kind"] == "brief")
+    assert "## 背景材料" in brief_prompt and "竞品 X 只做收集不做导出" in brief_prompt
+
+
+def test_proxy_answers_are_recorded_with_evidence_or_as_assumptions(monkeypatch) -> None:
+    """需求方代理答澄清：带出处的记为代理回答并留下出处，没有出处的降级为假设。"""
+    install(monkeypatch, _replies(brief=BRIEF_TWOQ, answer=ANSWER_TWOQ))
+    run_id, node_id = _meeting_run({"automation": {"level": "L3"}})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    clarifications = store.get_state(meeting_id)["clarifications"]
+    assert clarifications[0]["source"] == "proxy"
+    assert clarifications[0]["evidence"] == "简报：两周内可用"
+    assert clarifications[1]["source"] == "assumption"
+    answered = _charter(node_id)["已澄清的问题"]
+    assert "需求方代理，依据背景材料或用户回答" in answered
+    assert "需要导出周报" in answered and "按假设处理" in answered
+
+
+def _bare_meeting(run_id: str, node_id: int, phase: str) -> tuple[int, MeetingSession]:
+    """手工建一场空会议，用来直接驱动协议的单个步骤（不经 run_meeting）。"""
+    meeting_id = store.create_meeting(run_id=run_id, node_id=node_id, node_key="discuss",
+                                      protocol="discussion", charter={"sections": []}, config={})
+    store.update_meeting(meeting_id, phase=phase, round=1)
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        ctx = NodeContext(run_id=run_id, node_id=node_id, node_key=node.node_key, type=node.type,
+                          name=node.name, phase=phase, config=dict(node.config_json or {}),
+                          assignee={}, attempt_id=0, attempt_no=1, feedback=None, idea=IDEA)
+    return meeting_id, MeetingSession(meeting_id=meeting_id, ctx=ctx)
+
+
+def test_resuming_skips_steps_whose_results_are_already_in_state(monkeypatch) -> None:
+    """简报/澄清/名单/议题的结果已写进状态时重入：直接推进，不再调模型。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run()
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "prepare")
+    protocol = discussion_module.DiscussionProtocol()
+
+    store.set_state(mtg.meeting_id, {"brief": "已有简报"})
+    assert asyncio.run(protocol.step_prepare(mtg)).action == "advance"
+    store.set_state(mtg.meeting_id, {"clarifications": [
+        {"question": "q", "answer": "a", "source": "user"}]})
+    assert asyncio.run(protocol.step_clarify(mtg)).action == "advance"
+    store.set_state(mtg.meeting_id, {"roster_done": True})
+    assert asyncio.run(protocol.step_roster(mtg)).action == "advance"
+    store.set_state(mtg.meeting_id, {"agenda_done": True})
+    assert asyncio.run(protocol.step_agenda(mtg)).action == "advance"
+
+    assert seen == []                                   # 四个短路都没有调模型
+
+
+def test_positions_fail_without_participants(monkeypatch) -> None:
+    """名单是空的还推进到立场：带着明确的错误失败，不空转成稿。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "positions")
+
+    with pytest.raises(NodeFailure, match="讨论会议没有参会者"):
+        asyncio.run(discussion_module.DiscussionProtocol().step_positions(mtg))
+
+
+def test_exchange_resumes_without_repeating_the_recorded_claim(monkeypatch) -> None:
+    """交锋的每次发言落盘即记标记：第一条主张之后被中断，重入不再重复它。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    original = discussion_module.speak
+    armed = {"on": True}
+
+    async def flaky(mtg_, participant, **kwargs):
+        result = await original(mtg_, participant, **kwargs)
+        if armed["on"] and kwargs.get("kind") == "challenge":
+            armed["on"] = False                        # 第一条主张已落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return result
+
+    monkeypatch.setattr(discussion_module, "speak", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["claim"] == 3 and kinds["challenge"] == 4 and kinds["respond"] == 4
+
+
+def test_reopen_reuses_the_recorded_plan_and_ignores_unknown_indexes(monkeypatch) -> None:
+    """复议的计划落盘后被中断：重入复用它，不再让主持人重讲；账本里没有的编号不建点。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree), reopen=REOPEN_WITH_D99))
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    _set_feedback(node_id, "评审认为登录方案需要复议", "reroute")
+
+    original = discussion_module.speak
+    armed = {"on": True}
+
+    async def flaky(mtg_, participant, **kwargs):
+        result = await original(mtg_, participant, **kwargs)
+        if armed["on"] and kwargs.get("kind") == "reopen":
+            armed["on"] = False                        # 复议计划刚落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return result
+
+    monkeypatch.setattr(discussion_module, "speak", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    assert Counter(call["kind"] for call in seen)["reopen"] == 0    # 计划复用，不重新调用
+    ledger = _ledger(node_id)
+    assert ledger["D2"]["status"] == "agreed" and ledger["D2"]["closed_round"] == 2
+    assert "D99" not in ledger                                # 账本里没有的编号不计入
+    meeting_id = store.latest_meeting_for_node(node_id)["id"]
+    feedback = [t for t in store.list_turns(meeting_id) if t["kind"] == "user_feedback"]
+    assert [t["content"] for t in feedback] == ["评审认为登录方案需要复议"]  # 反馈发言不重复
+
+
+def test_a_revision_without_change_notes_is_rejected(monkeypatch) -> None:
+    """复议后的成稿是修订版：缺少「## 修改说明」要带着明确的错误失败，方案停在旧版。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)))
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    assert _proposal(run_id)[0]["version"] == 1
+    _set_feedback(node_id, "评审认为登录方案需要复议", "reroute")
+
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree),
+                                  proposal=PROPOSAL, proposal_revise=PROPOSAL))
+    with pytest.raises(NodeFailure, match="修订版缺少"):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert _proposal(run_id)[0]["version"] == 1
+
+
+def test_rounds_max_sends_the_discussion_to_consensus_at_the_limit(monkeypatch) -> None:
+    """轮次到上限仍有未决点：带着 rounds_max 的原因开共识确认点，由人决定怎么办。"""
+    install(monkeypatch, _replies(restance=_split))
+    run_id, node_id = _meeting_run({"params": {"discussion": {"rounds_max": 1}}})
+    asked: list[dict] = []
+
+    def answer(checkpoint: dict) -> tuple:
+        asked.append(checkpoint)
+        if checkpoint["kind"] == "consensus":
+            return "approve", {"option": "integrate"}, ""
+        return "approve", {}, ""
+
+    result = drive(run_id, node_id, answer, idea=IDEA)
+
+    assert result["done"] is True and result["rounds"] == 1
+    consensus = next(item for item in asked if item["kind"] == "consensus")
+    assert consensus["payload"]["reason"] == "rounds_max"
+    assert _ledger(node_id)["D1"]["status"] == "agreed"
+    assert _ledger(node_id)["D2"]["status"] == "deferred"      # 带着分歧整合
+
+
+def test_consensus_falls_back_to_a_reason_from_the_ledger(monkeypatch) -> None:
+    """consensus_reason 丢失（崩溃窗口）时按账本现况兜底：全部了结与仍有未决各走各的。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run({"automation": {"level": "L1"}})
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "consensus")
+    store.upsert_decision_point(meeting_id, "D1", title="已了结的点", question="q",
+                                options_json=[], status="agreed", conclusion="结论")
+    protocol = discussion_module.DiscussionProtocol()
+
+    result = asyncio.run(protocol.step_consensus(mtg))
+
+    assert result.action == "suspend"
+    assert result.checkpoint["title"] == "本轮的决策点已全部了结"        # all_closed 兜底
+
+    store.upsert_decision_point(meeting_id, "D2", title="没谈拢的点", question="q",
+                                options_json=[], status="open")
+    result = asyncio.run(protocol.step_consensus(mtg))
+
+    assert result.checkpoint["payload"]["reason"] == "stall"            # stall 兜底
+    assert "讨论陷入停滞" in result.checkpoint["title"]
