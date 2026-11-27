@@ -28,6 +28,7 @@ TURN_LABELS = {"position": "立场", "stance": "表态", "restance": "重新表�
                "review_intake": "受理意见", "review_brief": "评审准备",
                "review_points": "评审要点", "review": "独立评审", "review_delta": "增量复审",
                "review_merge": "汇总分级", "author_response": "作者回应",
+               "author_response_followup": "作者再回应",
                "review_defend": "意见辩护", "review_rule": "主席定夺",
                "author_revise": "方案修订", "revision_verify": "修订验证",
                "expect": "写预期", "fidelity": "忠实性核对", "quality": "质量评审",

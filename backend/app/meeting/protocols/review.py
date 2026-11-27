@@ -483,7 +483,7 @@ class ReviewProtocol(MeetingProtocol):
                 "rework_pending": False, "awaiting_rework": False,
                 "reviewed_round": None, "verdict": None, "accepted_by_user": False,
                 "summary": None, "blocking": None,
-                "unfixed": [], "discussed": [], "verify_retry_done": False,
+                "unfixed": [], "discussed": [], "defended": [], "verify_retry_done": False,
                 "review_batch": []})
             mtg.reset_builder()
             return
@@ -492,7 +492,8 @@ class ReviewProtocol(MeetingProtocol):
             store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
                 **state, "rework_pending": False, "awaiting_rework": False, "reviewed_round": None,
                 "verdict": None, "accepted_by_user": False, "summary": None, "blocking": None,
-                "unfixed": [], "discussed": [], "verify_retry_done": False, "review_batch": []})
+                "unfixed": [], "discussed": [], "defended": [], "verify_retry_done": False,
+                "review_batch": []})
             mtg.reset_builder()
 
     # ---------- 受理 ----------
@@ -735,7 +736,9 @@ class ReviewProtocol(MeetingProtocol):
             questions = [question for rows in asked.values() for question in rows]
             listing = "\n".join(f"{number}. {question}"
                                  for number, question in enumerate(questions, start=1))
-            answers = (await speak(
+            found = store.find_turn(mtg.meeting_id, phase="respond", round=_flow(mtg),
+                                    kind="answer", speaker_id=proxy["id"])
+            answers = found["data"]["answers"] if found else (await speak(
                 mtg, proxy, kind="answer", turn_kind="answer",
                 segments=[Segment("append", f"## 待澄清的问题\n{listing}", name="问题")],
                 instruction=ANSWER_INSTRUCTION, structured=_validate_answers(len(questions)),
@@ -750,13 +753,20 @@ class ReviewProtocol(MeetingProtocol):
                 qa_lines.append(f"- {issue_id}：需求方代理的回答——" + "；".join(parts))
             follow_text = "\n".join(qa_lines)
             follow_ids = list(asked)
-            second = await speak(
-                mtg, _author(mtg), kind="author_response", turn_kind="author_response",
-                charter=_charter(mtg),
-                segments=[Segment("append", f"## 需要回应的评审意见\n{follow_text}",
-                                  name="需求方代理的回答")],
-                instruction=AUTHOR_RESPONSE_INSTRUCTION,
-                structured=_validate_responses(follow_ids), turn_round=_flow(mtg))
+            # 再回应与第一次回应同为 author_response 调用，落盘类型分开：
+            # 重入按类型各找各的，不会拿再回应顶替第一次回应，也不重复发言
+            second = store.find_turn(mtg.meeting_id, phase="respond", round=_flow(mtg),
+                                     kind="author_response_followup",
+                                     speaker_id=_author(mtg)["id"])
+            if second is None:
+                second = await speak(
+                    mtg, _author(mtg), kind="author_response",
+                    turn_kind="author_response_followup",
+                    charter=_charter(mtg),
+                    segments=[Segment("append", f"## 需要回应的评审意见\n{follow_text}",
+                                      name="需求方代理的回答")],
+                    instruction=AUTHOR_RESPONSE_INSTRUCTION,
+                    structured=_validate_responses(follow_ids), turn_round=_flow(mtg))
             by_id = {str(row["id"]): row for row in second["data"]["responses"]}
             for issue_id in follow_ids:
                 row = by_id.get(issue_id) or {}
@@ -788,7 +798,10 @@ class ReviewProtocol(MeetingProtocol):
         if not targets:
             _patch_round(mtg, "discuss")
             return advance("verdict")
+        defended = set(mtg.state().get("defended") or [])
         for issue in targets:
+            if issue["id"] in defended:                   # 已辩护过的意见重入时跳过
+                continue
             speaker = _speaker_for(mtg, issue)
             if speaker is None:
                 continue
@@ -800,6 +813,9 @@ class ReviewProtocol(MeetingProtocol):
                                   f"执笔者的回应：{issue.get('response') or '未采纳'}",
                                   name="意见")],
                 instruction=REVIEW_DEFEND_INSTRUCTION, turn_round=_flow(mtg))
+            # 每条发言落盘后立刻记下：崩溃重入时不再为它重复发言（讨论协议交锋的记法）
+            defended |= {issue["id"]}
+            mtg.set_state(defended=sorted(defended))
         ids = [issue["id"] for issue in targets]
         listing = "\n".join(f"- {issue['id']}：{issue['problem']}；执笔者回应："
                             f"{issue.get('response') or '未采纳'}" for issue in targets)

@@ -287,6 +287,45 @@ def test_chair_rulings_are_reused_after_a_crash(monkeypatch) -> None:
     assert store.get_state(mtg.meeting_id)["issues"][0]["disposition"] == "主席定夺：成立"
 
 
+def test_defends_are_not_repeated_after_a_crash(monkeypatch) -> None:
+    """两条意见各由一名评审者辩护：第一条落盘后被中断，重入不再为它重复调用模型。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        review_rule=lambda text: _rule(text, keep=True),
+        review_defend="这条意见成立：不改会阻塞评审。"), seen)
+    run_id, node_id = _review_run()
+    issues = [
+        {**ISSUE, "id": "I1", "accepted": False, "disputed": True},
+        {**ISSUE, "id": "I2", "accepted": False, "disputed": True,
+         "raised_by": ["测试与质量"], "problem": "验收标准不可核对"},
+    ]
+    mtg = _review_session(run_id, node_id, phase="discuss", state={"issues": issues})
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试与质量",
+                          mode="reviewer", system_prompt="你是评审者")
+    protocol = review_module.ReviewProtocol()
+    original = review_module.speak
+    armed = {"on": True}
+
+    async def flaky(mtg_, participant, **kwargs):
+        texts = "".join(getattr(segment, "text", "") for segment in kwargs.get("segments") or [])
+        if armed["on"] and kwargs.get("kind") == "review_defend" and "I2" in texts:
+            armed["on"] = False                        # 第一条发言与标记都已落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original(mtg_, participant, **kwargs)
+
+    monkeypatch.setattr(review_module, "speak", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_discuss(mtg))
+    asyncio.run(protocol.step_discuss(mtg))
+
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["review_defend"] == 2                 # 每条意见恰好一次，重入从第二条继续
+    assert kinds["review_rule"] == 1
+    state = store.get_state(mtg.meeting_id)
+    assert [row["disposition"] for row in state["issues"]] == ["主席定夺：成立"] * 2
+    assert sorted(state["discussed"]) == ["I1", "I2"]
+
+
 def test_wording_issues_are_revised_and_verified(monkeypatch) -> None:
     seen: list[dict] = []
     install(monkeypatch, _replies(
@@ -539,6 +578,95 @@ def test_author_can_ask_the_requester_proxy(monkeypatch) -> None:
     assert kinds["answer"] == 1 and kinds["author_response"] == 2
     answer_prompts = [call["text"] for call in seen if call["kind"] == "answer"]
     assert all("需求方代理" in text for text in answer_prompts)
+
+
+def _respond_asking_about(text: str, ask_id: str = "I1") -> str:
+    """第一次回应：追问指定的一条意见，其余直接采纳；根据代理回答的再回应不再追问。"""
+    followup = "需求方代理的回答" in text
+    return json.dumps({"responses": [
+        {"id": issue_id, "accepted": True, "reason": "采纳",
+         "ask_requester": [] if followup else (
+             ["为什么要冻结范围？"] if issue_id == ask_id else [])}
+        for issue_id in _ids(text)]}, ensure_ascii=False)
+
+
+def _two_issues() -> list[dict]:
+    return [
+        {**ISSUE, "id": "I1", "accepted": None, "disputed": False},
+        {**ISSUE, "id": "I2", "accepted": None, "disputed": False,
+         "raised_by": ["测试与质量"], "problem": "验收标准不可核对"},
+    ]
+
+
+def test_proxy_answers_are_not_repeated_after_a_crash(monkeypatch) -> None:
+    """代理回答落盘后被中断：重入复用已落盘的回应与回答，不重复发言，意见照常入账。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        author_response=_respond_asking_about,
+        answer='{"answers": [{"text": "范围冻结是第一周的验收前提", "source": ""}]}'), seen)
+    run_id, node_id = _review_run(proxy=True)
+    mtg = _review_session(run_id, node_id, phase="respond", state={"issues": _two_issues()})
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试与质量",
+                          mode="reviewer", system_prompt="你是评审者")
+    store.add_participant(mtg.meeting_id, role_key="requester_proxy", display_name="需求方代理",
+                          mode="proxy", system_prompt="你是需求方代理，只回答事实问题")
+    protocol = review_module.ReviewProtocol()
+    original = review_module.speak
+    armed = {"on": True}
+
+    async def flaky(mtg_, participant, **kwargs):
+        result = await original(mtg_, participant, **kwargs)
+        if armed["on"] and kwargs.get("kind") == "answer":
+            armed["on"] = False                        # 回答刚落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return result
+
+    monkeypatch.setattr(review_module, "speak", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_respond(mtg))
+    asyncio.run(protocol.step_respond(mtg))
+
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["answer"] == 1                        # 重入不再让代理重复回答
+    assert kinds["author_response"] == 2               # 第一次回应与再回应各恰好一次
+    state = store.get_state(mtg.meeting_id)
+    assert all(row["accepted"] is True for row in state["issues"])
+
+
+def test_the_followup_response_is_reused_after_a_crash(monkeypatch) -> None:
+    """再回应落盘、意见还没入账时被中断：重入整步零调用，两条意见照常入账。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        author_response=_respond_asking_about,
+        answer='{"answers": [{"text": "范围冻结是第一周的验收前提", "source": ""}]}'), seen)
+    run_id, node_id = _review_run(proxy=True)
+    mtg = _review_session(run_id, node_id, phase="respond", state={"issues": _two_issues()})
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="测试与质量",
+                          mode="reviewer", system_prompt="你是评审者")
+    store.add_participant(mtg.meeting_id, role_key="requester_proxy", display_name="需求方代理",
+                          mode="proxy", system_prompt="你是需求方代理，只回答事实问题")
+    protocol = review_module.ReviewProtocol()
+    original = review_module.speak
+    armed = {"on": True}
+
+    async def flaky(mtg_, participant, **kwargs):
+        result = await original(mtg_, participant, **kwargs)
+        texts = "".join(getattr(segment, "text", "") for segment in kwargs.get("segments") or [])
+        if armed["on"] and kwargs.get("kind") == "author_response" \
+                and "需求方代理的回答" in texts:
+            armed["on"] = False                        # 再回应刚落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return result
+
+    monkeypatch.setattr(review_module, "speak", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_respond(mtg))
+    calls_before = len(seen)
+    asyncio.run(protocol.step_respond(mtg))
+
+    assert len(seen) == calls_before                   # 重入整步零调用：三段发言全部复用
+    state = store.get_state(mtg.meeting_id)
+    assert all(row["accepted"] is True for row in state["issues"])
 
 
 def test_reviewers_count_in_run_config_limits_the_panel(monkeypatch) -> None:
