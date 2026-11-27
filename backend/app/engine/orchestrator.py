@@ -433,9 +433,9 @@ class Orchestrator:
                                          "feedback_seq": updated["feedback_seq"]},
                                   drop=["retry_at", "retry_count"])
                 reset.append(other["node_key"])
-        # "已回流"的标记在目标节点确实重开之后才写：协议不再提前写，
-        # 这样进程在编排器接受回流之前中断时，重入的协议会重新发起回流而不是空等返工。
-        meeting = store.latest_meeting_for_node(node["id"])
+        # "已回流"的标记在目标节点确实重开之后才写（目标正在运行被跳过时不写）：
+        # 协议不再提前写，这样进程在编排器接受回流之前中断时，重入的协议会重新发起回流而不是空等返工。
+        meeting = store.latest_meeting_for_node(node["id"]) if reset else None
         if meeting is not None:
             store.update_meeting(meeting["id"], state_json={
                 **meeting["state"], "awaiting_rework": True, "rework_pending": True})
