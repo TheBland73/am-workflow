@@ -383,18 +383,21 @@ class ConfirmProtocol(MeetingProtocol):
             speaker = "评审意见" if state.get("feedback_kind") == "reroute" else "用户"
             store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
                            speaker_name=speaker, kind="user_feedback", content=text)
-            # 轮次、反馈的移交与上一轮清单一次写完：中途崩溃不会重复加轮
+            # 轮次、反馈的移交与滞留标记、旧报告字段的清理一次写完：中途崩溃不会重复加轮
             store.update_meeting(mtg.meeting_id, round=flow, phase="intake", state_json={
                 **state, "reopen_feedback": "", "intake_feedback": text,
                 "last_items": list(state.get("items") or []),
-                "verdict": None, "accepted_by_user": False, "awaiting_rework": False})
+                "rework_pending": False, "awaiting_rework": False,
+                "verdict": None, "accepted_by_user": False,
+                "summary": None, "blocking": None})
             mtg.reset_builder()
             return
         if state.get("rework_pending"):
             flow = _flow(mtg) + 1
             store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
                 **state, "rework_pending": False, "verdict": None,
-                "accepted_by_user": False, "awaiting_rework": False})
+                "accepted_by_user": False, "awaiting_rework": False,
+                "summary": None, "blocking": None})
             mtg.reset_builder()
 
     # ---------- 受理 ----------

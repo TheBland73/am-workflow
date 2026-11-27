@@ -16,10 +16,12 @@ from app.engine.events import load_events
 from app.engine.feedback import with_feedback
 from app.engine.orchestrator import orchestrator
 from app.engine.params import apply_run_config
-from app.engine.runners import NodeFailure
+from app.engine.runners import NodeContext, NodeFailure
 from app.engine.templates import instantiate_nodes, seed_defaults, workflow_definition
 from app.main import app
 from app.meeting import store
+from app.meeting.protocols import confirm as confirm_module
+from app.meeting.session import MeetingSession
 from tests.meeting_fakes import drive, install
 
 IDEA = "给小团队做一个反馈收集工具"
@@ -182,6 +184,20 @@ def _confirm_run(config: dict | None = None, *, spec: str = SPEC,
 
 def _never(checkpoint: dict) -> tuple:
     raise AssertionError(f"不该出现人工确认点：{checkpoint['title']}")
+
+
+def _confirm_session(run_id: str, node_id: int, *, phase: str, state: dict) -> MeetingSession:
+    """直接建一场确认会议与它的会话，用来单独驱动某个步骤（不经 run_meeting）。"""
+    meeting_id = store.create_meeting(run_id=run_id, node_id=node_id, node_key="confirm",
+                                      protocol="confirm", charter={}, config={})
+    store.update_meeting(meeting_id, phase=phase, round=1)
+    store.set_state(meeting_id, dict(state))
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        ctx = NodeContext(run_id=run_id, node_id=node_id, node_key="confirm", type="MEETING",
+                          name="需求确认会议", phase=phase, config=dict(node.config_json or {}),
+                          assignee={}, attempt_id=0, attempt_no=1)
+    return MeetingSession(meeting_id=meeting_id, ctx=ctx)
 
 
 def _meeting(node_id: int) -> dict:
@@ -440,3 +456,35 @@ def test_user_rejection_becomes_a_checklist_item_and_reroutes(monkeypatch) -> No
     rounds = [e["payload"]["round"] for e in load_events(run_id)
               if e["type"] == "review_round_started"]
     assert rounds == [1, 2]
+
+
+def test_reopen_branch_clears_stale_reroute_mark_and_last_report_fields() -> None:
+    """用户带反馈重开：滞留的回流标记与旧报告的摘要、阻塞数一并清掉。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="verdict", state={
+        "pending_feedback": "R1 的验收标准写得不清楚",
+        "rework_pending": True, "awaiting_rework": True,
+        "verdict": "fail", "summary": "需求确认会议完成：结论 不通过", "blocking": 3,
+        "minutes_version": 1})
+
+    asyncio.run(confirm_module.ConfirmProtocol().on_enter(mtg))
+
+    state = store.get_state(mtg.meeting_id)
+    assert state["intake_feedback"] == "R1 的验收标准写得不清楚"   # 反馈已移交给受理步
+    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["summary"] is None and state["blocking"] is None
+
+
+def test_rework_branch_clears_last_report_fields() -> None:
+    """从等待返工恢复：回流标记照旧清掉，旧报告的摘要与阻塞数也一并清掉。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="verdict", state={
+        "rework_pending": True, "awaiting_rework": True,
+        "verdict": "fail", "summary": "需求确认会议完成：结论 不通过", "blocking": 3,
+        "minutes_version": 1})
+
+    asyncio.run(confirm_module.ConfirmProtocol().on_enter(mtg))
+
+    state = store.get_state(mtg.meeting_id)
+    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["summary"] is None and state["blocking"] is None

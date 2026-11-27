@@ -383,6 +383,43 @@ def test_reroute_is_reissued_after_an_interruption_before_the_orchestrator_accep
     kinds = Counter(call["kind"] for call in seen)
     # 裁决是程序判定的：重入只重发指令，不重跑评审、汇总与回应
     assert kinds["review"] == 2 and kinds["review_merge"] == 1 and kinds["author_response"] == 1
+    # 重算裁决不重复发事件；重发的是同一条回流意见
+    verdicts = [e["payload"]["round"] for e in load_events(run_id)
+                if e["type"] == "review_verdict"]
+    assert verdicts == [1]
+    assert "按账本的结论改写" in second["reroute"]["feedback"]
+
+
+def test_reopen_branch_clears_stale_reroute_marks_and_last_report_fields() -> None:
+    """用户带反馈重开：上一轮滞留的回流标记与旧报告的摘要、阻塞数一并清掉。"""
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="verdict", state={
+        "pending_feedback": "范围还是不清楚",
+        "rework_pending": True, "awaiting_rework": True,
+        "verdict": "conditional", "summary": "评审会议完成：结论 接受", "blocking": 2,
+        "minutes_version": 1})
+
+    asyncio.run(review_module.ReviewProtocol().on_enter(mtg))
+
+    state = store.get_state(mtg.meeting_id)
+    assert state["intake_feedback"] == "范围还是不清楚"     # 反馈已移交给受理步
+    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["summary"] is None and state["blocking"] is None
+
+
+def test_rework_branch_clears_last_report_fields() -> None:
+    """从等待返工恢复：回流标记照旧清掉，旧报告的摘要与阻塞数也一并清掉。"""
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="verdict", state={
+        "rework_pending": True, "awaiting_rework": True,
+        "verdict": "conditional", "summary": "评审会议完成：结论 接受", "blocking": 2,
+        "minutes_version": 1})
+
+    asyncio.run(review_module.ReviewProtocol().on_enter(mtg))
+
+    state = store.get_state(mtg.meeting_id)
+    assert state["rework_pending"] is False and state["awaiting_rework"] is False
+    assert state["summary"] is None and state["blocking"] is None
 
 
 def test_chair_keeps_a_rejected_issue(monkeypatch) -> None:
