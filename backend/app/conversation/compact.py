@@ -150,8 +150,6 @@ async def compact_messages(messages: list[Message], *, summarize: Summarizer,
     # 这样的工具结果一并交给摘要。
     while cut < len(rest) and rest[cut].role == "tool":
         cut += 1
-    if cut <= 0:
-        return messages, before, before
     if cut == 1 and rest[0].role == "user" and (rest[0].content or "").startswith(SUMMARY_PREFIX):
         # 可压的只剩上一版摘要：再压一次只是把摘要摘要一遍，白花一次调用
         return messages, before, before
