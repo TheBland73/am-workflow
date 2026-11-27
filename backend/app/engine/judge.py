@@ -17,7 +17,7 @@ from app.engine.events import emit
 from app.engine.gates import request_gate
 from app.engine.params import decider_for, definition_of, effective_params, run_of
 from app.meeting.prompts import call_tag
-from app.models.budget import estimate_tokens, truncate_to_tokens
+from app.models.budget import ContextBudget, estimate_tokens, truncate_to_tokens
 from app.models.pool import ModelInfo, pool
 
 # 模型名 → 家族。认不出的家族就是模型名本身（详设 §5.3）。
@@ -255,21 +255,37 @@ async def _write_points(run_id: str, node: dict, attempt_id: int, model: ModelIn
     return points, result.content
 
 
+def artifact_budget(model: ModelInfo, fixed_tokens: int) -> int:
+    """判定调用里分给被审工件的 token 上限。
+
+    可用窗口减去系统提示、判据、核对要点、上游结论与指令之后剩下的部分：大窗口模型
+    不必再按固定的 6000 token 截断，小窗口模型也不会被塞进比整个输入预算还大的工件。
+    """
+    input_budget = ContextBudget(model.context_window, model.max_output_tokens).input_budget
+    return max(1000, input_budget - max(0, int(fixed_tokens)) - 200)
+
+
 async def _verdict(run_id: str, node: dict, attempt_id: int, model: ModelInfo,
                    config: dict, *, rubric: str, points: list[str],
                    points_raw: str) -> tuple[dict, str] | None:
     artifact_kind = str(config.get("artifact") or "")
-    artifact_text = (_artifact_excerpt(run_id, artifact_kind) if artifact_kind
-                     else "（这个确认点没有配置被审工件）")
     upstream = _upstream_text(run_id, node) or "（上游没有会议结论）"
+    head = [f"## 判据\n{rubric}",
+            "## 你写下的核对要点\n" + ("\n".join(f"- {item}" for item in points)
+                                         or points_raw.strip() or "（没有写要点）")]
+    tail = [f"## 上游会议的结论\n{upstream}",
+            GATE_VERDICT_INSTRUCTION, call_tag("gate_verdict")]
+    fixed = (estimate_tokens(_judge_system()) + estimate_tokens("\n\n".join(head + tail))
+             + estimate_tokens(f"## 被审工件（{artifact_kind or '无'}）\n"))
+    artifact_text = (_artifact_excerpt(run_id, artifact_kind, artifact_budget(model, fixed))
+                     if artifact_kind else "（这个确认点没有配置被审工件）")
     prompt = "\n\n".join([
-        f"## 判据\n{rubric}",
-        "## 你写下的核对要点\n" + ("\n".join(f"- {item}" for item in points)
-                                     or points_raw.strip() or "（没有写要点）"),
+        head[0],
+        head[1],
         f"## 被审工件（{artifact_kind or '无'}）\n{artifact_text}",
-        f"## 上游会议的结论\n{upstream}",
-        GATE_VERDICT_INSTRUCTION,
-        call_tag("gate_verdict"),
+        tail[0],
+        tail[1],
+        tail[2],
     ])
     result = await run_agent(
         run_id=run_id, node_id=node["id"], attempt_id=attempt_id, model=model,

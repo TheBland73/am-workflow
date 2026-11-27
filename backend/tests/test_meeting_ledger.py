@@ -86,6 +86,20 @@ def test_charter_segments_keep_materials_in_their_own_capped_segment() -> None:
     assert render.charter_segments(charter)[1].text == segments[1].text     # 同样的输入，同样的文本
 
 
+def test_charter_and_materials_caps_grow_with_the_model_budget() -> None:
+    """固定 8000/6000 的上限会把真实模型装得下的方案与规格截掉：给定预算时按比例放大。"""
+    body = "## 需求\n" + "字" * 20_000
+    charter = {"title": "需求确认会议章程",
+               "sections": [{"title": "需求规格（当前版本）", "text": body}],
+               "materials": "### 材料\n" + "字" * 20_000}
+    default = render.charter_segments(charter)
+    roomy = render.charter_segments(charter, input_budget=200_000)
+    assert "（已按上下文预算截断）" in default[0].text
+    assert roomy[0].text.count("字") == 20_000                 # 大窗口下规格全文保留
+    assert len(default[1].text) < len(roomy[1].text)
+    assert roomy[1].text.count("字") == 20_000
+
+
 def test_ledger_degrades_in_steps_when_over_budget() -> None:
     closed = _point("D1", {1: SUPPORT, 2: SUPPORT}, status="agreed")
     closed.update(conclusion="选甲", rationale="很长" * 2000, exchange_summary="很长" * 2000)

@@ -46,6 +46,18 @@ def parse_structured(content: str, validator: Validator | None = None) -> dict:
     return data
 
 
+def meeting_input_budget(mtg: MeetingSession, default: int = 32_000) -> int:
+    """这场会议里最小的可用输入预算：章程按它截，保证每个参会者都装得下同一份章程。"""
+    budgets: list[int] = []
+    for participant in mtg.participants():
+        try:
+            model = _model_for(participant)
+        except NodeFailure:
+            continue
+        budgets.append(ContextBudget(model.context_window, model.max_output_tokens).input_budget)
+    return min(budgets) if budgets else default
+
+
 def _model_for(participant: dict):
     """先取参会者绑定的模型，再取角色默认模型，再退到主持人的模型。"""
     model = None
@@ -287,7 +299,8 @@ async def drain_interventions(mtg: MeetingSession) -> bool:
         text = "\n".join(f"- {item['content']}" for item in queued)
         from app.meeting import render  # 延迟导入：避免与 render → rules 的导入顺序纠缠
 
-        charter = render.charter_segments(mtg.meeting().get("charter") or {})
+        charter = render.charter_segments(mtg.meeting().get("charter") or {},
+                                          input_budget=meeting_input_budget(mtg))
         ledger = render.ledger_segment(store.list_decision_points(mtg.meeting_id),
                                        round_no=mtg.meeting_round())
         await speak(mtg, facilitator, kind="intervention_ack", turn_kind="facilitator_note",

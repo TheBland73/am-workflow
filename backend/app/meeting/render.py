@@ -12,9 +12,11 @@ from app.conversation.builder import Segment, capped
 from app.meeting.rules import CLOSED_STATUSES, LEVEL_NAMES, OPEN_STATUSES
 from app.models.budget import estimate_tokens
 
-MATERIALS_LIMIT = 6000       # 背景材料段的 token 上限
-CHARTER_LIMIT = 8000         # 章程正文段的 token 上限
+MATERIALS_LIMIT = 6000       # 背景材料段的 token 上限（没有给模型预算时的下限）
+CHARTER_LIMIT = 8000         # 章程正文段的 token 上限（没有给模型预算时的下限）
 LEDGER_LIMIT = 4000          # 账本快照段的 token 上限
+_CHARTER_SHARE = 0.50        # 给了模型预算时，章程至多占可用窗口的这一份
+_MATERIALS_SHARE = 0.25      # 背景材料至多占可用窗口的这一份
 
 STATUS_NAMES = {"open": "讨论中", "reopened": "复议中", "agreed": "已一致",
                 "ruled": "主持人裁决", "deferred": "待定"}
@@ -38,17 +40,31 @@ def _cell(value) -> str:
     return (text.replace("|", "/").replace("\n", " ").strip()) or "—"
 
 
-def charter_segments(charter: dict) -> list[Segment]:
-    """会议章程：正文一段，背景材料另有上限的一段。都是冻结段，名字固定。"""
+def _caps(input_budget: int | None) -> tuple[int, int]:
+    """(章程上限, 背景材料上限)。给了模型预算时按比例放大，但不会低于原来的固定下限。"""
+    if input_budget is None:
+        return CHARTER_LIMIT, MATERIALS_LIMIT
+    budget = max(0, int(input_budget))
+    return (max(CHARTER_LIMIT, int(budget * _CHARTER_SHARE)),
+            max(MATERIALS_LIMIT, int(budget * _MATERIALS_SHARE)))
+
+
+def charter_segments(charter: dict, *, input_budget: int | None = None) -> list[Segment]:
+    """会议章程：正文一段，背景材料另有上限的一段。都是冻结段，名字固定。
+
+    input_budget 是这场会议里最小的可用窗口：大窗口下把规格、方案与背景材料放进全文，
+    而不是一律截到 8000/6000 个 token。
+    """
+    charter_limit, materials_limit = _caps(input_budget)
     parts = [f"## {charter.get('title') or '会议章程'}"]
     for section in charter.get("sections") or []:
         parts.append(f"### {section['title']}\n{section.get('text') or ''}".rstrip())
-    segments = [Segment("frozen", capped("\n\n".join(parts) + "\n", CHARTER_LIMIT),
-                        name="章程", limit=CHARTER_LIMIT)]
+    segments = [Segment("frozen", capped("\n\n".join(parts) + "\n", charter_limit),
+                        name="章程", limit=charter_limit)]
     materials = str(charter.get("materials") or "")
     if materials:
-        segments.append(Segment("frozen", capped(materials, MATERIALS_LIMIT),
-                                name="背景材料", limit=MATERIALS_LIMIT))
+        segments.append(Segment("frozen", capped(materials, materials_limit),
+                                name="背景材料", limit=materials_limit))
     return segments
 
 

@@ -27,7 +27,7 @@ from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, review_rules, store
-from app.meeting.calls import speak, speak_many
+from app.meeting.calls import meeting_input_budget, speak, speak_many
 from app.meeting.protocols.base import (MeetingProtocol, advance, done, register_protocol,
                                         reroute_or_escalate)
 
@@ -350,7 +350,8 @@ def _charter_dict(mtg, *, include_proposal: bool = True) -> dict:
 
 
 def _charter(mtg, *, include_proposal: bool = True) -> list[Segment]:
-    return render.charter_segments(_charter_dict(mtg, include_proposal=include_proposal))
+    return render.charter_segments(_charter_dict(mtg, include_proposal=include_proposal),
+                                   input_budget=meeting_input_budget(mtg))
 
 
 def _idea_segments(mtg) -> list[Segment]:

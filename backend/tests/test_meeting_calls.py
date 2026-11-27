@@ -166,6 +166,32 @@ def test_turn_round_is_recorded_on_the_turn(monkeypatch) -> None:
     assert store.list_turns(mtg.meeting_id)[0]["round"] == 7
 
 
+def test_meeting_input_budget_takes_the_smallest_participant(monkeypatch) -> None:
+    """章程按会议里最小的可用窗口截：每个参会者都要装得下同一份章程。"""
+    from app.models.budget import ContextBudget
+
+    mtg, _ = _meeting()
+    small = SimpleNamespace(context_window=8192, max_output_tokens=1024)
+    big = SimpleNamespace(context_window=128_000, max_output_tokens=8192)
+    monkeypatch.setattr(calls, "_model_for",
+                        lambda participant: small if participant["display_name"] == "主持人" else big)
+    assert calls.meeting_input_budget(mtg) == ContextBudget(8192, 1024).input_budget
+
+
+def test_charter_uses_the_meeting_budget_instead_of_fixed_caps(monkeypatch) -> None:
+    from app.meeting.protocols import discussion
+
+    install(monkeypatch, {"position": "立场"})
+    big = SimpleNamespace(id=1, model_name="mock-big", display_name="Mock Big",
+                          context_window=200_000, max_output_tokens=8192, cap_tools=True)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: big)
+    mtg, _ = _meeting()
+    store.update_meeting(mtg.meeting_id, charter_json={
+        "title": "讨论会议章程", "sections": [], "materials": "材料" * 10_000})
+    segments = discussion._charter(mtg)
+    assert segments[1].text.count("材") == 10_000          # 大窗口下背景材料全文保留
+
+
 def test_speak_compacts_old_turns_at_threshold(monkeypatch) -> None:
     """追加区占到阈值：较早的发言先压成摘要再发言。纪要不变，压缩留痕。"""
     seen: list[dict] = []

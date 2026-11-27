@@ -30,7 +30,7 @@ from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, store
-from app.meeting.calls import speak, speak_many
+from app.meeting.calls import meeting_input_budget, speak, speak_many
 from app.meeting.checkpoints import record_auto_decision
 from app.meeting.protocols.base import MeetingProtocol, advance, done, register_protocol, suspend
 from app.meeting.rules import (DEFERRED, LEVEL_NAMES, OPEN_STATUSES, relax, rank_speakers, settle,
@@ -378,7 +378,8 @@ def _rounds_max(mtg) -> int:
 
 
 def _charter(mtg) -> list[Segment]:
-    return render.charter_segments(mtg.meeting()["charter"])
+    return render.charter_segments(mtg.meeting()["charter"],
+                                   input_budget=meeting_input_budget(mtg))
 
 
 def _accounted_points(mtg) -> list[dict]:

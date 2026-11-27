@@ -53,7 +53,8 @@ def _make_run(config: dict | None = None) -> str:
     return run_id
 
 
-def _seed_model(name: str = "mock-fast", *, bind_judge: bool = True) -> int:
+def _seed_model(name: str = "mock-fast", *, bind_judge: bool = True,
+                context_window: int = 32768, max_output_tokens: int = 4096) -> int:
     init_db()
     seed_defaults()
     with session_scope() as s:
@@ -63,7 +64,7 @@ def _seed_model(name: str = "mock-fast", *, bind_judge: bool = True) -> int:
         s.add(provider)
         s.flush()
         model = ModelEntry(provider_id=provider.id, model_name=name, display_name=name,
-                           context_window=32768, max_output_tokens=4096)
+                           context_window=context_window, max_output_tokens=max_output_tokens)
         s.add(model)
         s.flush()
         if bind_judge:
@@ -212,6 +213,42 @@ def test_model_approve_writes_points_then_judges_the_full_artifact(monkeypatch) 
     assert requirement["status"] == "pending" and orchestrator._deps_done(requirement, nodes)
     with session_scope() as s:
         assert s.get(Run, run_id).status == "running"
+
+
+def test_a_large_artifact_is_judged_in_full_when_the_model_window_allows_it(monkeypatch) -> None:
+    # 固定 6000 token 的上限会把大窗口模型装得下的工件截断，"被审工件全文"就成了空话
+    seen: list[dict] = []
+    install(monkeypatch, {"gate_points": POINTS, "gate_verdict": APPROVE}, seen)
+    _no_kick(monkeypatch)
+    _seed_model(context_window=200_000, max_output_tokens=8192)
+    run_id = _make_run({"automation": {"level": "L3"}})
+    _artifact(run_id, "proposal", "# 建设方案\n\n" + "字" * 30_000 + "\nTAIL-MARKER\n")
+    _artifact(run_id, "review", REVIEW_REPORT)
+    _meeting(run_id, "review", "review", state={"verdict": "accept", "precheck_ok": True})
+
+    _run_node(run_id, "gate_review")
+
+    text = seen[1]["text"]
+    assert "TAIL-MARKER" in text
+    assert "工件超出判定预算" not in text
+
+
+def test_a_small_window_truncates_the_artifact_to_the_judge_budget(monkeypatch) -> None:
+    # 窗口只有 4k 时，6000 token 的工件比整个输入预算还大：按模型预算收紧，并显式注明截断
+    seen: list[dict] = []
+    install(monkeypatch, {"gate_points": POINTS, "gate_verdict": APPROVE}, seen)
+    _no_kick(monkeypatch)
+    _seed_model(context_window=4096, max_output_tokens=1024)
+    run_id = _make_run({"automation": {"level": "L3"}})
+    _artifact(run_id, "proposal", "# 建设方案\n\n" + "字" * 4000 + "\nTAIL-MARKER\n")
+    _artifact(run_id, "review", REVIEW_REPORT)
+    _meeting(run_id, "review", "review", state={"verdict": "accept", "precheck_ok": True})
+
+    _run_node(run_id, "gate_review")
+
+    text = seen[1]["text"]
+    assert "TAIL-MARKER" not in text
+    assert "工件超出判定预算" in text
 
 
 def test_model_reject_resets_the_target_and_counts(monkeypatch) -> None:

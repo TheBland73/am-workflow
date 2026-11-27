@@ -23,7 +23,7 @@ from app.engine.events import emit
 from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_template
 from app.meeting import confirm_rules, minutes, render, review_rules, store
-from app.meeting.calls import speak, speak_many
+from app.meeting.calls import meeting_input_budget, speak, speak_many
 from app.meeting.protocols.base import (MeetingProtocol, advance, done, register_protocol,
                                         reroute_or_escalate)
 
@@ -304,7 +304,8 @@ def _charter_dict(mtg, *, include_spec: bool = True) -> dict:
 
 
 def _charter(mtg, *, include_spec: bool = True) -> list[Segment]:
-    return render.charter_segments(_charter_dict(mtg, include_spec=include_spec))
+    return render.charter_segments(_charter_dict(mtg, include_spec=include_spec),
+                                   input_budget=meeting_input_budget(mtg))
 
 
 # ---------------- 程序生成的清单 ----------------
