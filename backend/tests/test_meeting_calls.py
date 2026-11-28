@@ -439,3 +439,43 @@ def test_charter_caps_scale_down_on_a_small_budget() -> None:
 
     charter, materials = _caps(8000)
     assert charter == 4000 and materials == 2000 and charter + materials <= 8000
+
+
+# ---------------- 单次输出上限的截断提示 ----------------
+def _cap_model():
+    """窗口 1600、最大输出 256：输出预留被 15% 窗口压到 240，单次上限仍取 256 下限。"""
+    return SimpleNamespace(id=1, model_name="mock-cap", display_name="Mock Cap",
+                           context_window=1600, max_output_tokens=256, cap_tools=True)
+
+
+def _install_capped_output(monkeypatch, output_tokens: int) -> None:
+    async def fake_run_agent(**kwargs):
+        return SimpleNamespace(content="立场", usage=Usage(100, output_tokens, 0), steps=1,
+                               stopped_by="final")
+
+    monkeypatch.setattr(calls, "run_agent", fake_run_agent)
+    monkeypatch.setattr(calls, "_model_for", lambda participant: _cap_model())
+
+
+def _node_log_payloads(mtg: MeetingSession) -> list[dict]:
+    return [e["payload"] for e in load_events(mtg.run_id) if e["type"] == "node_log"]
+
+
+def test_speak_warns_when_the_output_reaches_the_cap(monkeypatch) -> None:
+    """输出顶到单次上限时提示可能被截断：自由文本（如建设方案）只提示，由人决定调大上限。"""
+    _install_capped_output(monkeypatch, 256)
+    mtg, (_, speaker) = _meeting()
+    _speak(mtg, speaker, segments=[], instruction="请写立场")
+    warnings = [payload for payload in _node_log_payloads(mtg)
+                if payload.get("level") == "warn"]
+    assert any("可能被截断" in payload.get("message", "") for payload in warnings)
+    assert any("【架构】" in payload["message"] and "256 token" in payload["message"]
+               for payload in warnings)
+
+
+def test_speak_does_not_warn_below_the_cap(monkeypatch) -> None:
+    _install_capped_output(monkeypatch, 255)
+    mtg, (_, speaker) = _meeting()
+    _speak(mtg, speaker, segments=[], instruction="请写立场")
+    assert [payload for payload in _node_log_payloads(mtg)
+            if "可能被截断" in payload.get("message", "")] == []

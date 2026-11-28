@@ -103,8 +103,8 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
         params = GenParams(
             model=model.model_name,
             temperature=temperature,
-            # 输出上限与预算里的输出预留对齐：请求给得比预留还多会越窗
-            max_tokens=max(256, min(4096, budget.output_reserve)),
+            # 单次输出上限跟模型配置走：模型的输出上限与窗口 15% 取小，输入预算已为它留位
+            max_tokens=budget.max_output,
         )
         if extra_messages is None and len(messages) > 2 and step >= cooldown_until:
             # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）。

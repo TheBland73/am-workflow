@@ -19,6 +19,7 @@ from app.engine import agent_loop, events
 from app.engine.agent_loop import run_agent
 from app.engine.templates import seed_defaults
 from app.engine.usage import BudgetExceeded
+from app.models.budget import ContextBudget
 from app.models.types import GenParams, Message, ProviderError, StreamEvent, ToolCall, Usage
 from app.tools.registry import Toolbox
 
@@ -350,3 +351,37 @@ def test_record_compaction_failure_does_not_drop_the_compacted_view(monkeypatch)
         toolbox=toolbox, max_steps=6, quiet=True))
     assert result.content == "完成"
     assert any("留痕失败" in message for _level, message in _node_logs("hook-o"))
+
+
+def test_max_output_follows_the_model_output_cap() -> None:
+    """单次输出上限与输出预留同口径：模型配得多就多给，只受窗口 15% 与 256 下限约束。"""
+    assert ContextBudget(128000, 8192).max_output == 8192
+    assert ContextBudget(65536, 8192).max_output == 8192
+    assert ContextBudget(32768, 4096).max_output == 4096
+    assert ContextBudget(8192, 4096).max_output == 1228          # 窗口的 15%
+    assert ContextBudget(1024, 4096).max_output == 256           # 极小窗口取 256 下限
+
+
+def test_run_agent_requests_the_model_max_output(monkeypatch) -> None:
+    """请求的 max_tokens 跟模型配置的最大输出走，不再一律砍到 4096。"""
+    recorded: list[GenParams] = []
+
+    class Adapter:
+        async def stream(self, messages, schemas, params):
+            recorded.append(params)
+            yield StreamEvent(kind="done", message=Message(role="assistant", content="完成"))
+
+    async def slot(provider):
+        return asyncio.Semaphore(1)
+
+    monkeypatch.setattr(agent_loop.pool, "adapter_for", lambda model: Adapter())
+    monkeypatch.setattr(agent_loop.pool, "slot", slot)
+    for run_id, window, output_cap in (("hook-p", 128_000, 8192),
+                                       ("hook-q", 32768, 4096)):
+        node_id, attempt_id = _setup(run_id)
+        model = SimpleNamespace(**{**_MODEL, "context_window": window,
+                                   "max_output_tokens": output_cap, "provider": object()})
+        asyncio.run(run_agent(
+            run_id=run_id, node_id=node_id, attempt_id=attempt_id, model=model,
+            system_prompt="系统", user_prompt="你好", toolbox=None, max_steps=1, quiet=True))
+    assert [params.max_tokens for params in recorded] == [8192, 4096]

@@ -45,6 +45,11 @@ class ContextBudget:
         return min(self.max_output_tokens, int(self.context_window * RESERVE_OUTPUT_RATIO))
 
     @property
+    def max_output(self) -> int:
+        """单次请求的输出上限，与输出预留同一口径；256 的下限保持极小窗口下的现有行为。"""
+        return max(256, self.output_reserve)
+
+    @property
     def input_budget(self) -> int:
         available = self.context_window - self.output_reserve
         # 下限不能超过真实可用窗口：极小窗口下 1024 的下限反而越窗（只剩 256 兜底）

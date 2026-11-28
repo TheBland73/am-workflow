@@ -265,6 +265,7 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
                       name=f"角色人设:{participant.get('id')}")
     segments = [s for s in list(charter or []) + [persona] + list(segments) if s.text.strip()]
     budget = ContextBudget(model.context_window, model.max_output_tokens)
+    cap = budget.max_output
     tail_text = f"{instruction}\n\n{call_tag(kind)}"
     # 尾部预留按这次调用实际指令的长度估算，压缩判断不再用一个粗的固定值
     segments = await _fit(mtg, model, segments, budget.input_budget,
@@ -299,6 +300,12 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
         temperature=temperature, quiet=True,
         token_extra={"turn_id": turn_id, "meeting_id": mtg.meeting_id},
         extra_messages=built.messages[1:])
+    if result.usage.output_tokens >= cap:
+        # 自由文本（如建设方案）被截断时供应商不会报错：只提示，由人决定是否调大上限
+        message = (f"【{speaker_name}】的输出达到单次上限（{cap} token），可能被截断；"
+                   f"需要更长的输出，请在模型设置里调大最大输出")
+        await emit(mtg.run_id, "node_log", mtg.node_id,
+                   {"level": "warn", "message": message[:300]})
     data = parse_structured(result.content, structured) if structured else None
     store.finish_turn(turn_id, content=result.content, structured=data,
                       tokens_in=result.usage.input_tokens, tokens_out=result.usage.output_tokens,
