@@ -26,7 +26,9 @@ def build_system(role_prompt: str, memory: str = "", output_rules: str = "") -> 
 def fit_artifacts(artifacts: list[tuple[str, str]], token_budget: int) -> list[tuple[str, str]]:
     if not artifacts:
         return []
-    per = max(1200, token_budget // len(artifacts))
+    share = max(1, token_budget // len(artifacts))
+    # 单件下限只在总量装得下时生效：件数多时 1200 的下限会无上界地顶穿整段预算
+    per = share if 1200 * len(artifacts) > token_budget else max(1200, share)
     return [(label, truncate_to_tokens(text, per)) for label, text in artifacts]
 
 

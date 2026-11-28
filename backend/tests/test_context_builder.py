@@ -144,3 +144,36 @@ def test_policy_rules() -> None:
     assert validate_context_policy(ContextPolicy()) == []
     assert validate_context_policy(ContextPolicy(compact_at=0.6, compact_to=0.5))
     assert validate_context_policy(ContextPolicy(compact_at=1.2))
+
+
+def test_protected_segments_shrink_last() -> None:
+    """标了 shrinkable=False 的段（会议摘要段）不参与常规缩段：普通追加段先让预算。"""
+    builder = ContextBuilder()
+    summary = Segment("append", "摘" * 3000, name="交锋摘要", shrinkable=False)
+    verbatim = Segment("append", "字" * 3000, name="发言1")
+    built = builder.build([Segment("frozen", "章程", name="章程"), summary, verbatim],
+                          system="系统", input_budget=2000)
+
+    assert built.truncated and built.truncated[0] == "发言1"
+    assert "交锋摘要" in built.truncated          # 摘要段最后才轮到
+
+
+def test_fit_artifacts_never_overruns_the_budget() -> None:
+    """件数多时单件 1200 的下限不再生效：总截断量不超过整段预算。"""
+    from app.engine.context import fit_artifacts
+
+    fitted = fit_artifacts([(f"a{index}", "字" * 4000) for index in range(10)], 8000)
+
+    assert all(estimate_tokens(text) <= 900 for _label, text in fitted)
+
+
+def test_input_budget_never_exceeds_a_tiny_window() -> None:
+    """极小窗口下 1024 的固定下限不再顶穿窗口；正常窗口不受影响。"""
+    from app.models.budget import ContextBudget
+
+    tiny = ContextBudget(1200, 256)
+    assert tiny.input_budget == 1020
+    assert tiny.input_budget + tiny.output_reserve <= 1200
+    normal = ContextBudget(32768, 4096)
+    assert normal.input_budget == 32768 - 4096
+    assert normal.output_reserve == 4096

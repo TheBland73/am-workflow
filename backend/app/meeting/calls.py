@@ -154,12 +154,13 @@ def _assembled(segments: list[Segment], summary: str, kept: list[Segment],
 
 
 async def _fit(mtg: MeetingSession, model, segments: list[Segment],
-               input_budget: int) -> list[Segment]:
+               input_budget: int, tail_reserve: int = _TAIL_RESERVE) -> list[Segment]:
     """追加区占到压缩阈值时，把其中较早的发言压成一条摘要。只改这次发出的视图，不改纪要。
 
     压缩只动追加区：冻结区（章程、人设、账本快照）是前缀缓存命中的部分，本轮内逐字节不变。
     摘要按"会议 + 轮次"存进会议状态：同一轮的并行发言与后续发言直接复用，不重复摘要。
     摘要失败时按原视图继续——压缩只是优化，不该让一次发言作废；预算耗尽是例外。
+    tail_reserve 是这次调用尾部指令的估算占用，由调用方按实际指令文本给出。
     """
     try:
         policy = policy_for_run(mtg.run_id)
@@ -172,7 +173,7 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
         estimate_tokens(s.text) for s in segments if s.kind == "frozen")
     fixed += sum(estimate_tokens(s.text) for s in previous)
     threshold = policy.compact_at * input_budget
-    size = fixed + sum(estimate_tokens(s.text) for s in append) + _TAIL_RESERVE
+    size = fixed + sum(estimate_tokens(s.text) for s in append) + tail_reserve
     if size < threshold:
         return segments
     # 并行发言会同时进来：串行进出，后来者读到刚存下的摘要就直接复用
@@ -183,13 +184,18 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
             base = [Message(role="system", content="系统"),
                     Message(role="user", content=SUMMARY_PREFIX + stored["summary"])]
             base += [Message(role=s.role, content=s.text) for s in append[covered:]]
-            if fixed + estimate_messages(base) + _TAIL_RESERVE < threshold:
+            if fixed + estimate_messages(base) + tail_reserve < threshold:
                 # 摘要 + 尚未覆盖的发言已经装得下：不再调摘要
                 return _assembled(segments, stored["summary"], append[covered:], previous)
         else:
             base = [Message(role="system", content="系统")]
             base += [Message(role=s.role, content=s.text) for s in append]
         stats = CompactionStats()
+        # 分块大小跟着摘要模型的实际预算走：块比摘要器能吃的还大时，
+        # 摘要器入口的兜底截断会把块尾内容砍掉，而 covered_len 仍声称已覆盖
+        summarizer_budget = ContextBudget(model.context_window,
+                                          model.max_output_tokens).input_budget
+        chunk_tokens = max(256, int(summarizer_budget * 0.6) - 512)
 
         async def report_progress(index: int, total: int | None) -> None:
             done = f"/{total}" if total else ""
@@ -199,7 +205,8 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
         try:
             compacted, before, after = await compact_messages(
                 base, summarize=lambda text: _summarize_exchanges(mtg, model, text),
-                input_budget=max(1, input_budget - fixed - _TAIL_RESERVE), policy=policy,
+                input_budget=max(1, input_budget - fixed - tail_reserve), policy=policy,
+                chunk_tokens=chunk_tokens,
                 stats=stats, on_progress=report_progress)
         except BudgetExceeded:
             raise
@@ -222,13 +229,20 @@ async def _fit(mtg: MeetingSession, model, segments: list[Segment],
         mtg.set_state(compaction={
             "round": mtg.meeting_round(), "covered_len": new_covered,
             "prefix_hash": _prefix_hash(append[:new_covered]), "summary": summary})
-        await record_compaction(
-            run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id,
-            scope="meeting", summary=summary, before_tokens=before + fixed,
-            after_tokens=after + fixed, calls=stats.calls,
-            summarized_tokens=stats.summarized_tokens)
+        try:
+            await record_compaction(
+                run_id=mtg.run_id, node_id=mtg.node_id, attempt_id=mtg.ctx.attempt_id,
+                scope="meeting", summary=summary, before_tokens=before + fixed,
+                after_tokens=after + fixed, calls=stats.calls,
+                summarized_tokens=stats.summarized_tokens)
+        except Exception as exc:
+            # 留痕失败不该让这次发言作废：摘要已经进状态，下一次调用照常复用
+            await emit(mtg.run_id, "node_log", mtg.node_id, {
+                "level": "warn", "message": f"压缩留痕失败（摘要照用）：{exc}"[:300]})
+        # 摘要段不参与常规缩段：它是视图里早期内容的唯一载体，被静默截短就是内容丢失
         return ([s for s in segments if s.kind == "frozen"]
-                + [Segment("append", SUMMARY_PREFIX + summary, name="交锋摘要")]
+                + [Segment("append", SUMMARY_PREFIX + summary, name="交锋摘要",
+                           shrinkable=False)]
                 + kept + previous)
 
 
@@ -251,8 +265,11 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
                       name=f"角色人设:{participant.get('id')}")
     segments = [s for s in list(charter or []) + [persona] + list(segments) if s.text.strip()]
     budget = ContextBudget(model.context_window, model.max_output_tokens)
-    segments = await _fit(mtg, model, segments, budget.input_budget)
-    tail = Segment("tail", f"{instruction}\n\n{call_tag(kind)}", name="instruction")
+    tail_text = f"{instruction}\n\n{call_tag(kind)}"
+    # 尾部预留按这次调用实际指令的长度估算，压缩判断不再用一个粗的固定值
+    segments = await _fit(mtg, model, segments, budget.input_budget,
+                          tail_reserve=estimate_tokens(tail_text) + 64)
+    tail = Segment("tail", tail_text, name="instruction")
     built = mtg.builder.build(segments + [tail], system=BASE_SYSTEM_PROMPT,
                               input_budget=budget.input_budget)
     if built.truncated:

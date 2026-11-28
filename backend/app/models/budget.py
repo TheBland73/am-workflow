@@ -40,9 +40,15 @@ class ContextBudget:
     max_output_tokens: int
 
     @property
+    def output_reserve(self) -> int:
+        """给输出留的预算：请求里的 max_tokens 与它对齐，不再各用各的口径。"""
+        return min(self.max_output_tokens, int(self.context_window * RESERVE_OUTPUT_RATIO))
+
+    @property
     def input_budget(self) -> int:
-        reserve = min(self.max_output_tokens, int(self.context_window * RESERVE_OUTPUT_RATIO))
-        return max(1024, self.context_window - reserve)
+        available = self.context_window - self.output_reserve
+        # 下限不能超过真实可用窗口：极小窗口下 1024 的下限反而越窗（只剩 256 兜底）
+        return max(available, 256) if available < 1024 else available
 
     def section(self, name: str) -> int:
         return max(256, int(self.input_budget * SECTION_RATIOS.get(name, 0.05)))

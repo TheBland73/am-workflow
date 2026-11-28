@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from app.config import settings
 from app.conversation.compact import (CompactionStats, make_summarizer, maybe_compact,
                                       summary_of)
-from app.conversation.policy import policy_for_run
+from app.conversation.policy import DEFAULT_POLICY, policy_for_run
 from app.conversation.store import record_compaction
 from app.db.base import session_scope
 from app.db.models import Message as MessageRow
@@ -99,19 +99,23 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
     total = Usage()
     cooldown_until = 0
     for step in range(1, max_steps + 1):
+        budget = ContextBudget(model.context_window, model.max_output_tokens)
         params = GenParams(
             model=model.model_name,
             temperature=temperature,
-            max_tokens=min(4096, model.max_output_tokens or 4096),
+            # 输出上限与预算里的输出预留对齐：请求给得比预留还多会越窗
+            max_tokens=max(256, min(4096, budget.output_reserve)),
         )
         if extra_messages is None and len(messages) > 2 and step >= cooldown_until:
             # 压缩钩子：占用不到阈值时原样返回（此时不会留下任何记录）。
             # 调用方给了现成的消息列表（会议）时跳过：冻结区由调用方自己管理，这里压了会破坏前缀。
             # 摘要失败时按原消息继续——压缩只是优化，不该让已经跑了很久的节点作废、从头重来。
             # 预算耗尽是例外：那是要由人处理的事，照常上抛。
-            policy = policy_for_run(run_id)
-            input_budget = ContextBudget(model.context_window,
-                                         model.max_output_tokens).input_budget
+            try:
+                policy = policy_for_run(run_id)
+            except Exception:
+                policy = DEFAULT_POLICY       # 读策略失败按默认策略压，压缩辅助步骤不杀死节点
+            input_budget = budget.input_budget
             stats = CompactionStats()
 
             async def report_progress(index: int, total: int | None) -> None:
@@ -128,15 +132,23 @@ async def run_agent(*, run_id: str, node_id: int, attempt_id: int, model: ModelI
                 raise
             except Exception as exc:
                 compacted, before_tokens, after_tokens = messages, -1, -1
+                # 摘要失败也进入冷却：供应商对这类请求持续失败时，不必每一步都再试一次
+                cooldown_until = step + _COMPACT_COOLDOWN_STEPS
                 await emit(run_id, "node_log", node_id, {
                     "level": "warn",
                     "message": f"上下文压缩失败，按原内容继续：{exc}"[:300]})
             if compacted is not messages:
-                await record_compaction(
-                    run_id=run_id, node_id=node_id, attempt_id=attempt_id, scope="agent_loop",
-                    summary=summary_of(compacted) or "", before_tokens=before_tokens,
-                    after_tokens=after_tokens, calls=stats.calls,
-                    summarized_tokens=stats.summarized_tokens)
+                try:
+                    await record_compaction(
+                        run_id=run_id, node_id=node_id, attempt_id=attempt_id,
+                        scope="agent_loop", summary=summary_of(compacted) or "",
+                        before_tokens=before_tokens, after_tokens=after_tokens,
+                        calls=stats.calls, summarized_tokens=stats.summarized_tokens)
+                except Exception as exc:
+                    # 留痕失败不该让已经压好的内容丢失：照常换用压缩后的视图
+                    await emit(run_id, "node_log", node_id, {
+                        "level": "warn",
+                        "message": f"压缩留痕失败（照常使用压缩后的内容）：{exc}"[:300]})
                 messages = compacted
                 if after_tokens >= policy.compact_at * max(1, input_budget):
                     # 压不到触发线以下：冷却几轮再试，避免每一步都把最近的消息重新摘要一遍

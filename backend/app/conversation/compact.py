@@ -74,26 +74,27 @@ def _render(messages: list[Message]) -> str:
     return "\n".join(lines)
 
 
-def _chunks(messages: list[Message]) -> list[str]:
-    """把要压缩的消息渲染成按时间顺序排列的若干块，每块不超过 _SUMMARY_CHUNK_TOKENS。
+def _chunks(messages: list[Message], chunk_tokens: int | None = None) -> list[str]:
+    """把要压缩的消息渲染成按时间顺序排列的若干块，每块不超过 chunk_tokens。
 
     分块是为了不丢内容：待压缩的部分常常比一次摘要能处理的量大，而离保留窗口最近的
     那部分最有用，整段截到上限丢掉的恰恰是它。单条消息就超限时（例如一次很大的工具
-    调用）只保留它的开头。
+    调用）只保留它的开头。chunk_tokens 由调用方按摘要模型的实际预算给出；不给时用固定值。
     """
+    cap = max(1, int(chunk_tokens or _SUMMARY_CHUNK_TOKENS))
     chunks: list[str] = []
     current: list[str] = []
     size = 0
     for message in messages:
         text = _render([message])
         cost = estimate_tokens(text)
-        if cost > _SUMMARY_CHUNK_TOKENS:
+        if cost > cap:
             if current:
                 chunks.append("\n".join(current))
                 current, size = [], 0
-            chunks.append(truncate_to_tokens(text, _SUMMARY_CHUNK_TOKENS))
+            chunks.append(truncate_to_tokens(text, cap))
             continue
-        if size + cost > _SUMMARY_CHUNK_TOKENS:
+        if size + cost > cap:
             chunks.append("\n".join(current))
             current, size = [], 0
         current.append(text)
@@ -126,6 +127,7 @@ def _cap(message: Message, cap: int = _RECENT_MESSAGE_CAP) -> Message:
 async def compact_messages(messages: list[Message], *, summarize: Summarizer,
                            input_budget: int, policy: ContextPolicy,
                            max_calls: int | None = None,
+                           chunk_tokens: int | None = None,
                            stats: CompactionStats | None = None,
                            on_progress: ProgressCallback | None = None
                            ) -> tuple[list[Message], int, int]:
@@ -154,7 +156,7 @@ async def compact_messages(messages: list[Message], *, summarize: Summarizer,
         # 可压的只剩上一版摘要：再压一次只是把摘要摘要一遍，白花一次调用
         return messages, before, before
     limit = max(1, int(max_calls if max_calls is not None else MAX_SUMMARY_CALLS))
-    chunks = _chunks(rest[:cut])
+    chunks = _chunks(rest[:cut], chunk_tokens)
     omitted = 0
     if len(chunks) > limit:
         omitted = len(chunks) - limit

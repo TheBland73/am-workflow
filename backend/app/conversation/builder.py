@@ -35,6 +35,7 @@ class Segment:
     name: str = ""               # 冻结段的名字，用于冻结校验
     limit: int | None = None     # 预算不够时这个段允许缩到的基准（估算）。装配器不会主动按它截断，
                                  # 要预先截断请先用 capped()；不给的冻结段永远不会被缩小
+    shrinkable: bool = True      # 常规缩段不碰这个段；只有其它段都缩不动时才轮到它（如会议摘要段）
 
 
 @dataclass
@@ -56,12 +57,14 @@ def _shrink_once(texts: list[str], limits: list[int | None], segments: list[Segm
                  truncated: list[str]) -> bool:
     """把一个段缩小 20%，返回是否缩小了。
 
-    先缩追加段里最长的。追加段都缩到下限仍不够时，才动设了上限的冻结段，
-    从最后一个开始（它排得最靠后，变动它让出的前缀最少）。
+    先缩追加段里最长的（不可缩的段除外）。追加段都缩到下限仍不够时，才动设了上限的冻结段，
+    从最后一个开始（它排得最靠后，变动它让出的前缀最少）。还缩不动时，最后才轮到标了
+    shrinkable=False 的追加段（如会议摘要段——它是早期内容的唯一载体，能保就保）。
     已经缩到下限的段不再动，所以每返回一次 True，总占用都会变小；都缩不动时返回 False。
     """
     best, best_size = -1, 0
     capped_frozen: list[int] = []
+    protected: list[int] = []
     for index, (text, limit) in enumerate(zip(texts, limits)):
         segment = segments[index]
         if segment.kind == "tail":
@@ -70,12 +73,22 @@ def _shrink_once(texts: list[str], limits: list[int | None], segments: list[Segm
             if limit is not None:
                 capped_frozen.append(index)
             continue
+        if not segment.shrinkable:
+            protected.append(index)
+            continue
         size = estimate_tokens(text)
         if size <= _MIN_SEGMENT_TOKENS or size <= best_size:
             continue
         best, best_size = index, size
     if best < 0:
         for index in reversed(capped_frozen):
+            size = estimate_tokens(texts[index])
+            if size > _MIN_SEGMENT_TOKENS:
+                best, best_size = index, size
+                break
+    if best < 0:
+        protected.sort(key=lambda index: estimate_tokens(texts[index]), reverse=True)
+        for index in protected:
             size = estimate_tokens(texts[index])
             if size > _MIN_SEGMENT_TOKENS:
                 best, best_size = index, size

@@ -203,7 +203,11 @@ def _medium_model():
 
 
 def test_parallel_speakers_summarize_the_shared_history_once(monkeypatch) -> None:
-    """同一批并行发言看到的是同一段历史：摘要只做一次，后来者直接用已存下的摘要。"""
+    """同一批并行发言看到的是同一段历史：摘要只做一遍，后来者直接用已存下的摘要。
+
+    历史按摘要模型的实际预算分成 2 块（旧实现按固定 24000 分块、再在摘要器入口静默截尾，
+    只调一次却丢掉块尾内容）；这里顺带断言全部历史都进了摘要，没有被截断丢失。
+    """
     seen: list[dict] = []
     install(monkeypatch, {"position": "立场", "summarize": "较早交锋的摘要"}, seen)
     monkeypatch.setattr(calls, "_model_for", lambda participant: _medium_model())
@@ -219,7 +223,10 @@ def test_parallel_speakers_summarize_the_shared_history_once(monkeypatch) -> Non
     asyncio.run(speak_many(mtg, [{**call, "participant": speaker},
                                  {**call, "participant": other}]))
 
-    assert [item["kind"] for item in seen].count("summarize") == 1
+    assert [item["kind"] for item in seen].count("summarize") == 2
+    summarizer_texts = "".join(item["text"] for item in seen if item["kind"] == "summarize")
+    summarized = 40 - calls.DEFAULT_POLICY.keep_recent
+    assert summarizer_texts.count("字") == summarized * 150   # 压进去的历史没有被静默截断
     stored = store.get_state(mtg.meeting_id)["compaction"]
     assert stored["covered_len"] > 0 and stored["summary"]
 
@@ -234,7 +241,7 @@ def test_the_summary_is_reused_on_the_next_turn(monkeypatch) -> None:
 
     _speak(mtg, speaker, segments=[charter, *old], instruction="请写立场")
     first = [item["kind"] for item in seen].count("summarize")
-    assert first == 1
+    assert first == 2                                 # 历史按摘要模型预算分成 2 块
     assert store.get_state(mtg.meeting_id)["compaction"]["round"] == 1
 
     # 又多了两条发言，但替换成摘要后仍在阈值以下：不再调摘要
@@ -424,3 +431,11 @@ def test_intervention_ack_is_not_repeated_after_a_crash(monkeypatch) -> None:
 
     notes = [t for t in store.list_turns(mtg.meeting_id) if t["kind"] == "facilitator_note"]
     assert len(notes) == 1
+
+
+def test_charter_caps_scale_down_on_a_small_budget() -> None:
+    """小窗口下章程与材料的上限让位：两个固定下限加起来不顶穿整段预算。"""
+    from app.meeting.render import _caps
+
+    charter, materials = _caps(8000)
+    assert charter == 4000 and materials == 2000 and charter + materials <= 8000

@@ -40,11 +40,15 @@ def validate_context_policy(policy: ContextPolicy) -> list[str]:
 _policy_cache: dict[str, tuple[str, ContextPolicy]] = {}
 
 
+_POLICY_CACHE_LIMIT = 512        # 长驻服务 + 大量短运行时防止缓存无限增长
+
+
 def policy_for_run(run_id: str) -> ContextPolicy:
     """运行级配置里的 context 参数 → 策略。
 
     每次读一遍运行配置（短事务），用它的规范化文本判断缓存是否还新鲜：
     配置在别的进程里被改过也能发现；没变时省掉模板定义与参数合并的查询。
+    缓存按先进先出封顶：超出的最老运行条目丢掉。
     """
     import json
 
@@ -57,6 +61,8 @@ def policy_for_run(run_id: str) -> ContextPolicy:
         return cached[1]
     policy = policy_from_config(effective_params(definition_of(run_id), config).get("context"))
     _policy_cache[run_id] = (signature, policy)
+    while len(_policy_cache) > _POLICY_CACHE_LIMIT:
+        _policy_cache.pop(next(iter(_policy_cache)))
     return policy
 
 

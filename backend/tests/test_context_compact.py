@@ -496,3 +496,50 @@ def test_maybe_compact_summarizes_with_the_same_model_when_no_summarizer_is_give
     prompt, older = [item["content"] for item in sent["messages"]]
     assert prompt == compact.SUMMARIZER_PROMPT
     assert older.count("[用户] ") == 3 and older.count("[助手] ") == 3   # 较早的六条都送进了摘要
+
+
+def test_compact_chunk_size_follows_the_caller_budget() -> None:
+    """分块大小按调用方（摘要器）的预算收小：每块都在它装得下的范围内。"""
+    from app.models.types import Message
+
+    calls: list[str] = []
+
+    async def summarize(text: str) -> str:
+        calls.append(text)
+        return "摘要"
+
+    messages = [Message(role="user", content="字" * 400) for _ in range(10)]
+    compacted, _before, _after = asyncio.run(compact_messages(
+        messages, summarize=summarize, input_budget=10_000,
+        policy=ContextPolicy(keep_recent=2), chunk_tokens=900))
+
+    assert len(calls) == 4                         # 每块 2 条（800 token），8 条分 4 块
+    assert compacted is not messages
+
+
+def test_policy_cache_is_capped() -> None:
+    """长驻服务下策略缓存不会无限增长：超过上限时丢最老的条目。"""
+    from app.conversation import policy as policy_module
+    from app.conversation.policy import policy_for_run
+    from app.engine.templates import seed_defaults
+
+    run_id = f"cache-run-{uuid.uuid4().hex[:8]}"
+    init_db()
+    seed_defaults()
+    with session_scope() as s:
+        workflow = s.query(Workflow).filter(Workflow.template_key == "sdlc_v1").one()
+        s.add(Run(id=run_id, workflow_id=workflow.id, status="running"))
+
+    saved = dict(policy_module._policy_cache)
+    try:
+        policy_module._policy_cache.clear()
+        for index in range(policy_module._POLICY_CACHE_LIMIT):
+            policy_module._policy_cache[f"dummy-{index}"] = ("sig", ContextPolicy())
+        policy = policy_for_run(run_id)
+        assert isinstance(policy, ContextPolicy)
+        assert len(policy_module._policy_cache) <= policy_module._POLICY_CACHE_LIMIT
+        assert run_id in policy_module._policy_cache
+        assert "dummy-0" not in policy_module._policy_cache
+    finally:
+        policy_module._policy_cache.clear()
+        policy_module._policy_cache.update(saved)

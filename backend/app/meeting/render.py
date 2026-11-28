@@ -42,12 +42,19 @@ def _cell(value) -> str:
 
 
 def _caps(input_budget: int | None) -> tuple[int, int]:
-    """(章程上限, 背景材料上限)。给了模型预算时按比例放大，但不会低于原来的固定下限。"""
+    """(章程上限, 背景材料上限)。给了模型预算时按比例放大，但不会低于原来的固定下限。
+
+    小窗口下两个固定下限加起来会超过整段预算：这时下限让位，按预算比例整体缩。
+    """
     if input_budget is None:
         return CHARTER_LIMIT, MATERIALS_LIMIT
     budget = max(0, int(input_budget))
-    return (max(CHARTER_LIMIT, int(budget * _CHARTER_SHARE)),
-            max(MATERIALS_LIMIT, int(budget * _MATERIALS_SHARE)))
+    charter = max(CHARTER_LIMIT, int(budget * _CHARTER_SHARE))
+    materials = max(MATERIALS_LIMIT, int(budget * _MATERIALS_SHARE))
+    if budget and charter + materials > budget:
+        charter = max(256, int(budget * _CHARTER_SHARE))
+        materials = max(256, int(budget * _MATERIALS_SHARE))
+    return charter, materials
 
 
 def charter_segments(charter: dict, *, input_budget: int | None = None) -> list[Segment]:

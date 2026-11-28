@@ -179,9 +179,9 @@ def test_failed_summarization_does_not_kill_the_node(monkeypatch) -> None:
     assert result.content == "完成"
     assert "context_compacted" not in _event_types("hook-h")
     assert seen[-1][1].content == "字" * 900              # 原始提示原样还在，没有留下半截摘要
-    # 之后仍在阈值之上，所以每次重试都会再失败一次、各记一条压缩告警（另有进度日志，级别是 info）
+    # 摘要失败也进入冷却：不会每一步都再失败一次（6 步里只尝试一次，随后冷却 3 步）
     warnings = [message for level, message in _node_logs("hook-h") if level == "warn"]
-    assert warnings and all("压缩" in message for message in warnings)
+    assert len(warnings) == 1 and all("压缩" in message for message in warnings)
 
 
 def test_extra_messages_skip_the_compaction_hook(monkeypatch) -> None:
@@ -305,3 +305,48 @@ def test_emit_token_merges_extra_into_payload(monkeypatch) -> None:
     events.emit_token("hook-g", 3, "好")
     assert [event["payload"] for event in published] == [{"text": "你", "turn_id": 7}, {"text": "好"}]
     assert all(event["seq"] is None for event in published)      # 流式 token 不占事件序号
+
+
+def test_policy_failure_falls_back_to_the_default_policy(monkeypatch) -> None:
+    """读压缩策略失败不杀死节点：按默认策略照常压缩或跳过，节点跑完。"""
+    node_id, attempt_id = _setup("hook-n")
+    toolbox = Toolbox(workspace_dir("hook-n"), allow_shell=False)
+    seen: list[list[Message]] = []
+    _install_fake_stream(monkeypatch, seen, tool_calls=5)
+
+    def broken_policy(run_id):
+        raise RuntimeError("库里抖了一下")
+
+    async def fake_summarize(text: str) -> str:
+        return "摘要"
+
+    monkeypatch.setattr(agent_loop, "policy_for_run", broken_policy)
+    monkeypatch.setattr(agent_loop, "make_summarizer", lambda **kwargs: fake_summarize)
+    result = asyncio.run(run_agent(
+        run_id="hook-n", node_id=node_id, attempt_id=attempt_id,
+        model=SimpleNamespace(**_MODEL), system_prompt="系统", user_prompt="字" * 900,
+        toolbox=toolbox, max_steps=6, quiet=True))
+    assert result.content == "完成"
+
+
+def test_record_compaction_failure_does_not_drop_the_compacted_view(monkeypatch) -> None:
+    """压缩留痕失败：照常使用压缩后的内容，节点不失败，只记一条告警。"""
+    node_id, attempt_id = _setup("hook-o")
+    toolbox = Toolbox(workspace_dir("hook-o"), allow_shell=False)
+    seen: list[list[Message]] = []
+    _install_fake_stream(monkeypatch, seen, tool_calls=5)
+
+    async def fake_summarize(text: str) -> str:
+        return "摘要"
+
+    async def broken_record(**kwargs):
+        raise RuntimeError("写留痕失败")
+
+    monkeypatch.setattr(agent_loop, "make_summarizer", lambda **kwargs: fake_summarize)
+    monkeypatch.setattr(agent_loop, "record_compaction", broken_record)
+    result = asyncio.run(run_agent(
+        run_id="hook-o", node_id=node_id, attempt_id=attempt_id,
+        model=SimpleNamespace(**_MODEL), system_prompt="系统", user_prompt="字" * 900,
+        toolbox=toolbox, max_steps=6, quiet=True))
+    assert result.content == "完成"
+    assert any("留痕失败" in message for _level, message in _node_logs("hook-o"))
