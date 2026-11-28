@@ -1361,3 +1361,35 @@ def test_precheck_rejects_a_returned_verdict_without_user_acceptance() -> None:
     assert protocol._precheck("accept", False, ["I1"]) == (False, "有意见没有改好：I1")
     assert protocol._precheck("return", False, []) == (
         False, "评审结论为退回，讨论会议需要先复议")
+
+
+def _first_then(first: str, rest: str):
+    """第一次调用回第一份，之后一直回第二份。"""
+    calls: list[int] = []
+
+    def reply(text: str) -> str:
+        calls.append(1)
+        return first if len(calls) == 1 else rest
+
+    return reply
+
+
+def test_a_rejected_revision_is_asked_again_on_retry(monkeypatch) -> None:
+    """修订稿校验不过要丢掉这一步的复用键：重试时重新问模型，拿到合格稿写出新版。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(author_revise=_first_then(PROPOSAL, REVISED_PROPOSAL)), seen)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="revise", state={"issues": [dict(ISSUE)]})
+    protocol = review_module.ReviewProtocol()
+    targets = [dict(ISSUE)]
+    key = review_module._step_key("revise", mtg, [ISSUE["id"]],
+                                  extra=review_module._issue_states(targets))
+
+    with pytest.raises(NodeFailure, match="修订版缺少"):
+        asyncio.run(protocol._revise(mtg, targets))
+    assert key not in (store.get_state(mtg.meeting_id).get("step_turns") or {})
+
+    asyncio.run(protocol._revise(mtg, targets))
+
+    assert Counter(call["kind"] for call in seen)["author_revise"] == 2
+    assert parse_front_matter(read_artifact(run_id, "proposal"))[0]["version"] == 2

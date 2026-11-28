@@ -282,6 +282,9 @@ def _last_items_text(mtg) -> str:
         requirement = str(item.get("requirement") or "")
         if requirement:
             handled = "已改动" if requirement in changed else "未改动"
+        elif item.get("origin") == "user":
+            # 没落到具体需求上的用户意见：程序判定不了它是否已处理，如实说明保留在清单里
+            handled = "未对应到具体需求，保留在清单里"
         elif item.get("kind") == "mechanical":
             handled = "按当前规格重新核对"
         else:
@@ -776,8 +779,18 @@ class ConfirmProtocol(MeetingProtocol):
         intake_items = [item for item in state.get("items") or []
                         if item.get("origin") == "user"
                         and int(item.get("round") or 0) == flow]
+        if flow > 1:
+            # 没落到具体需求上的用户意见，程序无法判定它是否已经被处理，不能默认它已解决：
+            # 上一轮的这类条目原样带到本轮（编号与内容不变，只把轮次记为本轮），
+            # 清单因此非空，回流后不会变成"通过、0 条待办"；轮次用尽后走升级确认点由人决定。
+            existing_ids = {item.get("id") for item in intake_items}
+            intake_items.extend(
+                {**item, "round": flow} for item in state.get("last_items") or []
+                if item.get("origin") == "user" and not item.get("requirement")
+                and item.get("id") not in existing_ids)
         program = _program_items(mtg)
-        if program:
+        # 详设 §9.4：机械核对不过时不调模型，清单是纯程序结果，直接进入编号入账
+        if program and not state.get("mechanical"):
             # 详设 §9.2：主席把各方的核对条目去重归类，走样与遗漏的还要补上落点。
             # 行首序号是去重的凭据：quality/added 条目没有决策点编号，按序号标记重复
             listing = "\n".join(f"- {position}。 [{KIND_NAMES.get(item['kind'], item['kind'])}] "
@@ -801,9 +814,11 @@ class ConfirmProtocol(MeetingProtocol):
             for item in program:
                 if item["kind"] in ("distorted", "missing") and not item["requirement"]:
                     item["requirement"] = fills.get(item["index"], "")
+            # 只有质量意见与凭空新增可能被多名核对者重复报出；其余类别的序号被点名也不删
             if duplicates:
                 program = [item for position, item in enumerate(program, start=1)
-                           if str(position) not in duplicates]
+                           if item["kind"] not in ("quality", "added")
+                           or str(position) not in duplicates]
         number = _next_number(state.get("items") or [], state.get("last_items") or [])
         # 已入账的同一批条目沿用旧编号（按轮次、出处、需求、问题签名匹配）：崩溃重入
         # 重跑汇总时不会以新编号重复入账，也不会把已入账的条目挤掉。

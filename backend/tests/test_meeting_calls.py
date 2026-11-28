@@ -9,7 +9,7 @@ import pytest
 
 from app.conversation.builder import Segment
 from app.db.base import init_db, session_scope
-from app.db.models import Node, Run, Workflow
+from app.db.models import MeetingIntervention, Node, Run, Workflow
 from app.engine.events import load_events
 from app.engine.runners import NodeContext
 from app.engine.templates import seed_defaults
@@ -22,7 +22,8 @@ from tests.meeting_fakes import MODEL, install
 _counter = iter(range(1, 1000))
 
 
-def _meeting() -> tuple[MeetingSession, list[dict]]:
+def _new_meeting() -> tuple[MeetingSession, int]:
+    """建一场还没有参会者的会议；需要哪些角色由用例自己加。"""
     init_db()
     seed_defaults()
     index = next(_counter)
@@ -41,11 +42,16 @@ def _meeting() -> tuple[MeetingSession, list[dict]]:
     meeting_id = store.create_meeting(run_id=run_id, node_id=node.id, node_key="discuss",
                                       protocol="discussion", charter={}, config={})
     store.update_meeting(meeting_id, phase="positions")
+    return MeetingSession(meeting_id=meeting_id, ctx=ctx), meeting_id
+
+
+def _meeting() -> tuple[MeetingSession, list[dict]]:
+    mtg, meeting_id = _new_meeting()
     store.add_participant(meeting_id, role_key="facilitator", display_name="主持人",
                           mode="facilitator", system_prompt="你是主持人")
     store.add_participant(meeting_id, role_key="architect", display_name="架构",
                           mode="participant", system_prompt="你是架构师")
-    return MeetingSession(meeting_id=meeting_id, ctx=ctx), store.list_participants(meeting_id)
+    return mtg, store.list_participants(meeting_id)
 
 
 def _is_list_of_strings(data: dict) -> list[str]:
@@ -479,3 +485,56 @@ def test_speak_does_not_warn_below_the_cap(monkeypatch) -> None:
     _speak(mtg, speaker, segments=[], instruction="请写立场")
     assert [payload for payload in _node_log_payloads(mtg)
             if "可能被截断" in payload.get("message", "")] == []
+
+
+# ---------------- 评审/需求确认会议：没有主持人时插话由主席回应 ----------------
+def test_intervention_is_acknowledged_by_the_chair_without_a_facilitator(monkeypatch) -> None:
+    """评审、需求确认会议没有主持人：插话由主席回应，不能只写进纪要就标成已注入。"""
+    install(monkeypatch, {"intervention_ack": "收到，我按这条要求继续评审。"})
+    mtg, meeting_id = _new_meeting()
+    store.add_participant(meeting_id, role_key="chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    intervention_id = store.queue_intervention(meeting_id, content="注意合规")
+
+    assert asyncio.run(calls.drain_interventions(mtg)) is True
+
+    turns = store.list_turns(meeting_id)
+    assert [(t["kind"], t["speaker_name"]) for t in turns] == [
+        ("user_intervention", "用户"), ("facilitator_note", "评审主席")]
+    assert turns[1]["content"] == "收到，我按这条要求继续评审。"
+    with session_scope() as s:
+        row = s.get(MeetingIntervention, intervention_id)
+        assert row.status == "injected"
+        assert row.injected_turn_id == turns[0]["id"]      # 关联到插话被注入成的那条用户发言
+
+
+def test_intervention_without_facilitator_or_chair_has_no_ack(monkeypatch) -> None:
+    """既没有主持人也没有主席：与改动前一致，只写用户发言，不产生回应发言。"""
+    install(monkeypatch, {})
+    mtg, meeting_id = _new_meeting()
+    store.add_participant(meeting_id, role_key="reviewer", display_name="评审者",
+                          mode="reviewer", system_prompt="你是评审者")
+    store.queue_intervention(meeting_id, content="注意合规")
+
+    assert asyncio.run(calls.drain_interventions(mtg)) is True
+
+    assert [(t["kind"], t["speaker_name"]) for t in store.list_turns(meeting_id)] == [
+        ("user_intervention", "用户")]
+    assert store.take_queued_interventions(meeting_id) == []
+
+
+# ---------------- 模型返回空正文：不算说完 ----------------
+def test_speak_rejects_blank_content_and_leaves_the_turn_unfinished(monkeypatch) -> None:
+    """思考型模型可能把输出额度花在推理上、正文为空：这种发言不能当成说完落盘。"""
+    install(monkeypatch, {"position": "  \n\t "})
+    mtg, (_, speaker) = _meeting()
+
+    with pytest.raises(CallOutputError, match="空正文"):
+        _speak(mtg, speaker, segments=[], instruction="请写立场")
+
+    types = [e["type"] for e in load_events(mtg.run_id)]
+    assert "meeting_turn_started" in types
+    assert "meeting_turn_finished" not in types
+    turns = store.list_turns(mtg.meeting_id)
+    assert len(turns) == 1
+    assert turns[0]["content"] == ""

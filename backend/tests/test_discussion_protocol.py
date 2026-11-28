@@ -1117,6 +1117,70 @@ def test_a_new_point_raised_in_a_stance_enters_the_ledger(monkeypatch) -> None:
     assert ledger["D2"]["status"] == "agreed"
 
 
+def test_a_replayed_stance_does_not_create_a_duplicate_decision_point() -> None:
+    """崩溃重入时同一份表态被重放：同名、同提议者、同轮次的决策点已经建过就复用，不建第二条。"""
+    run_id, node_id = _meeting_run()
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "stances")
+    participant_id = store.add_participant(meeting_id, role_key="architect",
+                                           display_name="架构师", mode="participant")
+    participant = next(row for row in store.list_participants(meeting_id)
+                       if row["id"] == participant_id)
+    data = {"stances": [], "new_points": [
+        {"title": "是否支持离线填写", "question": "断网时能否先记下来",
+         "options": ["支持", "不支持"], "level": 5, "reason": "外勤场景必须离线可用"}]}
+
+    discussion_module._apply_stances(mtg, participant, data)
+    discussion_module._apply_stances(mtg, participant, data)      # 同一份表态原样重放
+
+    points = [point for point in store.list_decision_points(meeting_id)
+              if point["title"] == "是否支持离线填写"]
+    assert len(points) == 1
+    assert points[0]["index"] == "D1"
+    assert points[0]["raised_by"] == "架构师" and points[0]["origin_round"] == 1
+    assert points[0]["stances"][str(participant_id)]["level"] == 5    # 表态照常写到这一条上
+
+
+def test_a_new_point_with_a_null_level_counts_as_abstain() -> None:
+    """表态补充的新决策点 level 为 null（校验器允许缺省）：落库不崩溃，按弃权（3）处理。"""
+    run_id, node_id = _meeting_run()
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "stances")
+    participant_id = store.add_participant(meeting_id, role_key="architect",
+                                           display_name="架构师", mode="participant")
+    participant = next(row for row in store.list_participants(meeting_id)
+                       if row["id"] == participant_id)
+    data = {"stances": [], "new_points": [
+        {"title": "是否支持离线填写", "question": "断网时能否先记下来",
+         "options": ["支持", "不支持"], "level": None, "reason": "还需要更多信息"}]}
+
+    discussion_module._apply_stances(mtg, participant, data)
+
+    point = store.list_decision_points(meeting_id)[0]
+    assert point["stances"][str(participant_id)]["level"] == 3
+
+
+def test_the_same_new_point_from_two_participants_stays_two_points() -> None:
+    """两个参会者各提一个同名问题：各建各的，不因标题相同合并。"""
+    run_id, node_id = _meeting_run()
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "stances")
+    store.add_participant(meeting_id, role_key="architect",
+                          display_name="架构师", mode="participant")
+    store.add_participant(meeting_id, role_key="ux",
+                          display_name="用户体验", mode="participant")
+    members = {row["display_name"]: row for row in store.list_participants(meeting_id)}
+    data = {"stances": [], "new_points": [
+        {"title": "是否支持离线填写", "question": "断网时能否先记下来",
+         "options": ["支持", "不支持"], "level": 3}]}
+
+    discussion_module._apply_stances(mtg, members["架构师"], data)
+    discussion_module._apply_stances(mtg, members["用户体验"], data)
+
+    points = [point for point in store.list_decision_points(meeting_id)
+              if point["title"] == "是否支持离线填写"]
+    assert len(points) == 2
+    assert {point["raised_by"] for point in points} == {"架构师", "用户体验"}
+    assert {point["index"] for point in points} == {"D1", "D2"}
+
+
 def test_a_temporary_role_proposed_by_the_facilitator_can_sit_in_the_meeting(
         monkeypatch) -> None:
     """主持人提库里没有的临时角色（display_name + persona）：照常入会，人设作为系统提示。"""
@@ -1311,6 +1375,77 @@ def test_reopen_reuses_the_recorded_plan_and_ignores_unknown_indexes(monkeypatch
     meeting_id = store.latest_meeting_for_node(node_id)["id"]
     feedback = [t for t in store.list_turns(meeting_id) if t["kind"] == "user_feedback"]
     assert [t["content"] for t in feedback] == ["评审认为登录方案需要复议"]  # 反馈发言不重复
+
+
+def test_reopen_keeps_one_copy_of_the_points_it_creates_when_killed_before_the_commit(
+        monkeypatch) -> None:
+    """复议的决策点已写入、轮次与状态还没提交时被杀：重入复用计划，同类决策点只建一条。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)), None)
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    round_before = store.latest_meeting_for_node(node_id)["round"]
+    _set_feedback(node_id, "评审认为登录方案需要复议", "reroute")
+
+    original = store.update_meeting
+    armed = {"on": True}
+
+    def flaky(meeting_id, **fields):
+        if armed["on"] and "round" in fields:
+            armed["on"] = False              # 决策点已落盘、轮次与状态还没写：进程在这里被杀
+            raise asyncio.CancelledError()
+        return original(meeting_id, **fields)
+
+    monkeypatch.setattr(store, "update_meeting", flaky)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    assert Counter(call["kind"] for call in seen)["reopen"] == 0    # 计划复用，不重新调用
+    meeting = store.latest_meeting_for_node(node_id)
+    assert meeting["round"] == round_before + 1
+    feedback = [t for t in store.list_turns(meeting["id"]) if t["kind"] == "user_feedback"]
+    assert [t["content"] for t in feedback] == ["评审认为登录方案需要复议"]  # 反馈发言不重复
+    titles = [point["title"] for point in store.list_decision_points(meeting["id"])]
+    assert titles.count("是否支持离线填写") == 1
+
+
+def test_reopen_commits_the_new_round_and_the_cleared_state_together(monkeypatch) -> None:
+    """复议的轮次与状态一次提交：提交之后被杀，重入不再重跑复议步，也不多跳一轮。"""
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)), None)
+    run_id, node_id = _meeting_run()
+    drive(run_id, node_id, _approve, idea=IDEA)
+    round_before = store.latest_meeting_for_node(node_id)["round"]
+    _set_feedback(node_id, "评审认为登录方案需要复议", "reroute")
+
+    original = store.update_meeting
+    armed = {"on": True}
+
+    def crash_after_commit(meeting_id, **fields):
+        original(meeting_id, **fields)
+        if armed["on"] and "round" in fields:
+            armed["on"] = False              # 轮次与状态已一次写完、后续步骤还没跑：进程在这里被杀
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(store, "update_meeting", crash_after_commit)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(restance=_by_round(_agree, _agree)), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    assert Counter(call["kind"] for call in seen)["reopen"] == 0    # 已提交，重入不再重跑复议
+    meeting = store.latest_meeting_for_node(node_id)
+    assert meeting["round"] == round_before + 1                    # 只推进一轮
+    feedback = [t for t in store.list_turns(meeting["id"]) if t["kind"] == "user_feedback"]
+    assert [t["content"] for t in feedback] == ["评审认为登录方案需要复议"]
+    titles = [point["title"] for point in store.list_decision_points(meeting["id"])]
+    assert titles.count("是否支持离线填写") == 1
 
 
 def test_a_revision_without_change_notes_is_rejected(monkeypatch) -> None:
@@ -1632,3 +1767,52 @@ def test_check_revision_is_salvaged_after_a_crash(monkeypatch) -> None:
     assert result["done"] is True
     assert Counter(call["kind"] for call in seen)["proposal_revise"] == 0
 
+
+
+def test_a_rejected_draft_is_asked_again_on_retry(monkeypatch) -> None:
+    """成稿校验不过要丢掉这一步的复用键：重试时重新问模型，而不是把坏稿再校验一遍。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(proposal=_first_then("## 目标与成功标准\n\n两句话。", PROPOSAL)),
+            seen)
+    run_id, node_id = _meeting_run()
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "draft")
+    store.add_participant(meeting_id, role_key="facilitator", display_name="主持人",
+                          mode="facilitator", system_prompt="你是主持人")
+    protocol = discussion_module.DiscussionProtocol()
+
+    with pytest.raises(NodeFailure, match="方案缺少这些章节"):
+        asyncio.run(protocol.step_draft(mtg))
+    key = f"proposal_draft:{mtg.meeting_round()}"
+    assert key not in (store.get_state(meeting_id).get("step_turns") or {})
+
+    asyncio.run(protocol.step_draft(mtg))
+
+    assert Counter(call["kind"] for call in seen)["proposal"] == 2
+    assert _proposal(run_id)[0]["version"] == 1
+
+
+def test_a_rejected_check_revision_is_asked_again_on_retry(monkeypatch) -> None:
+    """复核修订校验不过同样丢键：重试只重新问修订，复核发言仍按复用键取回。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(proposal_check=CHECK_ISSUE,
+                                  proposal_revise=_first_then(PROPOSAL, PROPOSAL_V2)), seen)
+    run_id, node_id = _meeting_run()
+    write_artifact(run_id, "proposal", PROPOSAL, created_by="facilitator",
+                   inputs=["idea", "discussion"], status="draft")
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "check")
+    store.add_participant(meeting_id, role_key="facilitator", display_name="主持人",
+                          mode="facilitator", system_prompt="你是主持人")
+    store.add_participant(meeting_id, role_key="architect", display_name="架构师",
+                          mode="participant", system_prompt="你是架构师")
+    protocol = discussion_module.DiscussionProtocol()
+
+    with pytest.raises(NodeFailure, match="修订版缺少"):
+        asyncio.run(protocol.step_check(mtg))
+    key = f"proposal_revise:{mtg.state().get('check_round') or 1}"
+    assert key not in (store.get_state(meeting_id).get("step_turns") or {})
+
+    asyncio.run(protocol.step_check(mtg))
+
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["proposal_revise"] == 2 and kinds["proposal_check"] == 1
+    assert "## 修改说明" in _proposal(run_id)[1]

@@ -27,8 +27,8 @@ from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_suits_meeting, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, review_rules, store
-from app.meeting.calls import meeting_input_budget, reuse_or_speak as _reuse_or_speak, \
-    speak, speak_many
+from app.meeting.calls import forget_turn, meeting_input_budget, \
+    reuse_or_speak as _reuse_or_speak, speak, speak_many
 from app.meeting.protocols.base import (MeetingProtocol, advance, done, register_protocol,
                                         reroute_or_escalate)
 
@@ -960,21 +960,26 @@ class ReviewProtocol(MeetingProtocol):
         listing = "\n".join(f"- {issue['id']} [{issue.get('location') or '—'}] "
                             f"{issue['problem']}；建议：{issue.get('suggestion') or '—'}"
                             for issue in targets)
+        key = _step_key("revise", mtg, ids, extra=_issue_states(targets))
         result = await _reuse_or_speak(
-            mtg, _step_key("revise", mtg, ids, extra=_issue_states(targets)),
+            mtg, key,
             participant=_author(mtg), kind="author_revise", turn_kind="author_revise",
             charter=_charter(mtg),
             segments=[Segment("append", f"## 文字级修改意见\n{listing}", name="修改意见")],
             instruction=AUTHOR_REVISE_INSTRUCTION, turn_round=_flow(mtg))
         draft = strip_outer_fence(result["content"]).strip()
-        issues = validate_artifact("proposal", draft)
-        missing = [title for title in proposal.PROPOSAL_SECTIONS if title not in draft]
-        if missing:
-            issues.append("方案缺少这些章节：" + "、".join(missing))
-        if "## 修改说明" not in draft:
-            issues.append("修订版缺少「## 修改说明」一节")
-        if issues:
-            raise NodeFailure("修订后的方案校验未通过：" + "；".join(issues))
+        try:
+            issues = validate_artifact("proposal", draft)
+            missing = [title for title in proposal.PROPOSAL_SECTIONS if title not in draft]
+            if missing:
+                issues.append("方案缺少这些章节：" + "、".join(missing))
+            if "## 修改说明" not in draft:
+                issues.append("修订版缺少「## 修改说明」一节")
+            if issues:
+                raise NodeFailure("修订后的方案校验未通过：" + "；".join(issues))
+        except NodeFailure:
+            forget_turn(mtg, key)        # 坏稿不再复用：重试要重新问模型
+            raise
         discussion = _discussion(mtg)
         clarifications = (discussion["state"].get("clarifications") or []) if discussion else []
         body = proposal.compose(draft, points=_ledger_points(mtg),

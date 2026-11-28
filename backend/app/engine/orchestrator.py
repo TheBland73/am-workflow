@@ -303,10 +303,12 @@ class Orchestrator:
             if body is not None:
                 await emit(run_id, "gate_requested", node["id"], {
                     **body, "reason": result.get("reason") or "模型判定无效，转人工"})
-            # 从 delegate 入口进来时门已存在（不走 request_gate），节点不会自己回到等人状态：
-            # 判不了就明确置回 waiting_human，门开着等人工
-            self._update_node(node["id"], status="waiting_human")
-            self._set_run(run_id, status="waiting_human")
+                # 从 delegate 入口进来时门已存在（不走 request_gate），节点不会自己回到等人状态：
+                # 判不了就明确置回 waiting_human，门开着等人工。
+                # 门在判定期间已被处理（body 为 None）时不动节点与运行的状态——人的决定已经
+                # 把它们放到了正确的位置，再置回等人会让调度循环停摆。
+                self._update_node(node["id"], status="waiting_human")
+                self._set_run(run_id, status="waiting_human")
         return result["action"]
 
     async def _gate_to_human(self, run_id: str, node: dict, reason: str) -> str:

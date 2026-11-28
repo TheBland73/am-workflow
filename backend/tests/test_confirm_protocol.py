@@ -688,6 +688,50 @@ def test_the_chair_dedupes_the_program_findings(monkeypatch) -> None:
                                        if call["kind"] == "confirm_merge")
 
 
+def test_mechanical_failure_skips_the_chair_merge_model(monkeypatch) -> None:
+    """机械核对有失败项：汇总步不调主席模型（详设 §9.4），机械核对项留在清单里，裁决不通过。"""
+    seen: list[dict] = []
+    # 主席若被调用，会按旧行为把序号 1（机械核对项）当成重复删掉
+    install(monkeypatch, _replies(confirm_merge='{"items": [], "duplicates": ["1"]}'), seen)
+    run_id, node_id = _confirm_run(spec=MISSING_R1)
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert Counter(call["kind"] for call in seen)["confirm_merge"] == 0
+    items = _items(node_id)
+    assert [item["kind"] for item in items] == ["mechanical"]
+    assert "R1" in items[0]["problem"] and "追踪矩阵" in items[0]["problem"]
+    assert _state(node_id)["verdict"] == "fail"
+    assert result["reroute"]["targets"] == ["requirement"]
+
+
+def test_chair_duplicates_only_remove_quality_and_added_items(monkeypatch) -> None:
+    """主席给的 duplicates 只对质量意见与凭空新增生效：序号指向走样条目时不删。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(confirm_merge=json.dumps(
+        {"items": [], "duplicates": ["1", "2"]}, ensure_ascii=False)), seen)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="merge", state={
+        "fidelity": [{"index": "D1", "result": "distorted",
+                      "reason": "需求没有按 D1 的结论写", "checker": "架构师"}],
+        "quality_issues": [
+            {"location": "R1", "problem": "验收标准不清楚", "severity": "major",
+             "suggestion": "写细一点"},
+            {"location": "R2", "problem": "度量口径不一致", "severity": "major",
+             "suggestion": "统一口径"}]})
+    store.add_participant(mtg.meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    protocol = confirm_module.ConfirmProtocol()
+
+    asyncio.run(protocol.step_merge(mtg))
+
+    items = _items(node_id)
+    assert [item["kind"] for item in items] == ["distorted", "quality"]
+    assert items[0]["index"] == "D1"
+    assert items[1]["requirement"] == "R2"
+    assert [call["kind"] for call in seen] == ["confirm_merge"]
+
+
 # ---------------- S5.7：校验器、续开短路、参数开关与行为分支 ----------------
 def test_structured_output_validators_reject_the_remaining_bad_shapes() -> None:
     """结构化输出的校验器逐个报错分支：坏的形状都要带着明确原因被拒。"""
@@ -922,6 +966,69 @@ def test_last_items_text_marks_how_each_item_was_handled() -> None:
     text = confirm_module._last_items_text(mtg)
 
     assert "已改动" in text and "按当前规格重新核对" in text and "本轮重新核对" in text
+
+
+def test_rounds_after_rework_keep_user_items_without_a_requirement(monkeypatch) -> None:
+    """没带需求编号的用户意见程序无法判定已处理：第 3 轮原样带回清单，裁决不通过。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="merge", state={
+        "last_items": [{"id": "C1", "kind": "quality", "requirement": "", "index": "",
+                        "severity": "major", "problem": "整体太啰嗦，请重写",
+                        "suggestion": "", "origin": "user", "round": 2}]})
+    store.update_meeting(mtg.meeting_id, round=3)
+    protocol = confirm_module.ConfirmProtocol()
+
+    asyncio.run(protocol.step_merge(mtg))
+    asyncio.run(protocol.step_verdict(mtg))
+
+    items = _items(node_id)
+    assert [(item["id"], item["round"]) for item in items] == [("C1", 3)]
+    assert items[0]["origin"] == "user"
+    assert items[0]["problem"] == "整体太啰嗦，请重写"
+    assert _state(node_id)["verdict"] == "fail"
+
+
+def test_last_round_user_items_with_a_requirement_are_left_to_the_quality_checks(
+        monkeypatch) -> None:
+    """带需求编号的上一轮用户意见由质量评审覆盖，汇总是按需求重新核对，不重复带到清单。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="merge", state={
+        "last_items": [{"id": "C1", "kind": "quality", "requirement": "R1", "index": "",
+                        "severity": "major", "problem": "R1 的验收标准不清楚",
+                        "suggestion": "", "origin": "user", "round": 2}]})
+    store.update_meeting(mtg.meeting_id, round=3)
+
+    asyncio.run(confirm_module.ConfirmProtocol().step_merge(mtg))
+
+    assert _items(node_id) == []
+
+
+def test_first_round_does_not_carry_previous_items(monkeypatch) -> None:
+    """第 1 轮没有"上一轮的清单"可带：last_items 里的旧条目一条也不进本轮清单。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="merge", state={
+        "last_items": [{"id": "C1", "kind": "quality", "requirement": "", "index": "",
+                        "severity": "major", "problem": "整体太啰嗦，请重写",
+                        "suggestion": "", "origin": "user", "round": 1}]})
+
+    asyncio.run(confirm_module.ConfirmProtocol().step_merge(mtg))
+
+    assert _items(node_id) == []
+
+
+def test_last_items_text_says_unmatched_user_items_are_kept() -> None:
+    """没对应到需求的用户意见如实标成"保留在清单里"，不再说本轮会重新核对。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={
+        "last_items": [{"id": "C1", "kind": "quality", "requirement": "",
+                        "problem": "整体太啰嗦，请重写", "origin": "user"}]})
+
+    text = confirm_module._last_items_text(mtg)
+
+    assert "未对应到具体需求，保留在清单里" in text
 
 
 def test_missing_chair_fails_fatally() -> None:

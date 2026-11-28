@@ -300,6 +300,10 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
         temperature=temperature, quiet=True,
         token_extra={"turn_id": turn_id, "meeting_id": mtg.meeting_id},
         extra_messages=built.messages[1:])
+    if not result.content.strip():
+        # 思考型模型可能把输出额度全花在推理上：空正文不算说完，不落 finish_turn，
+        # 让这条发言行保持未完成，由节点级重试重新发言。
+        raise CallOutputError("模型返回了空正文（可能把输出额度用在了推理上）")
     if result.usage.output_tokens >= cap:
         # 自由文本（如建设方案）被截断时供应商不会报错：只提示，由人决定是否调大上限
         message = (f"【{speaker_name}】的输出达到单次上限（{cap} token），可能被截断；"
@@ -349,6 +353,13 @@ async def reuse_or_speak(mtg: MeetingSession, key: str, *, require_data: bool = 
     turns[key] = result["turn_id"]
     mtg.set_state(step_turns=turns)
     return result
+
+
+def forget_turn(mtg: MeetingSession, key: str) -> None:
+    """丢掉一个复用键：这一步的发言已被程序判为不合格，重试时要重新调用模型。"""
+    turns = dict(mtg.state().get("step_turns") or {})
+    if turns.pop(key, None) is not None:
+        mtg.set_state(step_turns=turns)
 
 
 async def speak_many(mtg: MeetingSession, calls: list[dict], *,
@@ -402,8 +413,9 @@ async def speak_many(mtg: MeetingSession, calls: list[dict], *,
 async def drain_interventions(mtg: MeetingSession) -> bool:
     """取出排队中的插话，写成用户发言，并让主持人回应一次。返回是否有插话。
 
-    状态改为"已注入"要等主持人回应成功之后：回应失败时插话仍在队列里，
-    下次重试会复用已经写下的那条用户发言，不会重复，也不会出现"标了已注入却没回应"。
+    评审、需求确认会议没有主持人，由主席代为回应。状态改为"已注入"要等回应成功之后：
+    回应失败时插话仍在队列里，下次重试会复用已经写下的那条用户发言，不会重复，
+    也不会出现"标了已注入却没回应"。
     """
     queued = store.take_queued_interventions(mtg.meeting_id)
     if not queued:
@@ -425,8 +437,10 @@ async def drain_interventions(mtg: MeetingSession) -> bool:
         await emit(mtg.run_id, "meeting_intervention_injected", mtg.node_id,
                    {"meeting_id": mtg.meeting_id, "intervention_id": item_id,
                     "turn_id": turn_id})
-    facilitator = next(iter(mtg.participants("facilitator")), None)
-    if facilitator is not None:
+    # 评审、需求确认会议没有主持人：由主席代为回应；两者都没有时才不回应
+    responder = (next(iter(mtg.participants("facilitator")), None)
+                 or next(iter(mtg.participants("chair")), None))
+    if responder is not None:
         text = "\n".join(f"- {item['content']}" for item in queued)
         from app.meeting import render  # 延迟导入：避免与 render → rules 的导入顺序纠缠
 
@@ -438,7 +452,7 @@ async def drain_interventions(mtg: MeetingSession) -> bool:
         batch = ",".join(str(item["id"]) for item in sorted(queued, key=lambda i: i["id"]))
         await reuse_or_speak(
             mtg, f"intervention_ack:{batch}",
-            participant=facilitator, kind="intervention_ack", turn_kind="facilitator_note",
+            participant=responder, kind="intervention_ack", turn_kind="facilitator_note",
             charter=charter,
             segments=[ledger, Segment("append", f"## 用户在会议进行中插话\n{text}",
                                       name="插话")],

@@ -30,7 +30,8 @@ from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_suits_meeting, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, store
-from app.meeting.calls import meeting_input_budget, reuse_or_speak, speak, speak_many
+from app.meeting.calls import (forget_turn, meeting_input_budget, reuse_or_speak, speak,
+                               speak_many)
 from app.meeting.checkpoints import record_auto_decision
 from app.meeting.protocols.base import MeetingProtocol, advance, done, register_protocol, suspend
 from app.meeting.rules import (DEFERRED, LEVEL_NAMES, OPEN_STATUSES, relax, rank_speakers, settle,
@@ -487,20 +488,36 @@ def _settle_round(mtg) -> dict:
 
 
 def _apply_stances(mtg, participant: dict, data: dict) -> None:
-    """把一次表态写进账本。表态里补充的遗漏决策点先建成新的决策点。"""
+    """把一次表态写进账本。表态里补充的遗漏决策点先建成新的决策点。
+
+    崩溃重入时同一份表态会被重放：标题、提议者与轮次都相同的新决策点已经建过就复用，
+    不再重复建点（否则账本里会出现同名的重复决策点）。不同参会者提同名问题、
+    或同一参会者在别的轮次提的问题，仍各建各的。
+    """
     by_index = {point["index"]: point for point in _points(mtg)}
     number = len(by_index) + 1
     round_no = mtg.meeting_round()
     rows = list(data["stances"])
     for extra in data.get("new_points") or []:
-        index = f"D{number}"
-        number += 1
-        point_id = store.upsert_decision_point(
-            mtg.meeting_id, index, title=extra["title"].strip(),
-            question=str(extra.get("question") or ""), options_json=list(extra.get("options") or []),
-            raised_by=participant["display_name"], origin_round=round_no)
-        by_index[index] = {"id": point_id, "index": index}
-        rows.append({"index": index, "level": extra.get("level", 3),
+        title = extra["title"].strip()
+        existing = next((point for point in by_index.values()
+                         if (point.get("title") or "").strip() == title
+                         and point.get("raised_by") == participant["display_name"]
+                         and int(point.get("origin_round") or 0) == round_no), None)
+        if existing is not None:
+            index = existing["index"]
+        else:
+            index = f"D{number}"
+            number += 1
+            point_id = store.upsert_decision_point(
+                mtg.meeting_id, index, title=title,
+                question=str(extra.get("question") or ""), options_json=list(extra.get("options") or []),
+                raised_by=participant["display_name"], origin_round=round_no)
+            by_index[index] = {"id": point_id, "index": index, "title": title,
+                               "raised_by": participant["display_name"], "origin_round": round_no}
+        # 校验器允许 new_points 不带 level 或写成 null：按弃权（3）处理，落库处不会碰到 None
+        level = extra.get("level")
+        rows.append({"index": index, "level": 3 if level is None else level,
                      "reason": extra.get("reason", ""), "choice": extra.get("choice", "")})
     for row in rows:
         point = by_index.get(str(row.get("index")))
@@ -1174,17 +1191,28 @@ class DiscussionProtocol(MeetingProtocol):
             elif index:
                 continue                              # 账本里没有的编号：不计入
             else:                                     # 反馈带出了账本里没有的问题：新建
+                title = str(row.get("title") or "").strip()
+                # 崩溃重入时这个点可能已经建过：同一发言人、同一轮、同名的问题不再重复建
+                if any((point.get("title") or "").strip() == title
+                       and point.get("raised_by") == speaker
+                       and int(point.get("origin_round") or 0) == following
+                       for point in by_index.values()):
+                    continue
                 store.upsert_decision_point(
-                    mtg.meeting_id, f"D{number}", title=str(row.get("title") or "").strip(),
+                    mtg.meeting_id, f"D{number}", title=title,
                     question=str(row.get("question") or ""),
                     options_json=list(row.get("options") or []),
                     raised_by=speaker, origin_round=following)
                 number += 1
-        store.update_meeting(mtg.meeting_id, round=following)
+        # 轮次与状态一次写完：分两次提交时，进程死在中间会让重入找不到上一轮的复议计划，
+        # 把反馈与新建的决策点再做一遍、轮次再跳一级。
         # 反馈处理完之后才清空标记：模型调用或落盘失败重试时，这条反馈还在
-        mtg.set_state(stance_snapshot={}, exchange_done=[], exchanges={}, stall=0,
-                      consensus_reason=None, rounds_limit=None, reopen_feedback="",
-                      reopen_rounds=reopened, gate_disposition=None)
+        store.update_meeting(
+            mtg.meeting_id, round=following,
+            state_json={**mtg.state(), "stance_snapshot": {}, "exchange_done": [],
+                        "exchanges": {}, "stall": 0, "consensus_reason": None,
+                        "rounds_limit": None, "reopen_feedback": "",
+                        "reopen_rounds": reopened, "gate_disposition": None})
         mtg.reset_builder()
         await _ledger_updated(mtg)
         return advance("stances")
@@ -1196,14 +1224,19 @@ class DiscussionProtocol(MeetingProtocol):
                     *_positions(mtg)]
         if previous:
             segments.append(Segment("append", f"## 上一版建设方案\n{previous}", name="上一版方案"))
+        key = f"proposal_draft:{mtg.meeting_round()}"
         result = await reuse_or_speak(
-            mtg, f"proposal_draft:{mtg.meeting_round()}",
+            mtg, key,
             participant=_facilitator(mtg), kind="proposal_revise" if previous else "proposal",
             turn_kind="proposal", charter=_charter(mtg),
             segments=segments, turn_round=mtg.meeting_round(),
             instruction=REVISION_INSTRUCTION if previous else PROPOSAL_INSTRUCTION)
-        self._save_proposal(mtg, strip_outer_fence(result["content"]),
-                            revision=bool(previous))
+        try:
+            self._save_proposal(mtg, strip_outer_fence(result["content"]),
+                                revision=bool(previous))
+        except NodeFailure:
+            forget_turn(mtg, key)        # 坏稿不再复用：重试要重新问模型
+            raise
         return advance()
 
     def _save_proposal(self, mtg, draft: str, notes: str = "",
@@ -1269,13 +1302,18 @@ class DiscussionProtocol(MeetingProtocol):
             self._write_minutes(mtg, notes)
             mtg.set_state(review_notes=notes, check_pending=[])
             return self._finish(mtg)
+        key = f"proposal_revise:{check_round}"
         result = await reuse_or_speak(
-            mtg, f"proposal_revise:{check_round}",
+            mtg, key,
             participant=_facilitator(mtg), kind="proposal_revise", turn_kind="proposal_revise",
             charter=_charter(mtg), turn_round=check_round,
             segments=view + [Segment("append", f"## 复核意见\n{notes}", name="复核意见")],
             instruction=REVISE_INSTRUCTION)
-        self._save_proposal(mtg, strip_outer_fence(result["content"]), revision=True)
+        try:
+            self._save_proposal(mtg, strip_outer_fence(result["content"]), revision=True)
+        except NodeFailure:
+            forget_turn(mtg, key)        # 坏稿不再复用：重试要重新问模型
+            raise
         mtg.set_state(check_round=check_round + 1,
                       check_pending=[member["id"] for member, _data in flagged])
         return advance("check")                      # 只让提出意见的人再复核一遍

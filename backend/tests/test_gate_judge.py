@@ -728,3 +728,36 @@ def test_an_invalid_model_verdict_returns_the_node_to_waiting_human(monkeypatch)
         assert _wait(lambda: _status(run_id, "gate_review") == "waiting_human"),             "判定无效后节点没有回到等待人工"
 
     assert _gate(gate["id"])["status"] == "open"
+
+
+def test_human_approval_during_the_model_judgment_is_not_pulled_back(monkeypatch) -> None:
+    """判定期间人已批掉门：无效判定落进 open 分支时，不能把节点和运行拉回等人。"""
+    seen: list[dict] = []
+    install(monkeypatch, {"gate_points": POINTS}, seen)
+    _no_kick(monkeypatch)
+    _seed_model()
+    run_id = _make_run({"automation": {"level": "L3"}})
+    _artifact(run_id, "proposal", PROPOSAL)
+    _artifact(run_id, "review", REVIEW_REPORT)
+    _meeting(run_id, "review", "review", state={"verdict": "accept", "precheck_ok": True})
+    gate_node_id = _node_id(run_id, "gate_review")
+
+    async def approve_then_return_invalid(*_args, **_kwargs):
+        # 模型还在判定，人先从界面把门批掉
+        with session_scope() as s:
+            gate = (s.query(Gate)
+                    .filter(Gate.node_id == gate_node_id, Gate.status == "open")
+                    .order_by(Gate.id.desc()).first())
+            gate_id = gate.id
+        await orchestrator.decide_gate(gate_id=gate_id, action="approve",
+                                       decided_by="human")
+        return None                                    # 判定无效 → open 分支
+
+    monkeypatch.setattr(judge, "_verdict", approve_then_return_invalid)
+
+    _run_node(run_id, "gate_review")
+
+    assert _status(run_id, "gate_review") == "done"
+    with session_scope() as s:
+        assert s.get(Run, run_id).status == "running"
+    assert _open_gates(run_id) == []
