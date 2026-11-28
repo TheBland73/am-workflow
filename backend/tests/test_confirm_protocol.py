@@ -116,7 +116,7 @@ def _replies(**overrides) -> dict:
     return base
 
 
-def _confirm_run(config: dict | None = None, *, spec: str = SPEC,
+def _confirm_run(config: dict | None = None, *, spec: str | None = SPEC,
                  participants: list[tuple[str, str]] | None = None,
                  stances: dict[str, list[str]] | None = None,
                  with_review: bool = True) -> tuple[str, int]:
@@ -134,8 +134,9 @@ def _confirm_run(config: dict | None = None, *, spec: str = SPEC,
     apply_run_config(run_id, definition, config or {})
     write_artifact(run_id, "idea", "# 想法\n\n" + IDEA, created_by="user", inputs=[],
                    status="approved")
-    write_artifact(run_id, "requirement", spec, created_by="requirement",
-                   inputs=["proposal", "discussion"], status="draft")
+    if spec is not None:
+        write_artifact(run_id, "requirement", spec, created_by="requirement",
+                       inputs=["proposal", "discussion"], status="draft")
     with session_scope() as s:
         discuss_id = s.query(Node).filter(Node.run_id == run_id,
                                           Node.node_key == "discuss").one().id
@@ -685,3 +686,372 @@ def test_the_chair_dedupes_the_program_findings(monkeypatch) -> None:
     assert len(items) == 1 and items[0]["requirement"] == "R1"
     assert seen and "归类去重" in next(call["text"] for call in seen
                                        if call["kind"] == "confirm_merge")
+
+
+# ---------------- S5.7：校验器、续开短路、参数开关与行为分支 ----------------
+def test_structured_output_validators_reject_the_remaining_bad_shapes() -> None:
+    """结构化输出的校验器逐个报错分支：坏的形状都要带着明确原因被拒。"""
+    from app.meeting.protocols.confirm import (_validate_expected, _validate_fidelity,
+                                              _validate_items, _validate_merge,
+                                              _validate_quality)
+
+    assert _validate_expected(["D1"])({"expected": "不是数组"}) == ["expected 须是数组"]
+    assert _validate_expected(["D1"])({"expected": ["不是对象"]}) == ["expected 的每一项须是对象"]
+    assert _validate_expected(["D1"])({"expected": []}) == [
+        "expected 须恰好覆盖这些决策点：['D1']"]
+    assert _validate_expected(["D1"])({"expected": [{"index": "D1", "content": " "}]}) == [
+        "D1：content 不能为空"]
+    assert _validate_fidelity(["D1"])({"checks": "不是数组"}) == ["checks 须是数组"]
+    assert _validate_fidelity(["D1"])({"checks": ["不是对象"]}) == ["checks 的每一项须是对象"]
+    assert _validate_fidelity(["D1"])({"checks": []}) == [
+        "checks 须恰好覆盖这些决策点：['D1']"]
+    assert _validate_fidelity(["D1"])({"checks": [{"index": "D1", "result": "看不出来"}]}) == [
+        "D1：result 须是 faithful、distorted、missing 之一"]
+    assert _validate_fidelity(["D1"])({"checks": [{"index": "D1", "result": "distorted"}]}) == [
+        "D1：走样和遗漏必须写 reason"]
+    assert _validate_fidelity(["D1"])({
+        "checks": [{"index": "D1", "result": "faithful"}], "added": "不是数组"}) == [
+        "added 须是数组"]
+    assert _validate_fidelity(["D1"])({
+        "checks": [{"index": "D1", "result": "faithful"}],
+        "added": [{"requirement": "R1"}]}) == ["added 的每一项须有 requirement 与 reason"]
+    assert _validate_quality({"issues": "不是数组"}) == ["issues 须是数组"]
+    assert _validate_quality({"issues": [{"requirement": "R1"}]}) == [
+        "第 1 条意见缺少 requirement 或 problem"]
+    assert _validate_items(allow_empty=False)({"items": "不是数组"}) == ["items 须是数组"]
+    assert _validate_items(allow_empty=False)({"items": []}) == ["items 须是非空数组"]
+    assert _validate_items(allow_empty=True)({"items": [{"problem": " "}]}) == [
+        "第 1 条缺少 problem"]
+    assert _validate_merge()({"items": [], "duplicates": "不是数组"}) == ["duplicates 须是序号数组"]
+
+
+def test_resuming_skips_confirm_steps_whose_results_are_already_in_state(monkeypatch) -> None:
+    """各步的 done 标记命中后的直推：崩溃重入不再调模型，按顺序推进下一步。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _confirm_run()
+    steps = ("intake", "prepare", "expect", "fidelity", "quality", "merge", "verdict")
+    mtg = _confirm_session(run_id, node_id, phase="intake",
+                           state={"done": {step: 1 for step in steps}})
+    expected = {"intake": "prepare", "prepare": "expect", "expect": "fidelity",
+                "fidelity": "quality", "quality": "merge", "merge": "verdict",
+                "verdict": "report"}
+    protocol = confirm_module.ConfirmProtocol()
+
+    for step, target in expected.items():
+        result = asyncio.run(getattr(protocol, f"step_{step}")(mtg))
+        assert result.action == "advance" and result.next == target, step
+
+    assert seen == []
+
+
+def test_mechanical_flag_short_circuits_the_model_steps() -> None:
+    """机械核对不过时：写预期、忠实性核对、质量评审三步都不调模型，直推汇总。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="expect", state={"mechanical": ["有问题"]})
+    protocol = confirm_module.ConfirmProtocol()
+
+    assert asyncio.run(protocol.step_expect(mtg)).next == "merge"
+    assert asyncio.run(protocol.step_fidelity(mtg)).next == "merge"
+    assert asyncio.run(protocol.step_quality(mtg)).next == "merge"
+
+
+def test_expected_first_switch_skips_the_expect_step(monkeypatch) -> None:
+    """expected_first=False：不做"先写预期"，直接进入忠实性核对。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _confirm_run(config={"params": {"confirm": {"expected_first": False}}})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    assert "expect" not in Counter(call["kind"] for call in seen)
+
+
+def test_expect_step_skips_itself_when_the_ledger_has_no_closed_points() -> None:
+    """账本里没有已了结的决策点：不向模型要"对零个点的预期"，直接进忠实性核对。"""
+    run_id, node_id = _confirm_run()
+    from app.db.models import DecisionPoint, Meeting as MeetingRow
+    with session_scope() as s:
+        meeting_ids = [row.id for row in s.query(MeetingRow).filter(
+            MeetingRow.run_id == run_id).all()]
+        s.query(DecisionPoint).filter(
+            DecisionPoint.meeting_id.in_(meeting_ids)).delete(synchronize_session=False)
+    mtg = _confirm_session(run_id, node_id, phase="expect", state={})
+
+    result = asyncio.run(confirm_module.ConfirmProtocol().step_expect(mtg))
+
+    assert result.action == "advance" and result.next == "fidelity"
+
+
+def test_intake_without_participants_defers_to_prepare(monkeypatch) -> None:
+    """带着反馈续开、参会者还没建出来：受理直推准备，不空调模型。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="intake",
+                           state={"intake_feedback": "用户要求重新确认"})
+    protocol = confirm_module.ConfirmProtocol()
+
+    result = asyncio.run(protocol.step_intake(mtg))
+
+    assert result.action == "advance" and result.next == "prepare"
+    assert seen == []
+
+
+def test_intake_normalizes_an_unknown_item_kind(monkeypatch) -> None:
+    """受理时模型给出的类别不在清单内：按质量意见入账，不丢这条。"""
+    install(monkeypatch, _replies(confirm_intake=json.dumps({"items": [
+        {"kind": "看起来像走样", "requirement": "R1", "problem": "验收标准不清楚",
+         "suggestion": "写细一点"}]}, ensure_ascii=False)), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="intake",
+                           state={"intake_feedback": "用户认为 R1 不清楚"})
+    store.add_participant(mtg.meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+
+    result = asyncio.run(confirm_module.ConfirmProtocol().step_intake(mtg))
+
+    assert result.action == "advance" and result.next == "prepare"
+    items = [item for item in mtg.state()["items"] if item["origin"] == "user"]
+    assert len(items) == 1 and items[0]["kind"] == "quality"
+
+
+def test_partitioned_coverage_falls_back_to_full_checking() -> None:
+    """分区核对：对应不回去的核对者与需求方代理都核对全部已了结的决策点。"""
+    run_id, node_id = _confirm_run(stances={"architect": ["D1"]})
+    mtg = _confirm_session(run_id, node_id, phase="fidelity", state={})
+    discussion = store.latest_meeting(run_id, "discussion")
+    store.add_participant(discussion["id"], role_key="requester_proxy",
+                          display_name="需求方代理", mode="proxy", system_prompt="只答事实")
+    points = store.list_decision_points(discussion["id"])
+    checkers = [
+        {"id": 1, "role_key": "architect", "display_name": "架构师"},
+        {"id": 2, "role_key": "临时顾问", "display_name": "临时顾问"},
+        {"id": 3, "role_key": "requester_proxy", "display_name": "需求方代理"},
+    ]
+
+    assignments = confirm_module.ConfirmProtocol()._assignments(
+        mtg, checkers, points, "partitioned")
+
+    assert assignments[1] == ["D1"]                    # 表过态的那一个
+    assert assignments[2] == ["D1", "D2"]              # 对应不回去：全员核对
+    assert assignments[3] == ["D1", "D2"]              # 需求方代理：全员核对
+
+
+def test_incremental_assignments_cover_gaps_and_changed_requirements(monkeypatch) -> None:
+    """增量轮：只看上一轮走样/遗漏的点（D1）与改动需求引用的点（R3 → D2）。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="fidelity", state={
+        "last_items": [{"kind": "distorted", "index": "D1"}], "changed": ["R3"]})
+
+    assignments = confirm_module.ConfirmProtocol()._incremental_assignments(
+        mtg, {"1": ["D1", "D2"], "2": []})
+
+    assert assignments == {"1": ["D1", "D2"], "2": []}
+
+
+def test_quality_rows_outside_the_current_scope_are_dropped(monkeypatch) -> None:
+    """质量评审的入账：不是现有需求编号的不计、重复的只留一条。"""
+    install(monkeypatch, _replies(quality=json.dumps({"issues": [
+        {"requirement": "R9", "problem": "不是现有需求编号", "suggestion": ""},
+        {"requirement": "R1", "problem": "验收标准不清楚", "suggestion": "写细一点"},
+        {"requirement": "R1", "problem": "验收标准不清楚", "suggestion": "写细一点"},
+    ]}, ensure_ascii=False)), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="quality", state={})
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="质量评审",
+                          mode="quality_reviewer", system_prompt="你是质量评审")
+
+    result = asyncio.run(confirm_module.ConfirmProtocol().step_quality(mtg))
+
+    assert result.action == "advance" and result.next == "merge"
+    issues = mtg.state()["quality_issues"]
+    assert len(issues) == 1 and issues[0]["location"] == "R1"
+
+
+def test_quality_rows_outside_the_incremental_scope_are_dropped(monkeypatch) -> None:
+    """增量轮的质量评审只看本轮该看的需求：其余编号的意见不计入。"""
+    install(monkeypatch, _replies(quality=json.dumps({"issues": [
+        {"requirement": "R2", "problem": "本轮不核对 R2", "suggestion": ""},
+        {"requirement": "R1", "problem": "验收标准不清楚", "suggestion": "写细一点"},
+    ]}, ensure_ascii=False)), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="quality", state={
+        "last_items": [{"kind": "quality", "requirement": "R1"}]})
+    store.update_meeting(mtg.meeting_id, round=2)
+    store.add_participant(mtg.meeting_id, role_key="qa", display_name="质量评审",
+                          mode="quality_reviewer", system_prompt="你是质量评审")
+
+    result = asyncio.run(confirm_module.ConfirmProtocol().step_quality(mtg))
+
+    assert result.action == "advance" and result.next == "merge"
+    issues = mtg.state()["quality_issues"]
+    assert len(issues) == 1 and issues[0]["location"] == "R1"
+
+
+def test_dedupe_merges_findings_at_the_same_spot() -> None:
+    """同处的发现合并：走样/遗漏按决策点合并（问题拼接、建议取先有的），质量意见按需求与问题去重。"""
+    rows = [
+        {"kind": "distorted", "index": "D1", "problem": "没按结论写", "suggestion": ""},
+        {"kind": "distorted", "index": "D1", "problem": "还漏了验收", "suggestion": "按结论重写"},
+        {"kind": "missing", "index": "D2", "problem": "没有对应需求", "suggestion": ""},
+        {"kind": "quality", "requirement": "R1", "problem": "太笼统", "suggestion": ""},
+        {"kind": "quality", "requirement": "R1", "problem": "太笼统", "suggestion": "写细一点"},
+    ]
+
+    merged = confirm_module._dedupe(rows)
+
+    assert len(merged) == 3
+    assert merged[0]["problem"] == "没按结论写；还漏了验收"
+    assert merged[0]["suggestion"] == "按结论重写"
+    assert merged[2]["suggestion"] == "写细一点"
+
+
+def test_last_items_text_marks_how_each_item_was_handled() -> None:
+    """上一轮清单的处理情况：需求改动的记"已改动"，机械核对的重核，其余本轮重核。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={
+        "last_items": [
+            {"id": "C1", "kind": "quality", "requirement": "R1", "problem": "问题一"},
+            {"id": "C2", "kind": "mechanical", "problem": "问题二"},
+            {"id": "C3", "kind": "distorted", "index": "D1", "problem": "问题三"}],
+        "changed": ["R1"]})
+
+    text = confirm_module._last_items_text(mtg)
+
+    assert "已改动" in text and "按当前规格重新核对" in text and "本轮重新核对" in text
+
+
+def test_missing_chair_fails_fatally() -> None:
+    """会议缺评审主席：带明确的错误失败，不让后续步骤空转。"""
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="intake", state={})
+
+    with pytest.raises(NodeFailure) as excinfo:
+        confirm_module._chair(mtg)
+
+    assert "需求确认会议缺少评审主席" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+def test_prepare_fails_without_the_requirement_artifact(monkeypatch) -> None:
+    """没有需求规格工件时准备步带明确的错误失败。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run(spec=None)
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+
+    with pytest.raises(NodeFailure) as excinfo:
+        asyncio.run(confirm_module.ConfirmProtocol().step_prepare(mtg))
+
+    assert "规格还没有产出" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+def test_prepare_fails_without_a_discussion_meeting(monkeypatch) -> None:
+    """没有讨论会议可取核对者与账本：准备步带明确的错误失败。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+    monkeypatch.setattr(confirm_module, "_discussion", lambda _mtg: None)
+
+    with pytest.raises(NodeFailure) as excinfo:
+        asyncio.run(confirm_module.ConfirmProtocol().step_prepare(mtg))
+
+    assert "缺少讨论会议" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+def test_prepare_fails_when_the_role_library_has_no_chair(monkeypatch) -> None:
+    """角色库里没有评审主席模板：准备步带明确的错误失败。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+    monkeypatch.setattr(confirm_module, "role_template", lambda _key: None)
+
+    with pytest.raises(NodeFailure) as excinfo:
+        asyncio.run(confirm_module.ConfirmProtocol().step_prepare(mtg))
+
+    assert "没有评审主席" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+def test_confirm_precheck_requires_a_pass_or_user_acceptance() -> None:
+    """详设的程序前置检查：结论不是通过、人也没接受现状时，报告的前置检查不通过。"""
+    protocol = confirm_module.ConfirmProtocol()
+
+    assert protocol._precheck("pass", False) == (True, "")
+    assert protocol._precheck("block", True) == (True, "")
+    assert protocol._precheck("block", False) == (
+        False, "需求确认不通过，需求分析师需要按清单修改")
+
+
+def _replace_latest_discussion(run_id: str, participants: list[tuple[str, str]]) -> None:
+    """再建一场"最新的"讨论会议：用它替换确认会继承的参会者与账本。"""
+    init_db()
+    with session_scope() as s:
+        discuss_id = s.query(Node).filter(Node.run_id == run_id,
+                                          Node.node_key == "discuss").one().id
+    meeting_id = store.create_meeting(run_id=run_id, node_id=discuss_id, node_key="discuss",
+                                      protocol="discussion", charter={"sections": []}, config={})
+    store.update_meeting(meeting_id, status="completed", phase="done", round=1)
+    for role_key, mode in participants:
+        store.add_participant(meeting_id, role_key=role_key, display_name=role_key,
+                              mode=mode, system_prompt=f"你是{role_key}")
+    store.upsert_decision_point(meeting_id, "D1", title="首版的范围与入口",
+                                question="首版做哪些功能", options_json=["网页版"],
+                                status="agreed", conclusion="网页版", closed_round=1,
+                                raised_by="architect")
+
+
+def test_quality_reviewers_fall_back_to_the_role_library(monkeypatch) -> None:
+    """没有评审会议、讨论会议也没有可当质量评审的参会者：从角色库取适合评审的前三名。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run(with_review=False)
+    _replace_latest_discussion(run_id, [("requester_proxy", "proxy")])
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+
+    confirm_module.ConfirmProtocol()._ensure_participants(mtg)
+
+    quality = [row for row in store.list_participants(mtg.meeting_id)
+               if row["mode"] == "quality_reviewer"]
+    assert [row["role_key"] for row in quality] == ["architect", "ux", "qa"]
+
+
+def test_quality_reviewer_fallback_respects_the_configured_count(monkeypatch) -> None:
+    """从角色库兜底时也按运行级配置的固定人数截断。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run(config={"rosters": {"reviewers": {"count": 2}}},
+                                   with_review=False)
+    _replace_latest_discussion(run_id, [("requester_proxy", "proxy")])
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+
+    confirm_module.ConfirmProtocol()._ensure_participants(mtg)
+
+    quality = [row for row in store.list_participants(mtg.meeting_id)
+               if row["mode"] == "quality_reviewer"]
+    assert [row["role_key"] for row in quality] == ["architect", "ux"]
+
+
+def test_prepare_fails_without_checkers(monkeypatch) -> None:
+    """讨论会议没有核对者：带明确的错误失败。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    _replace_latest_discussion(run_id, [("facilitator", "facilitator")])
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+
+    with pytest.raises(NodeFailure) as excinfo:
+        confirm_module.ConfirmProtocol()._ensure_participants(mtg)
+
+    assert "没有可用的核对者" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+def test_prepare_fails_when_no_quality_reviewer_can_be_found(monkeypatch) -> None:
+    """角色库里也没有适合评审的角色（环境损坏）：在人数下限处直接失败，不带着空评审者开会。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run(with_review=False)
+    _replace_latest_discussion(run_id, [("requester_proxy", "proxy")])
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+    monkeypatch.setattr(confirm_module, "role_library", lambda: [])
+
+    with pytest.raises(NodeFailure) as excinfo:
+        confirm_module.ConfirmProtocol()._ensure_participants(mtg)
+
+    assert "评审者人数不足" in str(excinfo.value) and excinfo.value.fatal is True

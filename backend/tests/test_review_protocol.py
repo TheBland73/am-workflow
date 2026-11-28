@@ -89,7 +89,8 @@ def _replies(**overrides) -> dict:
     return base
 
 
-def _review_run(config: dict | None = None, *, proxy: bool = False) -> tuple[str, int]:
+def _review_run(config: dict | None = None, *, proxy: bool = False,
+                proposal: bool = True) -> tuple[str, int]:
     init_db()
     seed_defaults()
     run_id = f"review-run-{next(_counter)}"
@@ -103,8 +104,9 @@ def _review_run(config: dict | None = None, *, proxy: bool = False) -> tuple[str
     apply_run_config(run_id, definition, config or {})
     write_artifact(run_id, "idea", "# 想法\n\n" + IDEA, created_by="user", inputs=[],
                    status="approved")
-    write_artifact(run_id, "proposal", PROPOSAL, created_by="facilitator",
-                   inputs=["idea", "discussion"], status="draft")
+    if proposal:
+        write_artifact(run_id, "proposal", PROPOSAL, created_by="facilitator",
+                       inputs=["idea", "discussion"], status="draft")
     with session_scope() as s:
         discuss_id = s.query(Node).filter(Node.run_id == run_id,
                                           Node.node_key == "discuss").one().id
@@ -219,6 +221,21 @@ def _review_session(run_id: str, node_id: int, *, phase: str,
                           mode="author", system_prompt="你是执笔者")
     store.add_participant(meeting_id, role_key="architect", display_name="架构师",
                           mode="reviewer", system_prompt="你是评审者")
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        ctx = NodeContext(run_id=run_id, node_id=node_id, node_key="review", type="MEETING",
+                          name="评审会议", phase=phase, config=dict(node.config_json or {}),
+                          assignee={}, attempt_id=0, attempt_no=1)
+    return MeetingSession(meeting_id=meeting_id, ctx=ctx)
+
+
+def _bare_review_meeting(run_id: str, node_id: int, *, phase: str = "intake",
+                         state: dict | None = None, round_no: int = 1) -> MeetingSession:
+    """手工建一场没有参会者的评审会议，用来直接驱动单个步骤与防御分支。"""
+    meeting_id = store.create_meeting(run_id=run_id, node_id=node_id, node_key="review",
+                                      protocol="review", charter={}, config={})
+    store.update_meeting(meeting_id, phase=phase, round=round_no)
+    store.set_state(meeting_id, dict(state or {}))
     with session_scope() as s:
         node = s.get(Node, node_id)
         ctx = NodeContext(run_id=run_id, node_id=node_id, node_key="review", type="MEETING",
@@ -1027,3 +1044,320 @@ def test_review_report_sections_follow_the_design_order(monkeypatch) -> None:
 
     body = parse_front_matter(read_artifact(run_id, "review"))[1]
     assert body.index("## 结论") < body.index("## 问题清单及处置状态") < body.index("## 优点")
+
+
+# ---------------- S5.7：校验器、续开短路、参数开关与行为分支 ----------------
+def test_structured_output_validators_reject_the_remaining_bad_shapes() -> None:
+    """结构化输出的校验器逐个报错分支：坏的形状都要带着明确原因被拒。"""
+    from app.meeting.protocols.review import (_validate_answers, _validate_checklist,
+                                              _validate_focus, _validate_intake,
+                                              _validate_merge, _validate_responses,
+                                              _validate_review, _validate_rulings,
+                                              _validate_verified)
+
+    assert _validate_intake({"issues": "不是数组"}) == ["issues 须是数组"]
+    assert _validate_intake({"issues": []}) == ["issues 须是非空数组"]
+    assert _validate_intake({"issues": ["不是对象"]}) == ["每条意见须是对象"]
+    assert _validate_intake({"issues": [{"problem": "   "}]}) == ["每条意见须有 problem"]
+    assert _validate_checklist({"checklist": []}) == ["checklist 须是非空字符串数组"]
+    assert _validate_checklist({"checklist": ["合法", 5]}) == ["checklist 须是非空字符串数组"]
+    assert _validate_focus({"focus": "不是数组"}) == ["focus 须是非空字符串数组"]
+    assert _validate_focus({"focus": ["  "]}) == ["focus 须是非空字符串数组"]
+    assert _validate_review({"strengths": "不是数组", "issues": []}) == ["strengths 须是字符串数组"]
+    assert _validate_review({"strengths": [], "issues": [], "resolved": "不是数组"},
+                            delta=True) == ["resolved 须是数组"]
+    assert _validate_review({"strengths": [], "issues": [],
+                             "resolved": [{"id": " ", "handled": True}]},
+                            delta=True) == ["resolved 的每一项须有 id 与布尔值 handled"]
+    assert _validate_merge({"issues": [{"problem": ""}]}) == ["每条意见须有 problem"]
+    assert _validate_responses(["I1"])({"responses": "不是数组"}) == ["responses 须是数组"]
+    assert _validate_responses(["I1"])({"responses": ["不是对象"]}) == ["responses 的每一项须是对象"]
+    assert _validate_responses(["I1"])({"responses": []}) == [
+        "responses 须恰好覆盖这些意见：['I1']"]
+    assert _validate_responses(["I1"])({"responses": [{"id": "I1", "accepted": "是"}]}) == [
+        "I1：accepted 须是布尔值"]
+    assert _validate_responses(["I1"])({"responses": [{"id": "I1", "accepted": False}]}) == [
+        "I1：不采纳必须写明理由"]
+    assert _validate_responses(["I1"])({
+        "responses": [{"id": "I1", "accepted": True, "ask_requester": [5]}]}) == [
+        "I1：ask_requester 须是字符串数组"]
+    assert _validate_answers(2)({"answers": [{"text": "只有一条"}]}) == [
+        "answers 须恰好包含 2 项，逐条对应问题"]
+    assert _validate_answers(2)({"answers": [{"text": "一"}, {"text": " "}]}) == [
+        "第 2 条回答缺少 text"]
+    assert _validate_rulings(["I1"])({"rulings": "不是数组"}) == ["rulings 须是数组"]
+    assert _validate_rulings(["I1"])({"rulings": ["不是对象"]}) == ["rulings 的每一项须是对象"]
+    assert _validate_rulings(["I1"])({"rulings": []}) == ["rulings 须恰好覆盖这些意见：['I1']"]
+    assert _validate_rulings(["I1"])({
+        "rulings": [{"id": "I1", "keep": "是", "note": "理由"}]}) == ["I1：keep 须是布尔值"]
+    assert _validate_rulings(["I1"])({
+        "rulings": [{"id": "I1", "keep": True, "note": " "}]}) == ["I1：note 不能为空"]
+    assert _validate_verified(["I1"])({"verified": "不是数组"}) == ["verified 须是数组"]
+    assert _validate_verified(["I1"])({"verified": ["不是对象"]}) == ["verified 的每一项须是对象"]
+    assert _validate_verified(["I1"])({"verified": []}) == ["verified 须恰好覆盖这些意见：['I1']"]
+    assert _validate_verified(["I1"])({"verified": [{"id": "I1", "fixed": 1}]}) == [
+        "I1：fixed 须是布尔值"]
+
+
+def test_missing_chair_or_author_fails_fatally() -> None:
+    """会议缺评审主席或执笔者：带明确的错误失败，不让后续步骤空转。"""
+    run_id, node_id = _review_run()
+    mtg = _bare_review_meeting(run_id, node_id)
+
+    with pytest.raises(NodeFailure) as chair:
+        review_module._chair(mtg)
+    with pytest.raises(NodeFailure) as author:
+        review_module._author(mtg)
+
+    assert "评审会议缺少评审主席" in str(chair.value) and chair.value.fatal is True
+    assert "评审会议缺少执笔者" in str(author.value) and author.value.fatal is True
+
+
+def test_later_round_charter_lists_only_decision_issues() -> None:
+    """详设 §8.3：第 2 轮起章程里的"上一轮意见"只列决策级的，文字级意见不进。"""
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="review", state={"issues": [
+        {**ISSUE, "id": "I1", "round": 1, "category": "wording"},
+        {**ISSUE, "id": "I2", "round": 1, "category": "decision", "severity": "blocker",
+         "disposition": "已处理"}], "checklist": ["范围是否完整"]})
+    store.update_meeting(mtg.meeting_id, round=2)
+
+    charter = review_module._charter_dict(mtg)
+
+    section = next(row["text"] for row in charter["sections"]
+                   if row["title"] == "上一轮的决策级意见与处理情况")
+    assert "I2" in section and "I1" not in section
+
+
+def test_speaker_fallback_and_family_hint_guards(monkeypatch) -> None:
+    """提出者不在名单时用第一名评审者；没有讨论会议或取不到参与者时异家族提示为空。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="discuss")
+
+    speaker = review_module._speaker_for(mtg, {"id": "I1", "raised_by": ["已离任的评审者"]})
+    assert speaker["display_name"] == "架构师"
+
+    bare = _bare_review_meeting(run_id, node_id, phase="discuss")
+    assert review_module._speaker_for(bare, {"id": "I1", "raised_by": []}) is None
+
+    monkeypatch.setattr(review_module, "_discussion", lambda _mtg: None)
+    assert review_module._family_hint(mtg) == ""
+    monkeypatch.setattr(review_module, "_discussion", lambda _mtg: {"id": 0, "state": {}})
+    assert review_module._family_hint(mtg) == ""
+
+
+def test_round_started_event_is_emitted_once_per_round(monkeypatch) -> None:
+    """同一轮的轮次开始事件只发一次：重入再调一次不再发。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="prepare", state={})
+    emitted: list[dict] = []
+    original_emit = review_module.emit
+
+    async def capture_emit(run_id_, type_, node_id_, payload):
+        if type_ == "review_round_started":
+            emitted.append(dict(payload))
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(review_module, "emit", capture_emit)
+    asyncio.run(review_module._round_started(mtg))
+    asyncio.run(review_module._round_started(mtg))
+
+    assert len(emitted) == 1 and emitted[0]["round"] == 1
+
+
+def test_intake_without_participants_defers_to_prepare(monkeypatch) -> None:
+    """带着反馈续开、参会者还没建出来（如准备步中断）：受理直推准备，不空调模型。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run()
+    mtg = _bare_review_meeting(run_id, node_id, phase="intake",
+                               state={"intake_feedback": "用户要求重新评审"})
+    protocol = review_module.ReviewProtocol()
+
+    result = asyncio.run(protocol.step_intake(mtg))
+
+    assert result.action == "advance" and result.next == "prepare"
+    assert seen == []
+
+
+def test_resuming_skips_review_steps_whose_results_are_already_in_state(monkeypatch) -> None:
+    """各步的 done 标记命中后的直推：崩溃重入不再调模型，按顺序推进下一步。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="intake")
+    steps = ("intake", "prepare", "points", "review", "merge", "respond", "discuss",
+             "verdict", "revise", "verify")
+    store.set_state(mtg.meeting_id, {"done": {step: 1 for step in steps}})
+    expected = {"intake": "prepare", "prepare": "points", "points": "review",
+                "review": "merge", "merge": "respond", "respond": "discuss",
+                "discuss": "verdict", "verdict": "revise", "revise": "verify",
+                "verify": "report"}
+    protocol = review_module.ReviewProtocol()
+
+    for step, target in expected.items():
+        result = asyncio.run(getattr(protocol, f"step_{step}")(mtg))
+        assert result.action == "advance" and result.next == target, step
+
+    assert seen == []
+
+
+def test_pre_brief_and_conference_switches_skip_their_steps(monkeypatch) -> None:
+    """pre_brief=False 跳过要点步（评审就用普通指令）；conference=False 跳过主席定夺步。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run(config={"params": {"review": {"pre_brief": False,
+                                                                "conference": False}}})
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    kinds = Counter(call["kind"] for call in seen)
+    assert "review_points" not in kinds and "review_defend" not in kinds
+    assert "review_rule" not in kinds
+    review_call = next(call for call in seen if call["kind"] == "review")
+    assert "## 你写下的评审要点" not in review_call["text"]
+
+
+def test_reviewers_max_limits_the_panel_and_min_shortage_fails(monkeypatch) -> None:
+    """reviewers_max 截断评审者人数；评审者少于 reviewers_min 时带明确的错误失败。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run(config={"params": {"review": {"reviewers_max": 1}}})
+
+    drive(run_id, node_id, _never, idea=IDEA)
+
+    reviewers = [row for row in store.list_participants(_meeting(node_id)["id"])
+                 if row["mode"] == "reviewer"]
+    assert len(reviewers) == 1
+
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run(config={"params": {"review": {"reviewers_min": 99}}})
+    with pytest.raises(NodeFailure) as excinfo:
+        drive(run_id, node_id, _never, idea=IDEA)
+
+    assert "评审者人数不足" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+def _replace_latest_discussion(run_id: str, participants: list[tuple[str, str]]) -> None:
+    """再建一场"最新的"讨论会议：用它替换评审会继承的参会者与账本。"""
+    init_db()
+    with session_scope() as s:
+        discuss_id = s.query(Node).filter(Node.run_id == run_id,
+                                          Node.node_key == "discuss").one().id
+    meeting_id = store.create_meeting(run_id=run_id, node_id=discuss_id, node_key="discuss",
+                                      protocol="discussion", charter={"sections": []}, config={})
+    store.update_meeting(meeting_id, status="completed", phase="done", round=1)
+    for role_key, mode in participants:
+        store.add_participant(meeting_id, role_key=role_key, display_name=role_key,
+                              mode=mode, system_prompt=f"你是{role_key}")
+    store.upsert_decision_point(meeting_id, "D1", title="首版的范围与入口",
+                                question="首版做哪些功能", options_json=["网页版"],
+                                status="agreed", conclusion="网页版", closed_round=1,
+                                raised_by="架构师")
+
+
+def test_author_comes_from_the_template_when_the_discussion_has_no_facilitator(
+        monkeypatch) -> None:
+    """讨论会议没有主持人可继承时，执笔者取角色库的 facilitator 模板。"""
+    from app.engine.templates import role_template
+
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    _replace_latest_discussion(run_id, [("architect", "participant"), ("ux", "participant")])
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    authors = [row for row in store.list_participants(_meeting(node_id)["id"])
+               if row["mode"] == "author"]
+    assert len(authors) == 1 and authors[0]["role_key"] == "facilitator"
+    # 名字取自 facilitator 模板（不是别的模板）：模板换了人这里会变
+    assert authors[0]["display_name"] == role_template("facilitator")["name"]
+
+
+def test_reviewers_fall_back_to_the_role_library(monkeypatch) -> None:
+    """讨论会议没有可继承的参会者时，评审者从角色库里取适合评审的前三名。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    _replace_latest_discussion(run_id, [("facilitator", "facilitator")])
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    reviewers = [row for row in store.list_participants(_meeting(node_id)["id"])
+                 if row["mode"] == "reviewer"]
+    assert [row["role_key"] for row in reviewers] == ["architect", "ux", "qa"]
+
+
+def test_role_library_fallback_respects_the_configured_reviewer_count(monkeypatch) -> None:
+    """从角色库兜底时也按运行级配置的固定人数截断。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run(config={"rosters": {"reviewers": {"count": 2}}})
+    _replace_latest_discussion(run_id, [("facilitator", "facilitator")])
+
+    result = drive(run_id, node_id, _never, idea=IDEA)
+
+    assert result["done"] is True
+    reviewers = [row for row in store.list_participants(_meeting(node_id)["id"])
+                 if row["mode"] == "reviewer"]
+    assert [row["role_key"] for row in reviewers] == ["architect", "ux"]
+
+
+def test_discuss_skips_defending_when_there_is_no_reviewer_to_defend(
+        monkeypatch) -> None:
+    """有分歧却找不到提出这条意见的评审者：跳过辩护，主席照样出定夺。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(review_rule=lambda text: _rule(text, keep=True)), seen)
+    run_id, node_id = _review_run()
+    mtg = _bare_review_meeting(run_id, node_id, phase="discuss", state={
+        "issues": [{**ISSUE, "disputed": True}]})
+    store.add_participant(mtg.meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    protocol = review_module.ReviewProtocol()
+
+    result = asyncio.run(protocol.step_discuss(mtg))
+
+    assert result.action == "advance" and result.next == "verdict"
+    assert "review_defend" not in Counter(call["kind"] for call in seen)
+    assert Counter(call["kind"] for call in seen)["review_rule"] == 1
+
+
+def test_review_prepare_fails_without_a_proposal(monkeypatch) -> None:
+    """没有方案工件时准备步带明确的错误失败，不评审空方案。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run(proposal=False)
+    mtg = _review_session(run_id, node_id, phase="prepare")
+
+    with pytest.raises(NodeFailure) as excinfo:
+        asyncio.run(review_module.ReviewProtocol().step_prepare(mtg))
+
+    assert "方案还没有产出" in str(excinfo.value) and excinfo.value.fatal is True
+
+
+@pytest.mark.parametrize("draft, message", [
+    ("## 修改说明\n\n只改了范围一处。\n", "方案缺少这些章节"),
+    (PROPOSAL, "修订版缺少「## 修改说明」一节"),
+])
+def test_revising_with_a_bad_draft_is_rejected(monkeypatch, draft, message) -> None:
+    """修订稿缺章节或缺修改说明：带明确原因被拒，不写出不合格的版本。"""
+    install(monkeypatch, _replies(author_revise=draft), None)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="revise", state={"issues": [dict(ISSUE)]})
+
+    with pytest.raises(NodeFailure, match=message):
+        asyncio.run(review_module.ReviewProtocol().step_revise(mtg))
+
+    assert read_artifact(run_id, "proposal").count("# 建设方案") == 1   # 没有写出新版
+
+
+def test_precheck_rejects_a_returned_verdict_without_user_acceptance() -> None:
+    """详设的程序前置检查：结论为退回且人未接受、或有意见没改好时都不通过。"""
+    protocol = review_module.ReviewProtocol()
+
+    assert protocol._precheck("accept", False, []) == (True, "")
+    assert protocol._precheck("return", True, []) == (True, "")
+    assert protocol._precheck("accept", False, ["I1"]) == (False, "有意见没有改好：I1")
+    assert protocol._precheck("return", False, []) == (
+        False, "评审结论为退回，讨论会议需要先复议")

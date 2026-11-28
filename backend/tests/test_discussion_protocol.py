@@ -973,6 +973,26 @@ def test_a_proposal_missing_required_sections_is_rejected(monkeypatch) -> None:
         drive(run_id, node_id, _never, idea=IDEA)
 
 
+def test_a_proposal_body_below_the_artifact_floor_is_rejected(monkeypatch) -> None:
+    """六个章节都在但正文太短：程序附加的两节之后仍不到工件下限，照样被拒。
+
+    compose() 附加的章节让"章节齐全"变得廉价，所以正文长度必须由正文自己满足。
+    """
+    install(monkeypatch, _replies(proposal=""), None)
+    run_id, node_id = _meeting_run()
+    meeting_id, mtg = _bare_meeting(run_id, node_id, "draft")
+    store.upsert_decision_point(meeting_id, "D1", title="首版的范围",
+                                question="首版做哪些功能", options_json=["网页版"],
+                                status="agreed", conclusion="网页版", closed_round=1,
+                                raised_by="架构师")
+    draft = "\n\n".join(f"{title}\n内容。" for title in
+                        discussion_module.PROPOSAL_SECTIONS) + "\n\n补充说明：" + "略" * 20
+    assert 100 <= len(draft) < 200          # 过了正文下限，但加两节后仍不足 200
+
+    with pytest.raises(NodeFailure, match="建设方案校验未通过"):
+        discussion_module.DiscussionProtocol()._save_proposal(mtg, draft)
+
+
 def test_structured_output_validators_reject_bad_shapes() -> None:
     from app.meeting.protocols.discussion import (_validate_agenda, _validate_stances,
                                                   _validate_summaries)
