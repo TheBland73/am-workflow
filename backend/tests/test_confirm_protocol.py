@@ -609,3 +609,29 @@ def test_rework_branch_clears_last_report_fields() -> None:
     state = store.get_state(mtg.meeting_id)
     assert state["rework_pending"] is False
     assert state["summary"] is None and state["blocking"] is None
+
+
+def test_confirm_round_started_is_not_re_emitted_after_a_crash(monkeypatch) -> None:
+    """准备步先记完成标记再发轮次事件：事件发送处被杀，重入不会重复发同一轮的事件。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="prepare", state={})
+    protocol = confirm_module.ConfirmProtocol()
+    armed = {"on": True}
+    calls = {"n": 0}
+    original_emit = confirm_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if type_ == "review_round_started":
+            calls["n"] += 1
+            if armed["on"]:
+                armed["on"] = False                # 事件发出、完成标记还没写：进程在这里被杀
+                raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(confirm_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_prepare(mtg))
+    asyncio.run(protocol.step_prepare(mtg))
+
+    assert calls["n"] == 1                          # 重入不再重复发同一轮的轮次事件

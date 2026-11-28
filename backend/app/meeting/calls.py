@@ -296,6 +296,37 @@ async def speak(mtg: MeetingSession, participant: dict, *, kind: str, turn_kind:
     return {"turn_id": turn_id, "content": result.content, "data": data}
 
 
+async def reuse_or_speak(mtg: MeetingSession, key: str, *, require_data: bool = False,
+                         **kwargs) -> dict:
+    """步骤的模型调用只做一次：状态里记着这一步的发言就直接复用。
+
+    复用键在发言之前先认领（记下当时的发言行数）：崩溃落在"发言落盘、编号写上"之间时，
+    重入按"认领之后才落盘"找回这一次的发言，不重复调用模型。
+    """
+    turns = dict(mtg.state().get("step_turns") or {})
+    remembered = turns.get(key)
+    if isinstance(remembered, int):
+        found = store.get_turn(mtg.meeting_id, remembered)
+        if found is not None and (found.get("data") is not None or not require_data):
+            return found
+    elif isinstance(remembered, dict):
+        found = store.find_turn(mtg.meeting_id, phase=mtg.meeting()["phase"],
+                                round=int(kwargs.get("turn_round") or mtg.round_no()),
+                                kind=kwargs.get("turn_kind"),
+                                speaker_id=kwargs["participant"]["id"],
+                                after_seq=int(remembered.get("seq") or 0))
+        if found is not None and (found.get("data") is not None or not require_data):
+            return found
+    turns = dict(mtg.state().get("step_turns") or {})
+    turns[key] = {"seq": store.count_turns(mtg.meeting_id)}     # 认领：只认这次调用之后的发言
+    mtg.set_state(step_turns=turns)
+    result = await speak(mtg, **kwargs)
+    turns = dict(mtg.state().get("step_turns") or {})
+    turns[key] = result["turn_id"]
+    mtg.set_state(step_turns=turns)
+    return result
+
+
 async def speak_many(mtg: MeetingSession, calls: list[dict], *,
                      resumable: bool = True) -> list[dict]:
     """多个参会者并行发言，结果顺序与 calls 一致。
@@ -379,12 +410,16 @@ async def drain_interventions(mtg: MeetingSession) -> bool:
                                           input_budget=meeting_input_budget(mtg))
         ledger = render.ledger_segment(store.list_decision_points(mtg.meeting_id),
                                        round_no=mtg.meeting_round())
-        await speak(mtg, facilitator, kind="intervention_ack", turn_kind="facilitator_note",
-                    charter=charter,
-                    segments=[ledger, Segment("append", f"## 用户在会议进行中插话\n{text}",
-                                              name="插话")],
-                    instruction="逐条回应用户的插话：你理解它要求什么，接下来怎么安排。只写一段话。",
-                    drain=False)
+        # 认领式复用：回应落盘后被杀，重入按同一批插话的键找回这条回应，不再重复发言
+        batch = ",".join(str(item["id"]) for item in sorted(queued, key=lambda i: i["id"]))
+        await reuse_or_speak(
+            mtg, f"intervention_ack:{batch}",
+            participant=facilitator, kind="intervention_ack", turn_kind="facilitator_note",
+            charter=charter,
+            segments=[ledger, Segment("append", f"## 用户在会议进行中插话\n{text}",
+                                      name="插话")],
+            instruction="逐条回应用户的插话：你理解它要求什么，接下来怎么安排。只写一段话。",
+            drain=False)
     for item_id, turn_id in pairs:
         store.attach_intervention_turn(item_id, turn_id)
     return True

@@ -30,7 +30,7 @@ from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_suits_meeting, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, store
-from app.meeting.calls import meeting_input_budget, speak, speak_many
+from app.meeting.calls import meeting_input_budget, reuse_or_speak, speak, speak_many
 from app.meeting.checkpoints import record_auto_decision
 from app.meeting.protocols.base import MeetingProtocol, advance, done, register_protocol, suspend
 from app.meeting.rules import (DEFERRED, LEVEL_NAMES, OPEN_STATUSES, relax, rank_speakers, settle,
@@ -639,11 +639,11 @@ class DiscussionProtocol(MeetingProtocol):
         segments = []
         if materials:
             segments.append(Segment("append", f"## 背景材料\n{materials}", name="背景材料"))
-        result = await speak(mtg, _facilitator(mtg), kind="brief", turn_kind="brief",
-                             segments=segments, structured=_validate_brief,
-                             turn_round=mtg.meeting_round(),
-                             instruction=f"## 想法原文\n{(mtg.ctx.idea or '').strip()}"
-                                         f"{BRIEF_INSTRUCTION}")
+        result = await reuse_or_speak(
+            mtg, f"brief:{mtg.meeting_round()}", participant=_facilitator(mtg),
+            kind="brief", turn_kind="brief", segments=segments, structured=_validate_brief,
+            turn_round=mtg.meeting_round(),
+            instruction=f"## 想法原文\n{(mtg.ctx.idea or '').strip()}{BRIEF_INSTRUCTION}")
         brief = result["data"]["brief"].strip()
         questions = [str(item).strip() for item in result["data"].get("questions") or []
                      if str(item).strip()]
@@ -672,8 +672,9 @@ class DiscussionProtocol(MeetingProtocol):
                 materials, _truncated = mtg.materials()
                 segments = ([Segment("append", f"## 背景材料\n{materials}", name="背景材料")]
                             if materials else [])
-                rows = (await speak(
-                    mtg, proxy, kind="answer", turn_kind="answer", segments=segments,
+                rows = (await reuse_or_speak(
+                    mtg, f"clarify_answer:{mtg.meeting_round()}",
+                    participant=proxy, kind="answer", turn_kind="answer", segments=segments,
                     instruction=f"{ANSWER_INSTRUCTION}\n\n## 待澄清的问题\n{listing}",
                     structured=_validate_answers(len(questions)),
                     turn_round=mtg.meeting_round()))["data"]["answers"]
@@ -694,7 +695,7 @@ class DiscussionProtocol(MeetingProtocol):
                 decision={"action": "approve", "answered": len(questions),
                           "assumptions": sum(1 for item in clarifications
                                              if item["source"] == "assumption")},
-                title="澄清问题已回答")
+                title="澄清问题已回答", dedupe=True)
             mtg.set_state(clarifications=clarifications)
             return advance()
         decision = mtg.decision()
@@ -720,8 +721,9 @@ class DiscussionProtocol(MeetingProtocol):
                 store.add_turn(mtg.meeting_id, round=mtg.meeting_round(), phase="clarify",
                                speaker_id=None, speaker_name="用户", kind="answer",
                                content=content)
-        mtg.set_state(clarifications=clarifications)
-        mtg.ack_decision(decision)
+        # 澄清结果与决定认领一次写完：旧的"结果入状态、再单独 ack"两步之间被杀，
+        # 决定会永久滞留，后面的共识步会把它误当成还没消费的决定
+        mtg.set_state(clarifications=clarifications, handled_gate_id=decision["gate_id"])
         return advance()
 
     # ---------- 名单 ----------
@@ -755,20 +757,18 @@ class DiscussionProtocol(MeetingProtocol):
                 payload={"proposed": mtg.state()["roster"], "min": low, "max": high,
                          "fixed": fixed}))
         if decision["action"] == "approve" and mtg.participants("participant"):
-            result = self._finish_roster(mtg)
-            mtg.ack_decision(decision)
-            return result
-        # 驳回，或者通过时名单是空的：带着意见重新提议
+            return self._finish_roster(mtg, ack_gate_id=decision["gate_id"])
+        # 驳回，或者通过时名单是空的：带着意见重新提议；撤名单与决定认领一次写完
         for row in mtg.participants("participant"):
             store.update_participant(row["id"], status="removed")
-        mtg.set_state(roster=None,
+        mtg.set_state(roster=None, handled_gate_id=decision["gate_id"],
                       roster_feedback=decision.get("feedback") or "至少需要一名参会角色")
-        mtg.ack_decision(decision)
         return advance("roster")
 
     async def _propose(self, mtg, spec: dict, low: int, high: int) -> None:
         """名单的优先级：用户点名 > 主持人在人数要求内挑选。结果写成参会者。"""
         library = {row["role_key"]: row for row in role_library()}
+        attempt = 0                                 # 用户点名不经过提议发言，没有复用键
         if spec.get("role_keys"):
             configured = [str(key) for key in spec["role_keys"]]
             problems = [f"已不存在：{key}" for key in configured if key not in library]
@@ -793,8 +793,11 @@ class DiscussionProtocol(MeetingProtocol):
             if feedback:
                 segments.append(Segment("append", f"## 用户对上一份名单的意见\n{feedback}",
                                         name="名单意见"))
-            picked = (await speak(
-                mtg, _facilitator(mtg), kind="roster", turn_kind="roster_proposal",
+            # 提议按"第几次"区分：人驳回后同轮重提是新的发言，不能复用上一份被驳回的提议
+            attempt = int(mtg.state().get("roster_attempt") or 0) + 1
+            picked = (await reuse_or_speak(
+                mtg, f"roster_proposal:{mtg.meeting_round()}:{attempt}",
+                participant=_facilitator(mtg), kind="roster", turn_kind="roster_proposal",
                 segments=segments, instruction=f"{ROSTER_INSTRUCTION}\n{count_text}。",
                 structured=_validate_roster(library, low, high),
                 turn_round=mtg.meeting_round()))["data"]["participants"]
@@ -806,21 +809,30 @@ class DiscussionProtocol(MeetingProtocol):
             display = str(row.get("display_name")
                           or (template["name"] if template else "")).strip()
             normalized.append({**row, "role_key": key or None, "display_name": display})
+        existing = {(row["mode"], row["role_key"], row["display_name"])
+                    for row in mtg.participants()}
         for row in normalized:
             key = str(row.get("role_key") or "")
             template = library.get(key)
+            display = str(row.get("display_name") or "").strip()
+            if ("participant", key or None, display) in existing:
+                continue                       # 上次运行已经建过这行（崩溃重入），不重复建
             store.add_participant(
                 mtg.meeting_id, role_key=key or None,
-                display_name=str(row.get("display_name") or "").strip(),
+                display_name=display,
                 mode="participant",
                 system_prompt=template["system_prompt"] if template
                 else str(row.get("persona") or ""),
                 source=source, expertise=list((template or {}).get("meta", {}).get("tags") or []))
-        mtg.set_state(roster=normalized, roster_source=source)
+            existing.add(("participant", key or None, display))
+        mtg.set_state(roster=normalized, roster_source=source, roster_attempt=attempt)
 
-    def _finish_roster(self, mtg):
+    def _finish_roster(self, mtg, ack_gate_id: int | None = None):
         _write_charter(mtg)
-        mtg.set_state(roster_done=True)
+        changes = {"roster_done": True}
+        if ack_gate_id is not None:
+            changes["handled_gate_id"] = ack_gate_id   # 名单生效与决定认领一次写完
+        mtg.set_state(**changes)
         return advance()
 
     # ---------- 立场、议题、表态 ----------
@@ -920,10 +932,13 @@ class DiscussionProtocol(MeetingProtocol):
                                       ("respond", claimer)):
                     if f"{mark}:{kind}" in done:
                         continue
-                    await speak(mtg, speaker, kind=kind, turn_kind=kind, charter=charter,
-                                segments=_view(mtg, _EXCHANGE_KINDS),
-                                decision_point_id=point["id"], turn_round=round_no,
-                                instruction=instructions[kind])
+                    # 认领式复用：发言落盘、编号还没写上时被杀，重入按发言行找回这一段
+                    await reuse_or_speak(
+                        mtg, f"exchange:{round_no}:{mark}:{kind}",
+                        participant=speaker, kind=kind, turn_kind=kind, charter=charter,
+                        segments=_view(mtg, _EXCHANGE_KINDS),
+                        decision_point_id=point["id"], turn_round=round_no,
+                        instruction=instructions[kind])
                     _mark(mtg, f"{mark}:{kind}")
                 exchanges[point["index"]] += 1
         mtg.set_state(exchanges={**(mtg.state().get("exchanges") or {}), **exchanges})
@@ -1172,8 +1187,9 @@ class DiscussionProtocol(MeetingProtocol):
                     *_positions(mtg)]
         if previous:
             segments.append(Segment("append", f"## 上一版建设方案\n{previous}", name="上一版方案"))
-        result = await speak(
-            mtg, _facilitator(mtg), kind="proposal_revise" if previous else "proposal",
+        result = await reuse_or_speak(
+            mtg, f"proposal_draft:{mtg.meeting_round()}",
+            participant=_facilitator(mtg), kind="proposal_revise" if previous else "proposal",
             turn_kind="proposal", charter=_charter(mtg),
             segments=segments, turn_round=mtg.meeting_round(),
             instruction=REVISION_INSTRUCTION if previous else PROPOSAL_INSTRUCTION)
@@ -1244,8 +1260,9 @@ class DiscussionProtocol(MeetingProtocol):
             self._write_minutes(mtg, notes)
             mtg.set_state(review_notes=notes, check_pending=[])
             return self._finish(mtg)
-        result = await speak(
-            mtg, _facilitator(mtg), kind="proposal_revise", turn_kind="proposal_revise",
+        result = await reuse_or_speak(
+            mtg, f"proposal_revise:{check_round}",
+            participant=_facilitator(mtg), kind="proposal_revise", turn_kind="proposal_revise",
             charter=_charter(mtg), turn_round=check_round,
             segments=view + [Segment("append", f"## 复核意见\n{notes}", name="复核意见")],
             instruction=REVISE_INSTRUCTION)

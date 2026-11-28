@@ -27,7 +27,8 @@ from app.engine.runners import NodeFailure
 from app.engine.templates import role_library, role_suits_meeting, role_template
 from app.engine.validate import validate_artifact
 from app.meeting import minutes, proposal, render, review_rules, store
-from app.meeting.calls import meeting_input_budget, speak, speak_many
+from app.meeting.calls import meeting_input_budget, reuse_or_speak as _reuse_or_speak, \
+    speak, speak_many
 from app.meeting.protocols.base import (MeetingProtocol, advance, done, register_protocol,
                                         reroute_or_escalate)
 
@@ -426,36 +427,6 @@ def _step_key(step: str, mtg, ids: list[str], *, extra: str = "") -> str:
     return f"{step}:{_flow(mtg)}:{','.join(sorted(ids))}:{extra}"
 
 
-async def _reuse_or_speak(mtg, key: str, *, require_data: bool = False, **kwargs) -> dict:
-    """步骤的模型调用只做一次：状态里记着这一步的发言就直接复用。
-
-    复用键在发言之前先认领（记下当时的发言行数）：崩溃落在"发言落盘、编号写上"之间时，
-    重入按"认领之后才落盘"找回这一次的发言，不重复调用模型。
-    """
-    turns = dict(mtg.state().get("step_turns") or {})
-    remembered = turns.get(key)
-    if isinstance(remembered, int):
-        found = store.get_turn(mtg.meeting_id, remembered)
-        if found is not None and (found.get("data") is not None or not require_data):
-            return found
-    elif isinstance(remembered, dict):
-        found = store.find_turn(mtg.meeting_id, phase=mtg.meeting()["phase"],
-                                round=int(kwargs.get("turn_round") or mtg.round_no()),
-                                kind=kwargs.get("turn_kind"),
-                                speaker_id=kwargs["participant"]["id"],
-                                after_seq=int(remembered.get("seq") or 0))
-        if found is not None and (found.get("data") is not None or not require_data):
-            return found
-    turns = dict(mtg.state().get("step_turns") or {})
-    turns[key] = {"seq": store.count_turns(mtg.meeting_id)}     # 认领：只认这次调用之后的发言
-    mtg.set_state(step_turns=turns)
-    result = await speak(mtg, **kwargs)
-    turns = dict(mtg.state().get("step_turns") or {})
-    turns[key] = result["turn_id"]
-    mtg.set_state(step_turns=turns)
-    return result
-
-
 def _speaker_for(mtg, issue: dict) -> dict | None:
     """这条意见的提出者：按 raised_by 里的显示名找评审者，找不到就用第一名评审者。"""
     names = set(issue.get("raised_by") or [])
@@ -481,7 +452,7 @@ async def _round_started(mtg) -> None:
         return
     mtg.set_state(round_started=flow)
     await emit(mtg.run_id, "review_round_started", mtg.node_id, {
-        "meeting_id": mtg.meeting_id, "round": flow,
+        "meeting_id": mtg.meeting_id, "round": flow, "protocol": "review",
         "incremental": flow > 1,
         "rounds_max": int(mtg.params().get("rounds_max") or 3)})
 
@@ -523,7 +494,7 @@ class ReviewProtocol(MeetingProtocol):
             store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
                 **state, "rework_pending": False,
                 "verdict": None, "accepted_by_user": False, "summary": None, "blocking": None,
-                "gate_disposition": None,
+                "gate_disposition": None, "intake_to": None,
                 "unfixed": [], "discussed": [], "verify_retry_done": False,
                 "review_batch": []})
             mtg.reset_builder()
@@ -531,7 +502,9 @@ class ReviewProtocol(MeetingProtocol):
     # ---------- 受理 ----------
     async def step_intake(self, mtg):
         if _done(mtg, "intake"):
-            return advance("prepare")
+            # 受理步的去向随轮次来源不同：反馈轮直接去回应，正常轮去准备；
+            # 去向在受理入账时一并写进状态，崩溃重入按它走，不会把反馈轮带进完整重审
+            return advance(mtg.state().get("intake_to") or "prepare")
         text = str(mtg.state().get("intake_feedback") or "").strip()
         if not text:
             _mark(mtg, "intake")
@@ -551,7 +524,8 @@ class ReviewProtocol(MeetingProtocol):
         for issue in _add_issues_done:
             if issue["origin"] == "user" and not issue.get("raised_by"):
                 issue["raised_by"] = ["用户"]
-        _finish_step(mtg, "intake", issues=_add_issues_done, intake_feedback="")
+        _finish_step(mtg, "intake", issues=_add_issues_done, intake_feedback="",
+                     intake_to="respond")
         await _round_started(mtg)
         return advance("respond")
 

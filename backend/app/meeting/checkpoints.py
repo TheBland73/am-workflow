@@ -70,8 +70,24 @@ def get_decision(gate_id: int) -> dict | None:
 
 async def record_auto_decision(mtg: "MeetingSession", kind: str, *, decided_by: str,
                                decision: dict, title: str = "",
-                               payload: dict | None = None) -> int:
-    """不是由人当场判定的确认点：直接落一条已决定的门留审计，并推 checkpoint_decided。"""
+                               payload: dict | None = None,
+                               dedupe: bool = False) -> int:
+    """不是由人当场判定的确认点：直接落一条已决定的门留审计，并推 checkpoint_decided。
+
+    dedupe 为真时，同一会议同一类型已经有已决定的门就不再落第二条：调用方（澄清回答、
+    名单自动生效）在"落门之后、结果入状态之前"被杀重入时，不会重复落门、不会重复推事件。
+    可能合法发生多次的调用（如复议后再走一次程序共识）不开启。
+    """
+    if dedupe:
+        with session_scope() as s:
+            existing = (
+                s.query(Gate)
+                .filter(Gate.meeting_id == mtg.meeting_id, Gate.kind == kind,
+                        Gate.status != "open")
+                .order_by(Gate.id.desc())
+                .first())
+            if existing is not None:
+                return existing.id
     action = "approve" if decision.get("action") == "approve" else "reject"
     with session_scope() as s:
         gate = Gate(run_id=mtg.run_id, node_id=mtg.node_id, meeting_id=mtg.meeting_id,

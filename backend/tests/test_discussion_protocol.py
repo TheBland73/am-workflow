@@ -1223,20 +1223,22 @@ def test_positions_fail_without_participants(monkeypatch) -> None:
 
 
 def test_exchange_resumes_without_repeating_the_recorded_claim(monkeypatch) -> None:
-    """交锋的每次发言落盘即记标记：第一条主张之后被中断，重入不再重复它。"""
+    """交锋的每段发言都按认领找回：质疑落盘、认领编号还没写上时被杀，重入主张与质疑都不重复。"""
     install(monkeypatch, _replies(), None)
     run_id, node_id = _meeting_run()
-    original = discussion_module.speak
     armed = {"on": True}
+    from app.meeting import calls as calls_module
 
-    async def flaky(mtg_, participant, **kwargs):
-        result = await original(mtg_, participant, **kwargs)
-        if armed["on"] and kwargs.get("kind") == "challenge":
-            armed["on"] = False                        # 第一条主张已落盘：进程在这里被杀
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" \
+                and payload.get("kind") == "challenge":
+            armed["on"] = False                        # 质疑已落盘、认领编号还没写上：进程在这里被杀
             raise asyncio.CancelledError()
-        return result
+        return await original_emit(run_id_, type_, node_id_, payload)
 
-    monkeypatch.setattr(discussion_module, "speak", flaky)
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
     with pytest.raises(asyncio.CancelledError):
         drive(run_id, node_id, _approve, idea=IDEA)
 
@@ -1246,7 +1248,7 @@ def test_exchange_resumes_without_repeating_the_recorded_claim(monkeypatch) -> N
 
     assert result["done"] is True
     kinds = Counter(call["kind"] for call in seen)
-    assert kinds["claim"] == 3 and kinds["challenge"] == 4 and kinds["respond"] == 4
+    assert kinds["claim"] == 3 and kinds["challenge"] == 3 and kinds["respond"] == 4
 
 
 def test_reopen_reuses_the_recorded_plan_and_ignores_unknown_indexes(monkeypatch) -> None:
@@ -1341,3 +1343,265 @@ def test_consensus_falls_back_to_a_reason_from_the_ledger(monkeypatch) -> None:
 
     assert result.checkpoint["payload"]["reason"] == "stall"            # stall 兜底
     assert "讨论陷入停滞" in result.checkpoint["title"]
+
+
+def test_brief_speak_is_salvaged_when_the_finish_write_is_lost(monkeypatch) -> None:
+    """简报发言落盘、状态还没写时被杀：重入按认领找回，不重复调用模型。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run()
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "prepare")
+    protocol = discussion_module.DiscussionProtocol()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" and payload.get("kind") == "brief":
+            armed["on"] = False                    # 简报已落盘、状态还没写：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_prepare(mtg))
+    monkeypatch.setattr(calls_module, "emit", original_emit)
+
+    asyncio.run(protocol.step_prepare(mtg))
+
+    assert Counter(call["kind"] for call in seen)["brief"] == 1
+
+
+def test_proxy_answer_is_salvaged_when_the_finish_write_is_lost(monkeypatch) -> None:
+    """澄清的代理回答落盘后被杀：重入按认领找回，不重复调用模型。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _meeting_run({"automation": {"level": "L3"}})
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "clarify")
+    store.add_participant(mtg.meeting_id, role_key="requester_proxy", display_name="需求方代理",
+                          mode="proxy", system_prompt="你是需求方代理")
+    store.set_state(mtg.meeting_id, {"questions": ["需要导出哪些格式？"]})
+    protocol = discussion_module.DiscussionProtocol()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" and payload.get("kind") == "answer":
+            armed["on"] = False                    # 回答已落盘、状态还没写：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_clarify(mtg))
+    monkeypatch.setattr(calls_module, "emit", original_emit)
+
+    asyncio.run(protocol.step_clarify(mtg))
+
+    assert Counter(call["kind"] for call in seen)["answer"] == 1
+
+
+def test_clarify_auto_decision_is_not_recorded_twice_after_a_crash(monkeypatch) -> None:
+    """审计门落库后、澄清结果入状态前被杀：重入不再重复落一条已决定的门。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run({"automation": {"level": "L3"}})
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "clarify")
+    store.add_participant(mtg.meeting_id, role_key="requester_proxy", display_name="需求方代理",
+                          mode="proxy", system_prompt="你是需求方代理")
+    store.set_state(mtg.meeting_id, {"questions": ["需要导出哪些格式？"]})
+    protocol = discussion_module.DiscussionProtocol()
+    armed = {"on": True}
+    from app.meeting import checkpoints as checkpoints_module
+
+    original_emit = checkpoints_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "checkpoint_decided":
+            armed["on"] = False                    # 审计门已落库、结果还没入状态：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(checkpoints_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_clarify(mtg))
+    monkeypatch.setattr(checkpoints_module, "emit", original_emit)
+
+    asyncio.run(protocol.step_clarify(mtg))
+
+    with session_scope() as s:
+        gates = s.query(Gate).filter(Gate.meeting_id == mtg.meeting_id,
+                                     Gate.kind == "clarify").all()
+    assert len(gates) == 1
+
+
+def test_roster_rows_are_not_duplicated_after_a_crash(monkeypatch) -> None:
+    """名单提议落库后、名单入状态前被杀：重入先认领找回提议，参会者行不再翻倍。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "roster")
+    store.add_participant(mtg.meeting_id, role_key="facilitator", display_name="主持人",
+                          mode="facilitator", system_prompt="你是主持人")
+    protocol = discussion_module.DiscussionProtocol()
+    armed = {"on": True}
+    original_set_state = mtg.set_state
+
+    def flaky_set_state(**changes):
+        if armed["on"] and "roster" in changes:
+            armed["on"] = False                    # 参会者行已建、名单还没入状态：进程在这里被杀
+            raise asyncio.CancelledError()
+        return original_set_state(**changes)
+
+    monkeypatch.setattr(mtg, "set_state", flaky_set_state)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol._propose(mtg, {}, 2, 2))
+    asyncio.run(protocol._propose(mtg, {}, 2, 2))
+
+    names = [row["display_name"] for row in store.list_participants(mtg.meeting_id)
+             if row["mode"] == "participant"]
+    assert len(names) == 2                         # 架构师与用户体验各一行，不是四行
+
+
+def test_clarify_decision_is_consumed_in_the_same_write(monkeypatch) -> None:
+    """澄清的人工回答与决定认领一次写完：旧的“结果入状态、认领分离”窗口不再存在。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "clarify")
+    store.set_state(mtg.meeting_id, {"questions": ["需要导出哪些格式？"]})
+    protocol = discussion_module.DiscussionProtocol()
+    suspended = asyncio.run(protocol.step_clarify(mtg))
+    gate_id = suspended.checkpoint["id"]
+    decide_gate(gate_id=gate_id, action="approve", data={"answers": ["Markdown 即可"]})
+    raised = {"on": True}
+    original_ack = mtg.ack_decision
+
+    def flaky_ack(decision=None, disposition=None):
+        if raised["on"]:
+            raised["on"] = False                   # 旧实现在这里单独 ack：中间被杀决定就滞留
+            raise asyncio.CancelledError()
+        return original_ack(decision, disposition)
+
+    monkeypatch.setattr(mtg, "ack_decision", flaky_ack)
+    result = asyncio.run(protocol.step_clarify(mtg))
+
+    state = store.get_state(mtg.meeting_id)
+    assert result.action == "advance"
+    assert state.get("handled_gate_id") == gate_id
+    assert state.get("clarifications")
+
+
+def test_roster_approval_consumes_the_decision_atomically(monkeypatch) -> None:
+    """名单通过：名单生效与决定认领一次写完，认领窗口被杀决定不滞留。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    _meeting_id, mtg = _bare_meeting(run_id, node_id, "roster")
+    store.add_participant(mtg.meeting_id, role_key="facilitator", display_name="主持人",
+                          mode="facilitator", system_prompt="你是主持人")
+    protocol = discussion_module.DiscussionProtocol()
+    suspended = asyncio.run(protocol.step_roster(mtg))
+    gate_id = suspended.checkpoint["id"]
+    decide_gate(gate_id=gate_id, action="approve")
+    raised = {"on": True}
+    original_ack = mtg.ack_decision
+
+    def flaky_ack(decision=None, disposition=None):
+        if raised["on"]:
+            raised["on"] = False                   # 旧实现在这里单独 ack：中间被杀决定就滞留
+            raise asyncio.CancelledError()
+        return original_ack(decision, disposition)
+
+    monkeypatch.setattr(mtg, "ack_decision", flaky_ack)
+    result = asyncio.run(protocol.step_roster(mtg))
+
+    state = store.get_state(mtg.meeting_id)
+    assert result.action == "advance"
+    assert state.get("handled_gate_id") == gate_id
+    assert state.get("roster_done") is True
+
+
+
+
+def test_exchange_claim_is_salvaged_when_the_claim_number_is_lost(monkeypatch) -> None:
+    """主张落盘、认领编号还没写上时被杀：重入按发言行找回，不再重复同一段主张。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" and payload.get("kind") == "claim":
+            armed["on"] = False                    # 第一条主张已落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["claim"] == 3 and kinds["challenge"] == 4 and kinds["respond"] == 4
+
+
+def test_draft_speak_is_salvaged_after_a_crash(monkeypatch) -> None:
+    """成稿发言落盘后、方案落库前被杀：重入按认领找回发言，不再重复调用模型。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _meeting_run()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" and payload.get("kind") == "proposal":
+            armed["on"] = False                    # 成稿已落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    assert Counter(call["kind"] for call in seen)["proposal"] == 0
+
+
+def test_check_revision_is_salvaged_after_a_crash(monkeypatch) -> None:
+    """复核修订发言落盘后被杀：重入按认领找回，不再重复调用模型。"""
+    install(monkeypatch, _replies(proposal_check=CHECK_ISSUE), None)
+    run_id, node_id = _meeting_run()
+    armed = {"on": True}
+    from app.meeting import calls as calls_module
+
+    original_emit = calls_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" \
+                and payload.get("kind") == "proposal_revise":
+            armed["on"] = False                    # 修订已落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        drive(run_id, node_id, _approve, idea=IDEA)
+
+    seen: list[dict] = []
+    install(monkeypatch, _replies(proposal_check=CHECK_ISSUE), seen)
+    result = drive(run_id, node_id, _approve, idea=IDEA)
+
+    assert result["done"] is True
+    assert Counter(call["kind"] for call in seen)["proposal_revise"] == 0
+

@@ -482,10 +482,12 @@ class ConfirmProtocol(MeetingProtocol):
         mtg.set_state(**changes)
         store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
         mtg.reset_builder()
+        # 先记完成标记再发事件：事件发送处被杀时重入不会重复发同一轮的轮次事件
+        # （事件本身可能丢失，与已登记的裁决事件抑制窗口同族）
+        _mark(mtg, "prepare")
         await emit(mtg.run_id, "review_round_started", mtg.node_id, {
             "meeting_id": mtg.meeting_id, "round": flow, "protocol": "confirm",
             "incremental": flow > 1, "rounds_max": mtg.max_rounds()})
-        _mark(mtg, "prepare")
         return advance("merge" if changes["mechanical"] else "expect")
 
     def _ensure_participants(self, mtg) -> None:

@@ -395,3 +395,32 @@ def test_a_too_large_previous_proposal_fails_instead_of_being_truncated(monkeypa
     with pytest.raises(NodeFailure, match="上一版建设方案"):
         _speak(mtg, speaker,
                segments=[Segment("frozen", "章程", name="章程"), previous], instruction="修订")
+
+
+def test_intervention_ack_is_not_repeated_after_a_crash(monkeypatch) -> None:
+    """主持人的插话回应落盘后被杀：重入按同一批插话的键找回回应，不再重复发言。"""
+    install(monkeypatch, {"position": "立场", "intervention_ack": "收到。"}, None)
+    mtg, _ = _meeting()
+    store.queue_intervention(mtg.meeting_id, content="注意成本")
+    speaker = next(p for p in store.list_participants(mtg.meeting_id)
+                   if p["mode"] == "participant")
+    _speak(mtg, speaker, segments=[], instruction="请写立场", drain=False)
+    armed = {"on": True}
+    original_emit = calls.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "meeting_turn_finished" \
+                and payload.get("kind") == "facilitator_note":
+            armed["on"] = False                    # 回应已落盘：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(calls, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(calls.drain_interventions(mtg))
+    monkeypatch.setattr(calls, "emit", original_emit)
+
+    asyncio.run(calls.drain_interventions(mtg))
+
+    notes = [t for t in store.list_turns(mtg.meeting_id) if t["kind"] == "facilitator_note"]
+    assert len(notes) == 1

@@ -878,3 +878,52 @@ def test_a_named_reviewer_not_meant_for_review_fails_the_meeting(monkeypatch) ->
         drive(run_id, node_id, _never, idea=IDEA)
     assert "不适合参加评审" in str(excinfo.value) and "judge" in str(excinfo.value)
     assert excinfo.value.fatal is True
+
+
+def test_intake_reentry_continues_to_respond(monkeypatch) -> None:
+    """受理步的状态写完之后被杀：重入直接去回应，不再把反馈轮带进完整重审。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="intake",
+                          state={"intake_feedback": "范围不清楚，请修订"})
+    protocol = review_module.ReviewProtocol()
+    armed = {"on": True}
+    original_emit = review_module.emit
+
+    async def flaky_emit(run_id_, type_, node_id_, payload):
+        if armed["on"] and type_ == "review_round_started":
+            armed["on"] = False                    # 受理已入账、轮次事件还没发：进程在这里被杀
+            raise asyncio.CancelledError()
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(review_module, "emit", flaky_emit)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(protocol.step_intake(mtg))
+    monkeypatch.setattr(review_module, "emit", original_emit)
+
+    result = asyncio.run(protocol.step_intake(mtg))
+
+    assert result.next == "respond"
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["review_intake"] == 1              # 受理发言不重复
+    assert kinds["review_points"] == 0 and kinds["review"] == 0   # 不进完整重审
+
+
+def test_review_round_started_names_the_protocol(monkeypatch) -> None:
+    """review_round_started 的载荷带 protocol 字段，与 confirm 的同类事件对齐。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    mtg = _review_session(run_id, node_id, phase="prepare", state={})
+    emitted: list[dict] = []
+    original_emit = review_module.emit
+
+    async def capture_emit(run_id_, type_, node_id_, payload):
+        if type_ == "review_round_started":
+            emitted.append(dict(payload))
+        return await original_emit(run_id_, type_, node_id_, payload)
+
+    monkeypatch.setattr(review_module, "emit", capture_emit)
+    asyncio.run(review_module._round_started(mtg))
+
+    assert emitted and emitted[0].get("protocol") == "review"
