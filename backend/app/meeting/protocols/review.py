@@ -597,17 +597,12 @@ class ReviewProtocol(MeetingProtocol):
         base = store.list_participants(discussion["id"]) if discussion else []
         desired: list[dict] = []
 
-        chair = next((row for row in base if row["mode"] == "chair"), None)
-        if chair is not None:
-            desired.append({"role_key": chair["role_key"], "display_name": chair["display_name"],
-                            "mode": "chair", "system_prompt": chair["system_prompt"],
-                            "model_id": chair["model_id"]})
-        else:
-            template = role_template("review_chair")
-            desired.append({"role_key": "review_chair", "display_name": template["name"],
-                            "mode": "chair", "system_prompt": template["system_prompt"],
-                            "model_id": None})
-
+        # 讨论会议没有主席这一行（它的参会者是主持人、参会者与需求方代理），
+        # 评审主席一律取角色库的模板，不从讨论会议继承。
+        template = role_template("review_chair")
+        desired.append({"role_key": "review_chair", "display_name": template["name"],
+                        "mode": "chair", "system_prompt": template["system_prompt"],
+                        "model_id": None})
         author = next((row for row in base if row["mode"] == "facilitator"), None)
         if author is not None:
             desired.append({"role_key": author["role_key"],
@@ -947,10 +942,8 @@ class ReviewProtocol(MeetingProtocol):
     async def step_revise(self, mtg):
         if _done(mtg, "revise"):
             return advance("verify")
-        verdict = str(mtg.state().get("verdict") or "")
-        if verdict == "return" and not mtg.state().get("accepted_by_user"):
-            _patch_round(mtg, "revise")               # 退回时由讨论会议复议，评审这里不修订
-            return advance("verify")
+        # 走到这里时结论不会是"退回且人未接受"：退回在裁决步就发起了回流，
+        # 评审这里不修订；人在确认点上接受现状时会把 accepted_by_user 置真。
         targets = _targets(mtg, lambda issue: issue.get("standing", True)
                            and issue.get("accepted") is True
                            and issue.get("category") == "wording"

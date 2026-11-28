@@ -687,10 +687,10 @@ class DiscussionProtocol(MeetingProtocol):
                     clarifications.append({"question": question, "answer": text,
                                            "source": "proxy", "evidence": evidence})
                 else:                                  # 没有出处的回答：标为假设
+                    # 校验器保证每一条回答都有非空 text，这里不必再判空
                     clarifications.append({
                         "question": question, "source": "assumption", "evidence": "",
-                        "answer": f"{text}（没有出处，按假设处理）" if text
-                        else "材料中没有说明，按假设处理"})
+                        "answer": f"{text}（没有出处，按假设处理）"})
             await record_auto_decision(
                 mtg, "clarify", decided_by="proxy" if proxy else "program",
                 decision={"action": "approve", "answered": len(questions),
@@ -922,12 +922,12 @@ class DiscussionProtocol(MeetingProtocol):
         for point in _open_points(_points(mtg)):
             ranked = rank_speakers(point, [member["id"] for member in members])
             claimer = by_id[ranked[0]]
-            # 质疑者从最反对的一端开始按轮换；人数多于轮次时按环取，不会越界
+            # 质疑者从最反对的一端开始按轮换；人数多于轮次时按环取，不会越界。
+            # 只有一名参会者时表态步直接了结、不进交锋，所以这里 opponents 一定非空。
             opponents = [voter for voter in reversed(ranked) if voter != ranked[0]]
             subject = f"决策点 {point['index']}「{point['title']}」：{point['question']}"
             mark = f"{point['index']}@{round_no}"
-            opponent = (opponents[(round_no - 1) % len(opponents)] if opponents
-                        else ranked[0])
+            opponent = opponents[(round_no - 1) % len(opponents)]
             challenger = by_id[opponent]
             instructions = {
                 "claim": f"关于{subject}，请主张你支持的立场，给出理由和依据。只写一段话。",
@@ -987,9 +987,8 @@ class DiscussionProtocol(MeetingProtocol):
             turn_round=mtg.meeting_round()))["data"]
         rulings = {str(row["index"]): row for row in data["rulings"]}
         for index in indexes:
-            row = rulings.get(index)
-            if row is None:
-                continue
+            # 校验器保证 rulings 恰好覆盖这些决策点，取不到行的情况不会发生
+            row = rulings[index]
             rationale = str(row["rationale"]).strip()
             dissent = str(row.get("dissent") or "").strip()
             if dissent:
