@@ -6,7 +6,7 @@
 
 引擎拥有控制流、上下文与状态；模型只是可替换的节点；人工审批是一等公民；完成与否由证据判定。
 
-[![Tests](https://img.shields.io/badge/tests-559%20passed-brightgreen.svg)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-589%20passed-brightgreen.svg)](#开发与测试)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-18%2B-339933.svg)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -61,7 +61,7 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 | 数据统计 | 可用 | 全局运行量 / 成功率 / 耗时 / Token / 成本 / 趋势 / 状态分布（只读聚合，6 个接口） |
 | 代码评审 + 验收门 | 实验 | 启发式静态评审（文件摘要 + 验收清单），无 diff / AST / 覆盖率分析 |
 | 多进程 / 分布式 | 设计封存 | 见 [`docs/分布式执行模式设计.md`](docs/分布式执行模式设计.md) |
-| 单元测试 | 通过 | `559 passed`（pytest，约 40 秒）；前端 `tsc --noEmit` 无错误 |
+| 单元测试 | 通过 | `589 passed`（pytest，约 70 秒）；前端 `tsc --noEmit` 无错误 |
 
 > W1 的目标是**把控制流跑通并证明它可靠**，不是把生成质量做到可交付。质量与规模的边界见 [已知限制](#已知限制)。
 
@@ -213,7 +213,11 @@ flowchart LR
 
 ### 事件类型（SSE）
 
-`run_created` · `run_finished` · `run_error` · `run_stopped` · `run_recovered` · `phase_entered` · `node_started` · `node_finished` · `node_failed` · `node_retry_scheduled` · `node_log` · `node_token`（内存直推）· `node_tool_call` · `node_tool_result` · `node_created` · `task_created` · `task_updated` · `artifact_written` · `gate_requested` · `gate_decided` · `nodes_reset` · `review_blocked` · `review_rework` · `plan_token` · `plan_generated` · `plan_failed`
+运行事件流（`GET /api/runs/{id}/events`）推以下事件；前端 `subscribeRun` 逐个注册它们，会议事件的载荷见[会议式流程设计 §12.5](./docs/想法到需求确认-会议式流程设计.md)。
+
+`run_created` · `run_finished` · `run_error` · `run_stopped` · `run_recovered` · `phase_entered` · `node_started` · `node_finished` · `node_failed` · `node_retry_scheduled` · `node_retried` · `node_log` · `node_token`（内存直推）· `node_tool_call` · `node_tool_result` · `node_created` · `node_skipped` · `node_reset` · `node_feedback_injected` · `task_created` · `task_updated` · `artifact_written` · `gate_requested` · `gate_decided` · `nodes_reset` · `checkpoint_decided` · `memory_written` · `review_round_started` · `review_verdict` · `review_blocked` · `review_rework` · `context_compacted` · `context_prefix_changed` · `node_rerouted` · `meeting_started` · `meeting_phase` · `meeting_turn_started` · `meeting_turn_finished` · `meeting_ledger_updated` · `meeting_issue_updated` · `meeting_suspended` · `meeting_resumed` · `meeting_intervention_queued` · `meeting_intervention_injected` · `meeting_finished`
+
+计划流（`GET /api/plans/{id}/events`）另有 `plan_token` · `plan_generated` · `plan_failed`。
 
 ---
 
@@ -225,7 +229,7 @@ flowchart LR
 | 存储 | SQLite（WAL + `synchronous=NORMAL` + 单连接池 `pool_size=1`） |
 | 前端 | Vite · React 18 · TypeScript · Ant Design 5 · TanStack Query · React Router · @xyflow/react · zustand |
 | 视觉 | 终末地控制台风格（纸白 / 墨黑 / 单一信号黄），Saira 字体（SIL OFL） |
-| 测试 | pytest（后端 · 559 用例）· `tsc --noEmit`（前端类型检查） |
+| 测试 | pytest（后端 · 589 用例）· `tsc --noEmit`（前端类型检查） |
 
 ---
 
@@ -475,7 +479,7 @@ am-workflow/
 ```powershell
 cd backend
 ..\.venv\Scripts\python.exe -m pytest tests -q
-# 559 passed in ~40s
+# 589 passed in ~70s
 ```
 
 覆盖范围：图与任务解析、front-matter、预算估算、门禁通过 / 驳回 / 升级重试、供应商与模型 CRUD、模板绑定校验、计划章节索引 / 错误码 / 波次 / 关键路径 / 环路径、计划 API（生成 / 编辑 / save 与 run 提交 / 幂等 / 归档）、并发闸门 / 节点超时 / 退避重试 / seq 缓存 / 取消收据 / metrics、模型发现与导入去重、评审节点 / 阻塞回退 / 轮次用尽 / 评审 API 与指标、三方讨论、数据统计（空窗口不除零 / 成功率 / 失败计数 / 平均耗时 / Token / 成本空态 / 时间筛选 / 趋势补零 / 状态分布 / 非法参数 400）。
