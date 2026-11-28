@@ -38,7 +38,7 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 
 | 你给它 | 它给你 | 谁做决定 |
 | --- | --- | --- |
-| 一段想法（≤ 20,000 字） | 8 阶段 17 节点的完整工件链 + 可运行工作区 | 引擎调度，人工签 6 道门 |
+| 一段想法（≤ 20,000 字） | 9 阶段 17 节点的完整工件链 + 可运行工作区 | 引擎调度，人工签 6 道门 |
 | 一份 Markdown 设计规格 | 8–40 条可校验任务、波次、关键路径、可拖拽执行图 | PM 只提议，服务端确定性校验 |
 | 一套供应商 + API Key | 按角色路由的模型调用、token 预算与成本核算 | 密钥 Fernet 加密落盘 |
 
@@ -50,7 +50,7 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 | --- | --- | --- |
 | 后端 API | 稳定 | FastAPI + SQLAlchemy + SQLite（WAL），85 个 REST 端点 |
 | 编排引擎 | 稳定 | 依赖就绪并发、超时、指数退避、attempt 心跳、取消收据、死锁判定、崩溃恢复 |
-| 固定 SDLC 模板 | 稳定 | 8 阶段 / 17 节点 / 6 道人工门 / 8 类工件；前半段为会议式流程 |
+| 固定 SDLC 模板 | 稳定 | 9 阶段 / 17 节点 / 6 道人工门 / 9 类工件；前半段为会议式流程 |
 | 人工门 | 稳定 | 通过 · 驳回（反馈 + 目标节点 + 级联重置）· 编辑后通过 · 交给模型判 |
 | 工件链 | 稳定 | YAML front-matter、版本递增、active/superseded/approved 状态机 |
 | 事件流 | 稳定 | SSE + `Last-Event-ID` 补发 + 15s 心跳帧 + 终态主动关闭 |
@@ -71,7 +71,7 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 
 ### 1. 可执行的 SDLC 状态机
 
-- **17 个节点、8 个阶段**：想法 → 讨论会议（澄清、名单、独立立场、交锋、整合成稿）→ 方案确认 → 评审会议 → 需求（EARS）→ 需求确认会议 → 设计（编号章节）→ 任务分解 → 并行开发 → 验证 → 交付。
+- **17 个节点、9 个阶段**：想法 → 讨论会议（澄清、名单、独立立场、交锋、整合成稿）→ 方案确认 → 评审会议 → 需求（EARS）→ 需求确认会议 → 设计（编号章节）→ 任务分解 → 并行开发 → 验证 → 交付。
 - **节点类型**：`PASS`、`AGENT`、`VERIFY`、`REVIEW`（旧版评审）、`MEETING`（讨论 / 评审 / 需求确认会议）、`TASKGRAPH`（解析 / 展开）、`HUMAN_GATE`，另有 `DECISION` / `RESTORE` / `CHECKPOINT` 预留。
 - **动态展开**：任务清单被解析成 `Task` 行后，按依赖生成 `dev_*` 节点，并把 `verify` 的依赖重写为全部开发节点。
 
@@ -407,11 +407,14 @@ netsh int ipv4 show excludedportrange protocol=tcp
 | --- | --- |
 | 供应商 | `GET /presets` · `GET/POST /providers` · `PATCH/DELETE /providers/{id}` · `GET /providers/{id}/models` · `POST /providers/{id}/models/import` · `POST /providers/{id}/test` |
 | 模型 | `GET/POST /models` · `PATCH/DELETE /models/{id}` |
-| 角色模板 | `GET /agent-templates` · `PATCH /agent-templates/{id}` |
-| 运行 | `POST/GET /runs` · `GET /runs/{id}` · `POST /runs/{id}/stop` · `GET /runs/{id}/metrics` · `GET /runs/{id}/review` · `POST /runs/{id}/review/rework` |
+| 角色模板 | `GET/POST /agent-templates` · `PATCH/DELETE /agent-templates/{id}` |
+| 运行 | `POST/GET /runs` · `GET /runs/{id}` · `POST /runs/{id}/stop` · `GET /runs/{id}/metrics` · `GET /runs/{id}/review` · `POST /runs/{id}/review/rework` · `GET/PATCH /runs/{id}/config` |
+| 会议 | `GET /runs/{id}/meetings` · `GET /runs/{id}/meetings/{meeting_id}` · `GET /runs/{id}/meetings/{meeting_id}/turns` · `GET /runs/{id}/meetings/{meeting_id}/minutes` · `PUT /runs/{id}/meetings/{meeting_id}/participants` · `PATCH /runs/{id}/meetings/{meeting_id}/decision-points/{point_id}` · `PATCH /runs/{id}/meetings/{meeting_id}/issues/{issue_id}` · `POST /runs/{id}/meetings/{meeting_id}/intervene` |
+| 背景材料 | `GET /runs/{id}/materials` · `POST /runs/{id}/materials` · `GET /runs/{id}/materials/{name}` |
+| 模板 | `GET /templates/{template_key}` |
 | 事件 | `GET /runs/{id}/events`（SSE）· `GET /runs/{id}/events/history` · `GET /events/{id}` |
 | 工件 | `GET /runs/{id}/artifacts` · `GET/PATCH /runs/{id}/artifacts/{kind}` |
-| 人工门 | `GET /gates` · `GET /gates/{id}` · `POST /gates/{id}/approve` · `POST /gates/{id}/reject` |
+| 人工门 | `GET /gates` · `GET /gates/{id}` · `POST /gates/{id}/approve` · `POST /gates/{id}/reject` · `POST /gates/{id}/delegate` |
 | 任务 / 节点 | `GET/POST /runs/{id}/tasks` · `PATCH/DELETE /runs/{id}/tasks/{uid}` · `GET /nodes/{id}` · `POST /nodes/{id}/retry` |
 | 记忆 | `GET /memories` · `PATCH /memories/{id}` |
 | 统计 | `GET /analytics/overview` · `GET /analytics/trends` · `GET /analytics/status-distribution` · `GET /analytics/usage` · `GET /analytics/recent-runs` · `GET /analytics/failed-runs`（均支持 `days=7/30/90` 或 `start`/`end`） |
@@ -456,7 +459,7 @@ am-workflow/
 │                                    analytics
 ├── frontend/                        Vite + React 18 + TS + AntD 5 + @xyflow/react + zustand
 │   └── src/{pages,panels,canvas,api,store,styles}
-├── templates/sdlc_workflow.json     固定 SDLC 模板（8 阶段 17 节点 6 门）
+├── templates/sdlc_workflow.json     固定 SDLC 模板（9 阶段 17 节点 6 门）
 ├── docs/                            设计规格、选型调研、评审体系、迭代记录、测试案例
 ├── data/                            SQLite 与密钥（git 忽略）
 ├── runs/                            运行产物与工作区（git 忽略）
@@ -499,7 +502,7 @@ npm run build        # 产物 dist/，由 FastAPI 托管
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/设计规格说明书.md`](docs/设计规格说明书.md) | 设计基线 v0.2：领域模型、节点模型、状态机、门、工件、事件、恢复 |
-| [`docs/想法到需求确认-会议式流程设计.md`](docs/想法到需求确认-会议式流程设计.md) | 前半段设计基线（尚未实现）：会议运行时、讨论 / 评审 / 确认三种会议、确认点机制（人工或模型判定）、会话与上下文模块 |
+| [`docs/想法到需求确认-会议式流程设计.md`](docs/想法到需求确认-会议式流程设计.md) | 前半段设计基线（已实现，真实模型验收待补）：会议运行时、讨论 / 评审 / 确认三种会议、确认点机制（人工或模型判定）、会话与上下文模块 |
 | [`docs/research/前沿技术调研与技术选型.md`](docs/research/前沿技术调研与技术选型.md) | 选型论据（工作流引擎、Agent 编排、可观测性对标） |
 | [`docs/评审与测试体系设计.md`](docs/评审与测试体系设计.md) | 三级评审 + 四级测试 + 缺陷闭环 + 质量钩子 + 调度拆屏障 |
 | [`docs/评审与验收门.md`](docs/评审与验收门.md) | 代码评审 Agent、阻塞自动回退、验收门、评审面板与指标 |

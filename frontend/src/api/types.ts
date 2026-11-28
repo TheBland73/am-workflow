@@ -245,21 +245,24 @@ export interface RunReview {
   available: boolean;
   run_id: string;
   run_status: string;
+  /** 短响应（available=false）只有 available/run_id/run_status，其余字段都可能缺省。 */
   node_id?: number;
   node_key?: string;
   node_status?: string;
   verdict?: string | null;
   summary?: string | null;
-  issues: ReviewIssue[];
-  blocking: number;
-  targets: string[];
-  round: number;
-  max_rounds: number;
+  issues?: ReviewIssue[];
+  blocking?: number;
+  targets?: string[];
+  round?: number;
+  max_rounds?: number;
   reviewed_at?: string | null;
-  files: string[];
-  history: ReviewHistoryItem[];
-  escalated: boolean;
-  can_rework: boolean;
+  files?: string[];
+  history?: ReviewHistoryItem[];
+  escalated?: boolean;
+  can_rework?: boolean;
+  /** 前半段的评审/确认报告才有；旧 REVIEW 节点的报告没有。 */
+  review_type?: "proposal" | "requirement";
   artifact?: ArtifactRecord | null;
   body?: string;
 }
@@ -291,6 +294,16 @@ export interface RunMetrics {
     rejected: number;
     avg_decision_ms: number;
     open_wait_ms: number;
+  };
+  context: {
+    compactions: number;
+    cached_tokens: number;
+    cache_hit_rate: number;
+  };
+  meetings: {
+    total: number;
+    turns: number;
+    checkpoints: { human: number; program: number; model: number; open: number };
   };
   events: number;
   per_node: NodeMetric[];

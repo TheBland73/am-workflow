@@ -245,7 +245,7 @@ export default function RunsPage() {
       <div className="am-page-head">
         <div>
           <h1 className="am-page-title">运行</h1>
-          <div className="am-page-sub">想法进入固定 SDLC 模板：讨论 → 方案 → 需求 → 设计 → 任务 → 并行开发 → 交付</div>
+          <div className="am-page-sub">想法进入固定 SDLC 模板：讨论 → 方案 → 评审 → 需求 → 设计 → 任务 → 并行开发 → 交付</div>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <Button icon={<ReloadOutlined />} onClick={() => runs.refetch()}>刷新</Button>

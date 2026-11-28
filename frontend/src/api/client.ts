@@ -323,13 +323,14 @@ export function subscribeRun(
     "run_created", "run_finished", "run_error", "run_stopped", "run_recovered",
     "phase_entered", "node_started", "node_finished", "node_failed", "node_log",
     "node_token", "node_tool_call", "node_tool_result", "node_retried", "node_retry_scheduled", "nodes_reset",
+    "node_skipped", "node_reset", "node_feedback_injected",
     "artifact_written", "task_created", "task_updated", "gate_requested", "gate_decided",
     "memory_written",
     // 会议式前半段（详设 §12.5）
     "meeting_started", "meeting_phase", "meeting_turn_started", "meeting_turn_finished",
-    "meeting_ledger_updated", "meeting_suspended", "meeting_resumed",
+    "meeting_ledger_updated", "meeting_issue_updated", "meeting_suspended", "meeting_resumed",
     "meeting_intervention_queued", "meeting_intervention_injected", "meeting_finished",
-    "checkpoint_decided", "review_round_started", "review_verdict",
+    "checkpoint_decided", "review_round_started", "review_verdict", "review_blocked", "review_rework",
     "context_compacted", "context_prefix_changed", "node_rerouted",
   ];
   const handler = (raw: MessageEvent) => {

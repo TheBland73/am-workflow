@@ -73,6 +73,13 @@ function durationText(start: string | null, end: string | null) {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+/** 评审面板标题：前半段按 report 的 review_type 区分方案评审/需求确认，旧 REVIEW 节点兜底回代码评审。 */
+function reviewHeading(reviewType?: "proposal" | "requirement") {
+  if (reviewType === "proposal") return { eyebrow: "PROPOSAL REVIEW", title: "方案评审" };
+  if (reviewType === "requirement") return { eyebrow: "REQUIREMENT REVIEW", title: "需求确认" };
+  return { eyebrow: "CODE REVIEW", title: "代码评审" };
+}
+
 function eventText(event: StreamEvent) {
   const payload = event.payload ?? {};
   const key = String(payload.node_key ?? "");
@@ -101,6 +108,7 @@ function eventText(event: StreamEvent) {
     case "task_updated": return `更新任务 ${String(payload.task_uid ?? "")}`;
     case "node_tool_call": return `${key} 调用 ${String(payload.name ?? "")}`;
     case "node_tool_result": return `${key} 工具返回${payload.is_error ? "（错误）" : ""}`;
+    case "node_log": return String(payload.message ?? "");
     case "memory_written": return `写入记忆 ${String(payload.subject ?? "")}`;
     // 会议式前半段（详设 §12.5）
     case "meeting_started": return "会议开始";
@@ -113,6 +121,7 @@ function eventText(event: StreamEvent) {
       return payload.roster
         ? "参会名单已更新"
         : `账本更新（第 ${String(payload.version ?? "")} 版）`;
+    case "meeting_issue_updated": return `评审意见改判：${payload.accepted ? "已采纳" : "不采纳"}`;
     case "meeting_suspended": return "会议在确认点挂起";
     case "meeting_resumed": return "会议续开";
     case "meeting_intervention_queued": return "插话已排队";
@@ -126,6 +135,12 @@ function eventText(event: StreamEvent) {
     }
     case "review_round_started": return `评审第 ${String(payload.round ?? "")} 轮开始`;
     case "review_verdict": return `结论：${verdictLabel(String(payload.verdict ?? ""))}`;
+    case "review_blocked":
+      return `评审第 ${String(payload.round ?? "")}/${String(payload.max_rounds ?? "")} 轮发现阻塞${payload.escalated ? "，已升级人工处理" : ""}`;
+    case "review_rework": {
+      const reworked = Array.isArray(payload.targets) ? payload.targets.length : 0;
+      return `人工回退 ${reworked} 个任务`;
+    }
     case "context_compacted":
       return `上下文已压缩（${String(payload.before_tokens ?? "")} → ${String(payload.after_tokens ?? "")} token）`;
     case "context_prefix_changed": {
@@ -653,7 +668,10 @@ export default function RunPage() {
       {review?.available ? (
         <section className="ef-panel review-panel">
           <div className="review-title">
-            <h2><span className="ef-eyebrow">CODE REVIEW</span>代码评审</h2>
+            <h2>
+              <span className="ef-eyebrow">{reviewHeading(review.review_type).eyebrow}</span>
+              {reviewHeading(review.review_type).title}
+            </h2>
             <div className="review-figs">
               <b className={review.verdict === "pass" ? "is-pass" : "is-block"}>
                 {review.verdict === "pass" ? "PASS" : "BLOCK"}
@@ -667,9 +685,9 @@ export default function RunPage() {
             </div>
           </div>
           <p className="review-summary">{review.summary || "评审未给出摘要。"}</p>
-          {review.issues.length ? (
+          {review.issues?.length ? (
             <ul className="review-issues">
-              {review.issues.map((issue, index) => {
+              {review.issues?.map((issue, index) => {
                 const uid = issue.task_uid || "";
                 const checked = Boolean(uid) && reworkUids.includes(uid);
                 return (
@@ -712,7 +730,7 @@ export default function RunPage() {
                 onChange={(event) => setReworkNote(event.target.value)}
               />
             ) : (
-              <em className="review-locked">评审已归档，不可再回退</em>
+              <em className="review-locked">没有可回退的任务</em>
             )}
             <Button size="small" disabled={!review.body} onClick={() => setReviewOpen(true)}>
               查看报告
@@ -729,7 +747,7 @@ export default function RunPage() {
             </Button>
           </div>
           <div className="review-metricline">
-            <span>问题 {metrics?.review?.issues ?? review.issues.length}</span>
+            <span>问题 {metrics?.review?.issues ?? review.issues?.length ?? 0}</span>
             <span>阻塞 {metrics?.review?.severities?.blocker ?? 0}</span>
             <span>重要 {metrics?.review?.severities?.major ?? 0}</span>
             <span>建议 {metrics?.review?.severities?.minor ?? 0}</span>
