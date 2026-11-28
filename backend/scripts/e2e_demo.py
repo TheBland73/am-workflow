@@ -1,12 +1,19 @@
-"""端到端演示脚本：配置 Mock 供应商 → 建 run → 自动走完 5 个人工门。
+"""端到端演示脚本：配置供应商 → 建 run → 逐个处理人工门。
 
 前置：
-1. `.\\.venv\\Scripts\\python.exe scripts\\mock_provider.py --port 8100`
+1. `.\\.venv\\Scripts\\python.exe scripts\\mock_provider.py --port 8100`（Mock 演示）
 2. `.\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --port 8099`
 
 用法（在 backend 目录）：
     .\\.venv\\Scripts\\python.exe scripts\\e2e_demo.py --auto
-    .\\.venv\\Scripts\\python.exe scripts\\e2e_demo.py          # 每个门手动确认
+        Mock 演示：自动批准所有门。
+    .\\.venv\\Scripts\\python.exe scripts\\e2e_demo.py
+        真实模型验收：手动模式，脚本按确认点类型逐个提问（澄清答复、名单驳回意见、
+        共识选项与指导语、升级接受或回流意见），运行级工件门仍是三选一。
+    .\\.venv\\Scripts\\python.exe scripts\\e2e_demo.py --full-history
+        建运行时打开 discussion.full_history，用于对照实验。
+    .\\.venv\\Scripts\\python.exe scripts\\e2e_demo.py --idea "……" --timeout 7200
+        --idea 换想法；--timeout 是等待运行的超时秒数，真实模型要留够时间。
 """
 from __future__ import annotations
 
@@ -55,6 +62,30 @@ def snapshot(client: httpx.Client, run_id: str) -> dict:
     return resp.json()
 
 
+def create_run(client: httpx.Client, idea: str, full_history: bool = False) -> str:
+    """建运行；只有要求时才带运行级配置，避免多发字段。"""
+    body: dict = {"idea": idea, "template_key": "sdlc_v1"}
+    if full_history:
+        body["config"] = {"params": {"discussion": {"full_history": True}}}
+    resp = client.post("/runs", json=body)
+    resp.raise_for_status()
+    return resp.json()["run"]["id"]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base", default="http://127.0.0.1:8099/api")
+    parser.add_argument("--idea", default=DEFAULT_IDEA)
+    parser.add_argument("--auto", action="store_true", help="自动批准所有门（Mock 演示用）")
+    parser.add_argument("--demo-reject", action="store_true",
+                        help="在需求门演示一次驳回 + 反馈 + 重跑")
+    parser.add_argument("--full-history", action="store_true",
+                        help="打开 discussion.full_history（对照实验用）")
+    parser.add_argument("--timeout", type=int, default=3600,
+                        help="等待运行的超时时间（秒）；真实模型要留够时间，默认 3600")
+    return parser
+
+
 def show_gate(snap: dict, gate: dict) -> None:
     node = next((n for n in snap["nodes"] if n["id"] == gate["node_id"]), None)
     print("\n" + "=" * 66)
@@ -79,21 +110,78 @@ def decide(client: httpx.Client, gate: dict, action: str, **kwargs) -> None:
         print()
 
 
+def approve_gate(client: httpx.Client, gate: dict) -> None:
+    """按确认点的类型作答：会议内的确认点要带决定的内容，工件门直接通过。"""
+    kind = gate.get("kind") or ""
+    if kind == "clarify":
+        questions = (gate.get("payload") or {}).get("questions") or []
+        decide(client, gate, "approve", decided_by="demo",
+               data={"answers": ["以背景材料为准"] * max(1, len(questions))})
+    elif kind == "roster":
+        decide(client, gate, "approve", decided_by="demo")
+    elif kind == "consensus":
+        decide(client, gate, "approve", decided_by="demo", data={"option": "integrate"})
+    elif kind == "escalation":
+        decide(client, gate, "approve", decided_by="demo", data={"option": "accept"})
+    else:
+        decide(client, gate, "approve", decided_by="demo")
+
+
+def manual_decide(client: httpx.Client, gate: dict, ask=input, run_id: str = "") -> None:
+    """手动处理一个确认点：按类型提问；会议内确认点驳回时不带 target_node。"""
+    kind = gate.get("kind") or ""
+    if kind == "clarify":
+        questions = (gate.get("payload") or {}).get("questions") or []
+        answers = [ask(f"{question}\n答（留空=按假设处理）：").strip() for question in questions]
+        decide(client, gate, "approve", decided_by="human", data={"answers": answers})
+    elif kind == "roster":
+        if (ask("通过(a) / 驳回并给意见(r)? [a]").strip().lower() or "a") == "r":
+            feedback = ask("驳回意见：").strip()
+            decide(client, gate, "reject", feedback=feedback, decided_by="human")
+        else:
+            decide(client, gate, "approve", decided_by="human")
+    elif kind == "consensus":
+        choice = ask("整合成稿(i) / 继续讨论(c) / 交主持人裁决(d)? [i]").strip().lower() or "i"
+        if choice == "d":
+            decide(client, gate, "approve", decided_by="human", data={"option": "delegate"})
+        elif choice == "c":
+            guidance = ask("继续讨论的指导语（可留空）：").strip()
+            decide(client, gate, "approve", decided_by="human",
+                   data={"option": "continue"}, feedback=guidance)
+        else:
+            decide(client, gate, "approve", decided_by="human", data={"option": "integrate"})
+    elif kind == "escalation":
+        if (ask("接受现状(a) / 带意见再回流一轮(r)? [a]").strip().lower() or "a") == "r":
+            feedback = ask("回流意见：").strip()
+            decide(client, gate, "reject", feedback=feedback, decided_by="human")
+        else:
+            decide(client, gate, "approve", decided_by="human", data={"option": "accept"})
+    else:
+        # 运行级的工件门：三选一，驳回时照旧指定退回节点。
+        action = ask("通过(a) / 驳回(r) / 编辑后通过(e)? [a] ").strip().lower() or "a"
+        if action == "r":
+            feedback = ask("驳回反馈：").strip()
+            target = ask("退回节点 key：").strip()
+            decide(client, gate, "reject", feedback=feedback,
+                   target_node=target, decided_by="human")
+        elif action == "e":
+            kind = ask("工件类型：").strip()
+            art = client.get(f"/runs/{run_id}/artifacts/{kind}").json()
+            body = art["body"] + "\n\n## 人工补充\n\n（此处由审批人补充。）\n"
+            client.patch(f"/runs/{run_id}/artifacts/{kind}",
+                         json={"body": body, "status": "approved"})
+            decide(client, gate, "approve", decided_by="human")
+        else:
+            decide(client, gate, "approve", decided_by="human")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default="http://127.0.0.1:8099/api")
-    parser.add_argument("--idea", default=DEFAULT_IDEA)
-    parser.add_argument("--auto", action="store_true", help="自动批准所有门")
-    parser.add_argument("--demo-reject", action="store_true",
-                        help="在需求门演示一次驳回 + 反馈 + 重跑")
-    parser.add_argument("--timeout", type=int, default=300)
+    parser = build_parser()
     args = parser.parse_args()
 
     with httpx.Client(base_url=args.base, timeout=60.0) as client:
         ensure_provider(client)
-        resp = client.post("/runs", json={"idea": args.idea, "template_key": "sdlc_v1"})
-        resp.raise_for_status()
-        run_id = resp.json()["run"]["id"]
+        run_id = create_run(client, args.idea, full_history=args.full_history)
         print(f"[run] {run_id} 已创建，idea 已落盘")
 
         rejected = False
@@ -116,27 +204,13 @@ def main() -> None:
                 if args.demo_reject and not rejected and gate["node_key"] == "gate_requirement":
                     rejected = True
                     decide(client, gate, "reject",
-                           feedback="需求缺少「导出周报」的验收标准，请补充 R6 并给出 Given/When/Then。",
+                           feedback="需求规格的 R1 缺少验收标准，请补充 Given/When/Then。",
                            target_node="requirement", decided_by="demo")
                     continue
                 if args.auto:
-                    decide(client, gate, "approve", decided_by="demo")
+                    approve_gate(client, gate)
                 else:
-                    action = input("通过(a) / 驳回(r) / 编辑后通过(e)? [a] ").strip().lower() or "a"
-                    if action == "r":
-                        feedback = input("驳回反馈：").strip()
-                        target = input("退回节点 key：").strip()
-                        decide(client, gate, "reject", feedback=feedback,
-                               target_node=target, decided_by="human")
-                    elif action == "e":
-                        kind = input("工件类型：").strip()
-                        art = client.get(f"/runs/{run_id}/artifacts/{kind}").json()
-                        body = art["body"] + "\n\n## 人工补充\n\n（此处由审批人补充。）\n"
-                        client.patch(f"/runs/{run_id}/artifacts/{kind}",
-                                     json={"body": body, "status": "approved"})
-                        decide(client, gate, "approve", decided_by="human")
-                    else:
-                        decide(client, gate, "approve", decided_by="human")
+                    manual_decide(client, gate, run_id=run_id)
                 continue
             time.sleep(0.6)
 

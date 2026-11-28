@@ -1,11 +1,11 @@
 # 真实模型验收测试：随手账本 `ledger-cli`
 
 这份文档是一条**可以直接照做**的验收路径：用你自己的 API Key，让 AM-Workflow 从一句想法跑到
-可执行的代码，途中经过 5 个人工门、7 类工件和一次真实 `unittest` 验证。
+可执行的代码，途中经过 6 个运行级人工门（另有会议内的确认点：讨论会议的名单确认一定会停，有澄清问题时也会停）、8 类工件和一次真实 `unittest` 验证。
 
 - 配套需求规格：[`docs/tasks/ledger-idea.txt`](ledger-idea.txt)（直接粘贴到“新建运行”的输入框）
 - 预计耗时：20–40 分钟（取决于模型速度）
-- 建议预算：`300000` tokens（约 20–21 个节点：模板 18 + 2–3 个 `dev_*` 展开，含三方讨论与重试）
+- 建议预算：`300000` tokens（约 20 个节点：模板 17 + 2–3 个 `dev_*` 展开，含讨论 / 评审 / 需求确认三场会议与重试）
 - 建议并发：`AM_NODE_CONCURRENCY=2`，避免真实供应商限流
 
 ## 0. 一页速览
@@ -14,9 +14,9 @@
 |---|------|------|------|
 | 1 | 启动 | `uvicorn app.main:app --port 8099` | 打开 `http://127.0.0.1:8099` |
 | 2 | 接模型 | 供应商页新增 DeepSeek + `deepseek-chat` | 连接测试通过 |
-| 3 | 绑角色 | 角色页把 11 个角色绑到该模型 | 无“尚未配置”报错 |
+| 3 | 绑角色 | 角色页把全部角色绑定到该模型 | 无“尚未配置”报错 |
 | 4 | 建运行 | 粘贴 `ledger-idea.txt`，预算 300000 | 运行进入 `idea` |
-| 5 | 过 5 个门 | 方案 → 需求 → 设计 → 任务图 → 验收 | 每次通过后自动续跑 |
+| 5 | 过 6 个门 | 方案 → 评审裁决 → 需求确认 → 设计 → 任务图 → 验收（讨论会议里的名单确认、澄清确认也会各停一次，照确认点卡片处理） | 每次通过后自动续跑 |
 | 6 | 验收 | 手工跑 CLI + `unittest` | 全绿，工件齐 |
 
 ## 1. 启动 API
@@ -24,7 +24,7 @@
 前端产物需要先存在（仓库里通常已有 `frontend/dist`；没有就先 `npm run build`）。
 
 ```powershell
-cd D:\Project\SoftwareProj\TeamWk\am-workflow
+cd <仓库根目录>
 $env:AM_NODE_CONCURRENCY = "2"     # 真实供应商限流更稳
 $env:AM_NODE_TIMEOUT_S   = "600"  # 单节点 10 分钟
 cd backend
@@ -49,11 +49,9 @@ cd backend
    下拉可自动填入模型名。
 5. 点供应商行的「测试」：有本地模型时会真发一句 8-token 对话，返回延迟与回复；模型行的 ⚗ 按钮
    可单独验证某个模型名（401 一般是 Key 错，404 一般是模型名或 Base URL 错）。
-6. 左侧「角色」→ 把 **11 个角色全部**绑定到该模型（`discuss_pro`、`discuss_con`、`discuss_mod`、
-   `proposal`、`requirement`、`design`、`task_breaker`、`pm`、`review`、`dev`、`delivery`）。未绑定的角色会
+6. 左侧「角色」→ 把**全部角色**绑定到该模型（主持人 `facilitator`、评审主席 `review_chair`、参会者 `architect` / `ux` / `qa` / `security` / `ops_cost` / `business`、需求方代理 `requester_proxy`、判定 `judge`、需求分析师 `requirement`、设计师 `design`、任务分解 `task_breaker`、PM `pm`、评审 `review`、开发 `dev`、交付 `delivery`）。未绑定的角色会
    回退到第一个可用模型；只有一个模型时能跑通，但多模型环境建议全绑，避免角色串用。
-   `discuss_mod`（讨论主持人）负责蒸馏共识与未决项，绑定后讨论阶段为
-   主张 → 质疑 → 回应 → 蒸馏四个节点。
+   `facilitator`（讨论主持人）负责提炼决策点、整合成稿；`review_chair`（评审主席）负责合并评审意见并在讨论阶段主持。
 
 ### 2.2 脚本方式（可选，等价于上面的点击，一步到位）
 
@@ -61,7 +59,8 @@ cd backend
 把全部角色绑到该模型 → 建运行。密钥只从环境变量读，不进命令行历史。
 
 ```powershell
-cd D:\Project\SoftwareProj\TeamWk\am-workflow\backend
+```powershell
+cd <仓库根目录>\backend
 $env:DEEPSEEK_API_KEY = "sk-..."
 ..\.venv\Scripts\python.exe scripts\setup_real_model.py --idea ..\docs\tasks\ledger-idea.txt
 ```
@@ -77,14 +76,15 @@ $env:DEEPSEEK_API_KEY = "sk-..."
    下游测试越可验）。
 4. 创建后进入运行详情页：左侧是阶段圆盘与人工门，右侧是节点/工件/事件。
 
-## 4. 五个门的检查点
+## 4. 六个门的检查点
 
 每个门都有「通过 / 驳回」。本次验收按下表检查，**至少演示一次“编辑后通过”和一次“驳回重做”**。
 
 | 门 | 看什么 | 本次建议动作 |
 |----|--------|--------------|
 | 方案确认 `gate_proposal` | `proposal.md` 是否有目标、范围、非目标、风险、验收标准 | 在弹窗里给“非目标”补一句“不做 Web/云同步”，编辑后通过 |
-| 需求审查 `gate_requirement` | 需求是否可测（WHEN/THEN 或 Given/When/Then），有无歧义 | 直接通过 |
+| 评审裁决 `gate_review` | `review` 工件的问题清单与处置；阻塞项是否回流 | 直接通过 |
+| 需求确认 `gate_requirement` | 需求是否可测（WHEN/THEN 或 Given/When/Then），有无歧义；确认会议报告是否列出走样与遗漏 | 直接通过 |
 | 设计审查 `gate_design` | 模块划分、公开接口、错误处理、测试策略是否覆盖契约 | 直接通过 |
 | 任务图 `gate_tasks` | 任务是否为 3 个左右、依赖是否合理（A/B 可并行、C 依赖 A/B） | 直接通过 → 展开出 `dev_*` 并行节点 |
 | 验收 `gate_accept` | `verify` 节点日志是否 `Ran N tests ... OK`；工件链是否齐全 | 直接通过 |
@@ -94,8 +94,8 @@ $env:DEEPSEEK_API_KEY = "sk-..."
 
 ## 5. 验收清单
 
-- [ ] 运行状态 `finished`，`20–21` 个节点全部 `done`（模板 18 个；2–3 个 `dev_*` 是展开后新增的）。
-- [ ] 磁盘：`runs\<run_id>\artifacts\` 下有 idea/discussion/proposal/requirement/design/task/changelog 七类 `.md`；
+- [ ] 运行状态 `finished`，约 `20` 个节点全部 `done`（模板 17 个；2–3 个 `dev_*` 是展开后新增的）。
+- [ ] 磁盘：`runs\<run_id>\artifacts\` 下有 idea/discussion/proposal/review/requirement/design/task/changelog 八类 `.md`；
       `runs\<run_id>\workspace\` 下有 `ledger.py`、`test_ledger.py`、`README.md`。
 - [ ] 手工跑 CLI（路径按实际 `run_id` 替换）：
 
@@ -128,6 +128,7 @@ $env:DEEPSEEK_API_KEY = "sk-..."
 | `BudgetExceeded` | 预算耗尽 | 新建运行把 `budget_tokens` 提到 600000 |
 | `dev_*` 完成但报“未完成” | 模型没调用 `finish` 工具 | 看事件里的 `stopped_by`；门驳回并反馈“必须调用 finish 结束” |
 | `验证命令失败` | 测试或 CLI 有错 | 看 `node_log` 输出；驳回验收门，目标选对应 `dev_*`，反馈贴错误 |
+| 会议节点（讨论 / 评审 / 需求确认）停在“转人工”的门上 | 模型某一步的输出不合格（JSON 不合法、空正文、方案缺章节）。会议每在一个确认点挂起一次就算一次尝试，默认最多 3 次：经过名单、澄清两个确认点之后，再出一次不合格就不会自动重试 | 点「通过」让会议从出错的那一步续开（那一步会重新问模型）；日志里有“可能被截断”的警告时，到模型设置里调大最大输出 |
 
 ## 7. 进阶观察
 

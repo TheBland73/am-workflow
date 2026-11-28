@@ -11,6 +11,7 @@ export interface Run {
   finished_at: string | null;
   budget_tokens: number;
   error: string | null;
+  config: Record<string, unknown>;
   nodes_total?: number;
   nodes_done?: number;
 }
@@ -59,6 +60,23 @@ export interface NodeMessage {
   tool_call_id?: string | null;
 }
 
+export type NodeDetail = Omit<Node, "attempts"> & {
+  attempts: NodeAttemptDetail[];
+  messages: NodeMessage[];
+  order_index: number;
+  run_status: string;
+  upstream: NodeDownstreamRef[];
+  downstream: NodeDownstreamRef[];
+  open_gate: NodeGateRef | null;
+  can_retry: boolean;
+  can_reset: boolean;
+  can_skip: boolean;
+  can_feedback: boolean;
+  can_edit_config: boolean;
+  events: StreamEvent[];
+  artifact_kinds: string[];
+};
+
 /** 上下游节点的轻量引用（GET /nodes/{id}）。 */
 export interface NodeDownstreamRef {
   node_key: string;
@@ -74,25 +92,7 @@ export interface NodeGateRef {
   status: string;
 }
 
-export type NodeDetail = Omit<Node, "attempts"> & {
-  attempts: NodeAttemptDetail[];
-  messages: NodeMessage[];
-  max_attempts: number;
-  order_index: number;
-  run_status: string;
-  upstream: NodeDownstreamRef[];
-  downstream: NodeDownstreamRef[];
-  open_gate: NodeGateRef | null;
-  can_retry: boolean;
-  can_reset: boolean;
-  can_skip: boolean;
-  can_feedback: boolean;
-  can_edit_config: boolean;
-  events: StreamEvent[];
-  artifact_kinds: string[];
-};
-
-/** POST /nodes/{id}/retry 请求体。expected_status 用于幂等保护（契约 §4）。 */
+/** POST /nodes/{id}/retry 请求体。expected_status 用于幂等保护。 */
 export interface RetryNodeBody {
   feedback?: string;
   reset_downstream?: boolean;
@@ -112,7 +112,7 @@ export interface SkipNodeBody {
   expected_status?: string;
 }
 
-/** 节点动作端点的统一响应（契约 §4；feedback 响应没有 run_id）。 */
+/** 节点动作端点的统一响应（feedback 响应没有 run_id）。 */
 export interface NodeActionResponse {
   node_id: number;
   status: string;
@@ -137,6 +137,8 @@ export interface Gate {
   id: number;
   node_id: number;
   node_key: string;
+  /** 会议内确认点所属的会议；人工门为 null。 */
+  meeting_id?: number | null;
   status: string;
   feedback: string | null;
   decided_by: string | null;
@@ -144,6 +146,19 @@ export interface Gate {
   decided_at: string | null;
   title?: string | null;
   description?: string | null;
+  kind: string;
+  payload: Record<string, unknown>;
+  decision: Record<string, unknown>;
+}
+
+/** `/gates?run_id=` 的精简列表项（与快照里的门不是同一份形状）。 */
+export interface GateListItem {
+  id: number;
+  run_id: string;
+  node_id: number;
+  status: string;
+  feedback: string | null;
+  decided_by: string | null;
 }
 
 export interface ArtifactRecord {
@@ -230,21 +245,24 @@ export interface RunReview {
   available: boolean;
   run_id: string;
   run_status: string;
+  /** 短响应（available=false）只有 available/run_id/run_status，其余字段都可能缺省。 */
   node_id?: number;
   node_key?: string;
   node_status?: string;
   verdict?: string | null;
   summary?: string | null;
-  issues: ReviewIssue[];
-  blocking: number;
-  targets: string[];
-  round: number;
-  max_rounds: number;
+  issues?: ReviewIssue[];
+  blocking?: number;
+  targets?: string[];
+  round?: number;
+  max_rounds?: number;
   reviewed_at?: string | null;
-  files: string[];
-  history: ReviewHistoryItem[];
-  escalated: boolean;
-  can_rework: boolean;
+  files?: string[];
+  history?: ReviewHistoryItem[];
+  escalated?: boolean;
+  can_rework?: boolean;
+  /** 前半段的评审/确认报告才有；旧 REVIEW 节点的报告没有。 */
+  review_type?: "proposal" | "requirement";
   artifact?: ArtifactRecord | null;
   body?: string;
 }
@@ -276,6 +294,16 @@ export interface RunMetrics {
     rejected: number;
     avg_decision_ms: number;
     open_wait_ms: number;
+  };
+  context: {
+    compactions: number;
+    cached_tokens: number;
+    cache_hit_rate: number;
+  };
+  meetings: {
+    total: number;
+    turns: number;
+    checkpoints: { human: number; program: number; model: number; open: number };
   };
   events: number;
   per_node: NodeMetric[];
@@ -355,6 +383,133 @@ export interface AgentTemplate {
   memory_scope: string;
   default_model_id: number | null;
   max_steps: number;
+  builtin: boolean;
+  meta: { description?: string; tags?: string[]; meeting_roles?: string[] };
+}
+
+/* ---------- 会议式前半段：会议、确认点、参数表 ---------- */
+
+export interface MeetingSummary {
+  id: number;
+  run_id: string;
+  node_id: number;
+  node_key: string;
+  protocol: string;
+  status: string;
+  phase: string;
+  round: number;
+}
+
+export interface Participant {
+  id: number;
+  meeting_id: number;
+  role_key: string | null;
+  display_name: string;
+  mode: string;
+  system_prompt: string;
+  model_id: number | null;
+  source: string;
+  expertise: string[];
+  status: string;
+  position: number;
+}
+
+export interface ParticipantIn {
+  role_key?: string | null;
+  display_name: string;
+  persona?: string;
+  model_id?: number | null;
+  mode?: string;
+}
+
+export interface MeetingTurn {
+  id: number;
+  seq: number;
+  round: number;
+  phase: string;
+  speaker_id: number | null;
+  speaker_name: string;
+  kind: string;
+  decision_point_id: number | null;
+  content: string;
+  structured: Record<string, unknown>;
+  reply_to: number | null;
+  tokens_in: number;
+  tokens_out: number;
+  cached_tokens: number;
+}
+
+export interface DecisionPoint {
+  id: number;
+  meeting_id: number;
+  index: number;
+  title: string;
+  question: string;
+  options: string[];
+  raised_by: string | null;
+  status: string;
+  conclusion: string | null;
+  rationale: string | null;
+  exchange_summary: string | null;
+  stances: Record<string, unknown>;
+  origin_round: number | null;
+  closed_round: number | null;
+  superseded_by: number | null;
+}
+
+export interface MeetingDetail {
+  meeting: MeetingSummary;
+  participants: Participant[];
+  decision_points: DecisionPoint[];
+  checkpoints: Gate[];
+  turn_count: number;
+  node_status: string | null;
+}
+
+export interface ParamSpec {
+  type: "int" | "float" | "bool" | "str";
+  default: number | string | boolean;
+  min?: number;
+  max?: number;
+  choices?: string[];
+  title: string;
+  recommend?: string;
+  hint?: string;
+}
+
+export interface TemplateNode {
+  key: string;
+  type: string;
+  name?: string;
+  phase?: string;
+  deps?: string[];
+  config?: Record<string, unknown>;
+}
+
+export interface TemplateDefinition {
+  key: string;
+  name: string;
+  phases: Array<{ key: string; name: string }>;
+  params: Record<string, Record<string, ParamSpec>>;
+  automation_levels: Record<string, Record<string, string>>;
+  rubrics: Record<string, string>;
+  nodes: TemplateNode[];
+}
+
+export interface RunConfig {
+  automation?: { level?: string; checkpoints?: Record<string, string> };
+  params?: Record<string, Record<string, unknown>>;
+  rosters?: Record<string, { role_keys?: string[]; count?: number }>;
+}
+
+export interface MaterialIn {
+  name?: string;
+  content: string;
+}
+
+export interface MaterialRecord {
+  name: string;
+  chars: number;
 }
 
 export interface Preset {
@@ -372,7 +527,7 @@ export interface Preset {
   }>;
 }
 
-/* ---------- 缂栨帓宸ヤ綔鍙帮紙ORCH-01锛?---------- */
+/* ---------- 编排工作台（ORCH-01） ---------- */
 
 export type PlanStatus =
   | "draft" | "generating" | "generated" | "validating"
@@ -571,7 +726,11 @@ export interface PlanListItem {
   updated_at: string | null;
 }
 
-/* ---------- 鏁版嵁缁熻锛圓NALYTICS锛?---------- */
+export interface PlanEvent {
+  seq: number;
+  type: "plan_token" | "plan_generated" | "plan_failed";
+  payload: { token?: string; status?: string; plan_id?: string; error?: string; [key: string]: unknown };
+}
 
 /** 缁熻鏃堕棿绐楋細鍚庣鎸?runs.created_at銆乁TC 鑷劧鏃ュ垏妗躲€?*/
 export interface AnalyticsWindow {
@@ -732,8 +891,3 @@ export interface AnalyticsFailedRuns {
   items: AnalyticsFailedItem[];
 }
 
-export interface PlanEvent {
-  seq: number;
-  type: "plan_token" | "plan_generated" | "plan_failed";
-  payload: { token?: string; status?: string; plan_id?: string; error?: string; [key: string]: unknown };
-}

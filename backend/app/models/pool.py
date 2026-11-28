@@ -95,27 +95,41 @@ class ModelPool:
         )
 
     # ---------- 绑定解析 ----------
-    def pick_role_model(self, role_key: str) -> ModelInfo | None:
+    def role_default_model_id(self, role_key: str) -> int | None:
+        """用户给这个角色显式绑定的模型；没绑过返回 None。"""
+        with session_scope() as s:
+            template = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
+            return template.default_model_id if template else None
+
+    def role_model_candidates(self, role_key: str) -> list[ModelInfo]:
+        """这个角色可用的模型，按优先级排好：显式绑定的在前，其后是启用的供应商下的启用模型。
+
+        pick_role_model 取第一个；要在候选里另做选择的调用方（如裁决模型的异构优先）用它。
+        """
         candidates: list[int] = []
         with session_scope() as s:
             template = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
             if template and template.default_model_id:
                 candidates.append(template.default_model_id)
-            row = (
-                s.query(ModelEntry)
+            rows = (
+                s.query(ModelEntry.id)
                 .join(ProviderConfig, ProviderConfig.id == ModelEntry.provider_id)
                 .filter(ModelEntry.enabled.is_(True), ProviderConfig.enabled.is_(True))
                 .order_by(ModelEntry.id.asc())
-                .first()
+                .all()
             )
-            if row:
-                candidates.append(row.id)
-        for model_id in candidates:
+            candidates += [row.id for row in rows]
+        models: list[ModelInfo] = []
+        for model_id in dict.fromkeys(candidates):      # 去重且保持顺序：绑定的模型可能也在可用列表里
             try:
-                return self.load_model(model_id)
+                models.append(self.load_model(model_id))
             except ProviderError:
                 continue
-        return None
+        return models
+
+    def pick_role_model(self, role_key: str) -> ModelInfo | None:
+        candidates = self.role_model_candidates(role_key)
+        return candidates[0] if candidates else None
 
     def require_role_model(self, role_key: str) -> ModelInfo:
         model = self.pick_role_model(role_key)

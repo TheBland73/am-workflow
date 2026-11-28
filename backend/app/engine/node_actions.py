@@ -23,6 +23,7 @@ from app.db.models import (
     Run,
     Task,
 )
+from app.engine.feedback import with_feedback
 
 TERMINAL_RUN_STATUS = frozenset({"finished", "failed", "stopped"})
 
@@ -117,7 +118,7 @@ def _reset_downstream_impl(s: Session, run_id: str, node_key: str, *,
         if node.status not in _RESETTABLE_STATUSES:
             continue
         node.status = "pending"
-        node.config_json = _clean_scheduling_config(node.config_json)
+        node.config_json = with_feedback(_clean_scheduling_config(node.config_json), None)
         reset_keys.append(node.node_key)
         if sync_tasks:
             _sync_task_status(s, run_id, node.node_key, "pending")
@@ -214,6 +215,20 @@ def collect_open_gates(s: Session, node_id: int) -> list[Gate]:
     )
 
 
+def _has_output_artifact(s: Session, node: Node) -> bool:
+    """会议节点是否已经产出过工件（任意版本）。
+
+    跳过会议等于让下游在没有会议产出（纪要 / 方案 / 评审报告）的情况下继续；
+    详设 §6.7 要求"产出工件已存在才允许跳过"。
+    """
+    return (
+        s.query(Artifact.id)
+        .filter(Artifact.run_id == node.run_id, Artifact.created_by_node == node.node_key)
+        .first()
+        is not None
+    )
+
+
 def action_flags(node: Node, run: Run) -> dict:
     """按 §2 矩阵推导 can_*；run 终态时全部为 False。"""
     run_terminal = run is None or run.status in TERMINAL_RUN_STATUS
@@ -237,6 +252,11 @@ def action_flags(node: Node, run: Run) -> dict:
         if action == "skip":
             # HUMAN_GATE 一律不可跳过；skipped 幂等重放
             if is_gate:
+                return False
+            # 会议节点：还没有产出工件时不可跳过（下游会缺输入）
+            if node.type == "MEETING" and (
+                session is None or not _has_output_artifact(session, node)
+            ):
                 return False
             return status in ("pending", "waiting_human", "skipped")
         if action == "feedback":
@@ -426,9 +446,10 @@ def apply_retry(node: Node, run: Run, *, feedback: str | None,
     closed = close_open_gates(
         s, node.id, decided_by="human-retry", feedback=feedback
     )
-    config = _clean_scheduling_config(node.config_json)
+    config = with_feedback(_clean_scheduling_config(node.config_json), None)
     if feedback:
-        config["feedback"] = feedback
+        # 与 with_feedback 同一口径：会议运行器靠 feedback_kind/feedback_seq 认出待复议的反馈
+        config = with_feedback(config, feedback, "user")
     node.config_json = config
     node.status = "pending"
     _resume_run(s, run)
@@ -449,7 +470,7 @@ def apply_reset(s: Session, node: Node, run: Run, *, reset_downstream: bool = Tr
     _ensure_node_not_running(node)
     _ensure_no_open_gate_bypass(s, node)
     before = node.status
-    node.config_json = _clean_scheduling_config(node.config_json)
+    node.config_json = with_feedback(_clean_scheduling_config(node.config_json), None)
     node.status = "pending"
     # 保留门的原始反馈（升级原因）供审计，人工动作用 decided_by 区分。
     closed = close_open_gates(s, node.id, decided_by="human-reset", feedback=None)
@@ -478,6 +499,17 @@ def apply_skip(s: Session, node: Node, run: Run, *, reason: str | None,
             hint="请通过门审批接口 approve/reject 处理该节点",
             details={"node_id": node.id, "node_key": node.node_key},
         )
+    if node.type == "MEETING" and not _has_output_artifact(s, node):
+        kind = str((node.config_json or {}).get("artifact") or "").strip()
+        raise NodeActionError(
+            "meeting_artifact_missing",
+            "会议节点还没有产出工件，不能跳过",
+            hint=(
+                f"先让这场会议至少完成一轮并写出 {kind or '产出工件'}；"
+                "否则下游没有可用的输入"
+            ),
+            details={"node_id": node.id, "node_key": node.node_key, "artifact": kind},
+        )
     _ensure_run_active(run)
     _ensure_node_not_running(node)
     if node.status not in ("pending", "waiting_human", "skipped"):
@@ -497,7 +529,7 @@ def apply_skip(s: Session, node: Node, run: Run, *, reason: str | None,
             "closed_gates": 0,
             "changed": False,
         }
-    node.config_json = _clean_scheduling_config(node.config_json)
+    node.config_json = with_feedback(_clean_scheduling_config(node.config_json), None)
     node.status = "skipped"
     # 有 reason 时覆盖门的反馈，否则保留原始升级原因供审计。
     closed = close_open_gates(
@@ -535,7 +567,6 @@ def apply_feedback(node: Node, run: Run, *, feedback: str) -> dict:
             hint="如需按反馈重跑，请先 retry/reset",
             details={"node_id": node.id, "status": node.status},
         )
-    config = dict(node.config_json or {})
-    config["feedback"] = feedback
-    node.config_json = config
+    # 与 with_feedback 同一口径：会议运行器靠 feedback_kind/feedback_seq 认出待复议的反馈
+    node.config_json = with_feedback(node.config_json, feedback, "user")
     return {"before": node.status, "after": node.status, "reset_nodes": []}

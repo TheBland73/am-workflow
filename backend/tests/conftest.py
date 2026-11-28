@@ -8,6 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 # 注意：本机沙箱下 tempfile.gettempdir() 会退化为 cwd，因此显式把测试临时目录
@@ -38,3 +40,14 @@ os.environ.setdefault("AM_DATABASE_URL", f"sqlite:///{(_TMP / 'data' / 'test.db'
 os.environ.setdefault("AM_SECRET_KEY", "test-secret-key-0123456789abcdef0123456789ab")
 
 sys.path.insert(0, str(BACKEND_DIR))
+
+
+@pytest.fixture(autouse=True)
+def _no_orchestrator_recovery(monkeypatch) -> None:
+    """测试共用一个临时库：前面用例留下的运行，不该被后面用例启动应用时的恢复流程拉起来。"""
+    from app.engine.orchestrator import orchestrator
+
+    async def no_recover() -> None:
+        return None
+
+    monkeypatch.setattr(orchestrator, "recover", no_recover)

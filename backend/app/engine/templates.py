@@ -22,7 +22,11 @@ BUILTIN_FIELDS = (
     "memory_scope",
     "max_steps",
     "stop_condition",
+    "meta_json",
 )
+
+# 不再内置的角色：启动时清理没被用户改过的；改过的和旧库里没有指纹的保留为自定义角色
+RETIRED_ROLES = ("discuss_pro", "discuss_con", "discuss_mod", "proposal")
 
 
 def load_definition(template_key: str = "sdlc_v1") -> dict:
@@ -41,8 +45,15 @@ def _canonical_json(data: dict) -> str:
 
 
 def builtin_fingerprint(fields: dict) -> str:
-    """六个可编辑字段的 sha256 指纹（规范化 JSON 的 UTF-8 字节）。"""
+    """七个可编辑字段的 sha256 指纹（规范化 JSON 的 UTF-8 字节）。"""
     return hashlib.sha256(_canonical_json(fields).encode("utf-8")).hexdigest()
+
+
+def legacy_template_fingerprint(row: AgentTemplate) -> str:
+    """旧版算法（六个字段、不含 meta_json）的指纹，用来识别升级前的未修改行。"""
+    fields = template_fields(row)
+    fields.pop("meta_json", None)
+    return builtin_fingerprint(fields)
 
 
 def role_fields(role: dict) -> dict:
@@ -54,11 +65,12 @@ def role_fields(role: dict) -> dict:
         "memory_scope": role.get("memory_scope", "agent"),
         "max_steps": int(role.get("max_steps") or 3),
         "stop_condition": list(role.get("stop_condition") or []),
+        "meta_json": dict(role.get("meta") or {}),
     }
 
 
 def template_fields(row: AgentTemplate) -> dict:
-    """DB 行 → 同样的六个字段（JSON 列已反序列化为 Python 对象，可直接哈希）。"""
+    """DB 行 → 同样的七个字段（JSON 列已反序列化为 Python 对象，可直接哈希）。"""
     return {
         "name": row.name,
         "system_prompt": row.system_prompt,
@@ -66,6 +78,7 @@ def template_fields(row: AgentTemplate) -> dict:
         "memory_scope": row.memory_scope,
         "max_steps": int(row.max_steps or 0),
         "stop_condition": list(row.stop_condition or []),
+        "meta_json": dict(row.meta_json or {}),
     }
 
 
@@ -87,7 +100,7 @@ def _sync_builtin_row(row: AgentTemplate, role: dict) -> None:
     """把已有行升级到当前内置定义，三种判定（幂等）：
 
     a) ``builtin_hash is None``：旧库（本列引入前落库）无法区分「用户改动」与
-       「旧内置定义」，只能接受一次性覆盖——刷新六字段并写入当前指纹；
+       「旧内置定义」，只能接受一次性覆盖——刷新七字段并写入当前指纹；
     b) ``template_fingerprint(row) == row.builtin_hash``：用户没改过，内置定义
        变了就刷新字段并更新指纹；
     c) 其余：用户经 PATCH 改过，完全不动（含 system_prompt 与 builtin_hash）。
@@ -97,6 +110,11 @@ def _sync_builtin_row(row: AgentTemplate, role: dict) -> None:
     fields = role_fields(role)
     target = builtin_fingerprint(fields)
     if row.builtin_hash is None:
+        _refresh_builtin_fields(row, fields)
+        row.builtin_hash = target
+        return
+    if row.builtin_hash == legacy_template_fingerprint(row):
+        # 旧版算法写下、字段没改过：按未修改处理，升级到七字段指纹
         _refresh_builtin_fields(row, fields)
         row.builtin_hash = target
         return
@@ -122,6 +140,18 @@ def seed_defaults() -> None:
         else:
             row.name = definition.get("name", row.name)
             row.definition_json = definition
+        for role_key in RETIRED_ROLES:
+            retired = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
+            if retired is None:
+                continue
+            unmodified = bool(retired.builtin_hash) and (
+                template_fingerprint(retired) == retired.builtin_hash
+                or legacy_template_fingerprint(retired) == retired.builtin_hash)
+            if unmodified and retired.default_model_id is None:
+                s.delete(retired)                # 没改过、也没绑模型：清理
+                continue
+            retired.builtin_hash = None          # 改过、绑过模型，或旧库没有指纹：保留为自定义角色
+        s.flush()
         existing = {r.role_key: r for r in s.query(AgentTemplate).all()}
         for role in ROLES:
             template = existing.get(role["role_key"])
@@ -145,6 +175,41 @@ def workflow_definition(template_key: str) -> dict:
 
 def phase_names(definition: dict) -> dict[str, str]:
     return {p["key"]: p.get("name", p["key"]) for p in definition.get("phases", [])}
+
+
+def role_library() -> list[dict]:
+    """角色库：每个角色的键、名称、提示词与元数据。主持人挑名单、前端列角色都用它。"""
+    with session_scope() as s:
+        return [
+            {"role_key": r.role_key, "name": r.name, "system_prompt": r.system_prompt,
+             "meta": dict(r.meta_json or {}), "builtin": bool(r.builtin_hash),
+             "default_model_id": r.default_model_id}
+            for r in s.query(AgentTemplate).order_by(AgentTemplate.id.asc()).all()
+        ]
+
+
+def role_suits_meeting(role: dict, meeting: str) -> bool:
+    """这个角色能不能参加这类会议（meeting 是会议类型键：参会者看 "discussion"，评审者看 "review"）。
+
+    元数据里标了"适合的会议角色"就必须包含这类会议；没标（用户自建、没填）不受限。
+    接口的名单校验与三个协议的点名分支共用这条规则。
+    """
+    roles = (role.get("meta") or {}).get("meeting_roles")
+    if roles is None:
+        return True
+    if not isinstance(roles, list):
+        return False            # 元数据坏了（如被 PATCH 成字符串）：按不适合处理，不做子串匹配
+    return meeting in roles
+
+
+def role_template(role_key: str) -> dict | None:
+    """取一个角色；不存在时返回 None。"""
+    with session_scope() as s:
+        row = s.query(AgentTemplate).filter(AgentTemplate.role_key == role_key).first()
+        if row is None:
+            return None
+        return {"role_key": row.role_key, "name": row.name, "system_prompt": row.system_prompt,
+                "meta": dict(row.meta_json or {}), "default_model_id": row.default_model_id}
 
 
 def instantiate_nodes(run_id: str, definition: dict) -> int:

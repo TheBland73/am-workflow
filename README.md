@@ -6,7 +6,7 @@
 
 引擎拥有控制流、上下文与状态；模型只是可替换的节点；人工审批是一等公民；完成与否由证据判定。
 
-[![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen.svg)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-589%20passed-brightgreen.svg)](#开发与测试)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)](https://www.python.org/)
 [![Node](https://img.shields.io/badge/node-18%2B-339933.svg)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -38,7 +38,7 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 
 | 你给它 | 它给你 | 谁做决定 |
 | --- | --- | --- |
-| 一段想法（≤ 20,000 字） | 8 阶段 18 节点的完整工件链 + 可运行工作区 | 引擎调度，人工签 5 道门 |
+| 一段想法（≤ 20,000 字） | 9 阶段 17 节点的完整工件链 + 可运行工作区 | 引擎调度，人工签 6 道门 |
 | 一份 Markdown 设计规格 | 8–40 条可校验任务、波次、关键路径、可拖拽执行图 | PM 只提议，服务端确定性校验 |
 | 一套供应商 + API Key | 按角色路由的模型调用、token 预算与成本核算 | 密钥 Fernet 加密落盘 |
 
@@ -48,18 +48,20 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
-| 后端 API | 稳定 | FastAPI + SQLAlchemy + SQLite（WAL），约 60 个 REST 端点 |
+| 后端 API | 稳定 | FastAPI + SQLAlchemy + SQLite（WAL），86 个 REST 端点（含 `GET /api/health`） |
 | 编排引擎 | 稳定 | 依赖就绪并发、超时、指数退避、attempt 心跳、取消收据、死锁判定、崩溃恢复 |
-| 固定 SDLC 模板 | 稳定 | 8 阶段 / 18 节点 / 5 道人工门 / 8 类工件 |
-| 人工门 | 稳定 | 通过 · 驳回（反馈 + 目标节点 + 级联重置）· 编辑后通过 |
+| 固定 SDLC 模板 | 稳定 | 9 阶段 / 17 节点 / 6 道人工门 / 9 类工件；前半段为会议式流程 |
+| 人工门 | 稳定 | 通过 · 驳回（反馈 + 目标节点 + 级联重置）· 编辑后通过 · 交给模型判 |
 | 工件链 | 稳定 | YAML front-matter、版本递增、active/superseded/approved 状态机 |
 | 事件流 | 稳定 | SSE + `Last-Event-ID` 补发 + 15s 心跳帧 + 终态主动关闭 |
 | 前端控制台 | 稳定 | 运行列表 / 运行详情 / 编排工作台 / 数据统计 / 供应商 / 角色模板（Vite + React 18） |
 | 编排工作台 | 可用 | 生成 → 校验 → 编辑 → 画布拖拽 → 提交运行，支持快照回滚与 30 步撤销 |
+| 会议式前半段 | 已实现（真实模型验收待补） | 讨论 / 评审 / 需求确认三种会议、决策点账本、定点回流、确认点（人工或模型判定）、会话与上下文模块；Mock 端到端通过，验收数字待回填 |
+| 节点交互与动作 | 稳定 | 节点详情、重试 / 重置 / 跳过 / 注入反馈的矩阵与审计；人工门不可跳过 |
 | 数据统计 | 可用 | 全局运行量 / 成功率 / 耗时 / Token / 成本 / 趋势 / 状态分布（只读聚合，6 个接口） |
 | 代码评审 + 验收门 | 实验 | 启发式静态评审（文件摘要 + 验收清单），无 diff / AST / 覆盖率分析 |
 | 多进程 / 分布式 | 设计封存 | 见 [`docs/分布式执行模式设计.md`](docs/分布式执行模式设计.md) |
-| 单元测试 | 通过 | `119 passed`（pytest，约 6 秒）；前端 `tsc --noEmit` 无错误 |
+| 单元测试 | 通过 | `589 passed`（pytest，约 70 秒）；前端 `tsc --noEmit` 无错误 |
 
 > W1 的目标是**把控制流跑通并证明它可靠**，不是把生成质量做到可交付。质量与规模的边界见 [已知限制](#已知限制)。
 
@@ -69,8 +71,8 @@ AM-Workflow 是一个**网页端多智能体软件研发工作流平台**。它�
 
 ### 1. 可执行的 SDLC 状态机
 
-- **18 个节点、8 个阶段**：想法 → 三方讨论（主张 / 质疑 / 回应 / 主持人蒸馏）→ 方案 → 需求（EARS）→ 设计（编号章节）→ 任务分解 → 并行开发 → 验证 → 交付。
-- **节点类型**：`PASS`、`AGENT`、`VERIFY`、`REVIEW`、`TASKGRAPH`（解析 / 展开）、`HUMAN_GATE`，另有 `DECISION` / `RESTORE` / `CHECKPOINT` 预留。
+- **17 个节点、9 个阶段**：想法 → 讨论会议（澄清、名单、独立立场、交锋、整合成稿）→ 方案确认 → 评审会议 → 需求（EARS）→ 需求确认会议 → 设计（编号章节）→ 任务分解 → 并行开发 → 验证 → 交付。
+- **节点类型**：`PASS`、`AGENT`、`VERIFY`、`REVIEW`（旧版评审）、`MEETING`（讨论 / 评审 / 需求确认会议）、`TASKGRAPH`（解析 / 展开）、`HUMAN_GATE`，另有 `DECISION` / `RESTORE` / `CHECKPOINT` 预留。
 - **动态展开**：任务清单被解析成 `Task` 行后，按依赖生成 `dev_*` 节点，并把 `verify` 的依赖重写为全部开发节点。
 
 ### 2. 可靠执行（不依赖模型自觉）
@@ -211,7 +213,11 @@ flowchart LR
 
 ### 事件类型（SSE）
 
-`run_created` · `run_finished` · `run_error` · `run_stopped` · `run_recovered` · `phase_entered` · `node_started` · `node_finished` · `node_failed` · `node_retry_scheduled` · `node_log` · `node_token`（内存直推）· `node_tool_call` · `node_tool_result` · `node_created` · `task_created` · `task_updated` · `artifact_written` · `gate_requested` · `gate_decided` · `nodes_reset` · `review_blocked` · `review_rework` · `plan_token` · `plan_generated` · `plan_failed`
+运行事件流（`GET /api/runs/{id}/events`）推以下事件；前端 `subscribeRun` 逐个注册它们，会议事件的载荷见[会议式流程设计 §12.5](./docs/想法到需求确认-会议式流程设计.md)。
+
+`run_created` · `run_finished` · `run_error` · `run_stopped` · `run_recovered` · `phase_entered` · `node_started` · `node_finished` · `node_failed` · `node_retry_scheduled` · `node_retried` · `node_log` · `node_token`（内存直推）· `node_tool_call` · `node_tool_result` · `node_created` · `node_skipped` · `node_reset` · `node_feedback_injected` · `task_created` · `task_updated` · `artifact_written` · `gate_requested` · `gate_decided` · `nodes_reset` · `checkpoint_decided` · `memory_written` · `review_round_started` · `review_verdict` · `review_blocked` · `review_rework` · `context_compacted` · `context_prefix_changed` · `node_rerouted` · `meeting_started` · `meeting_phase` · `meeting_turn_started` · `meeting_turn_finished` · `meeting_ledger_updated` · `meeting_issue_updated` · `meeting_suspended` · `meeting_resumed` · `meeting_intervention_queued` · `meeting_intervention_injected` · `meeting_finished`
+
+计划流（`GET /api/plans/{id}/events`）另有 `plan_token` · `plan_generated` · `plan_failed`。
 
 ---
 
@@ -223,7 +229,7 @@ flowchart LR
 | 存储 | SQLite（WAL + `synchronous=NORMAL` + 单连接池 `pool_size=1`） |
 | 前端 | Vite · React 18 · TypeScript · Ant Design 5 · TanStack Query · React Router · @xyflow/react · zustand |
 | 视觉 | 终末地控制台风格（纸白 / 墨黑 / 单一信号黄），Saira 字体（SIL OFL） |
-| 测试 | pytest（后端 · 119 用例）· `tsc --noEmit`（前端类型检查） |
+| 测试 | pytest（后端 · 589 用例）· `tsc --noEmit`（前端类型检查） |
 
 ---
 
@@ -320,7 +326,7 @@ cd backend
 
 ### 运行页（RUNS）
 
-新建运行：填写想法与 token 预算（默认 1,200,000）→ 应用按固定模板固化 18 个节点并立即开始调度。运行详情页由命令栏、阶段圆盘、执行图、运行账本、内联人工门裁决卡与评审面板组成；工件可在线查看、编辑并保存为新版本。
+新建运行：填写想法与 token 预算（默认 1,200,000）→ 应用按固定模板固化 17 个节点并立即开始调度。运行详情页由命令栏、阶段圆盘、执行图、运行账本、内联人工门裁决卡与评审面板组成；工件可在线查看、编辑并保存为新版本。
 
 ### 人工门怎么用
 
@@ -405,11 +411,14 @@ netsh int ipv4 show excludedportrange protocol=tcp
 | --- | --- |
 | 供应商 | `GET /presets` · `GET/POST /providers` · `PATCH/DELETE /providers/{id}` · `GET /providers/{id}/models` · `POST /providers/{id}/models/import` · `POST /providers/{id}/test` |
 | 模型 | `GET/POST /models` · `PATCH/DELETE /models/{id}` |
-| 角色模板 | `GET /agent-templates` · `PATCH /agent-templates/{id}` |
-| 运行 | `POST/GET /runs` · `GET /runs/{id}` · `POST /runs/{id}/stop` · `GET /runs/{id}/metrics` · `GET /runs/{id}/review` · `POST /runs/{id}/review/rework` |
+| 角色模板 | `GET/POST /agent-templates` · `PATCH/DELETE /agent-templates/{id}` |
+| 运行 | `POST/GET /runs` · `GET /runs/{id}` · `POST /runs/{id}/stop` · `GET /runs/{id}/metrics` · `GET /runs/{id}/review` · `POST /runs/{id}/review/rework` · `GET/PATCH /runs/{id}/config` |
+| 会议 | `GET /runs/{id}/meetings` · `GET /runs/{id}/meetings/{meeting_id}` · `GET /runs/{id}/meetings/{meeting_id}/turns` · `GET /runs/{id}/meetings/{meeting_id}/minutes` · `PUT /runs/{id}/meetings/{meeting_id}/participants` · `PATCH /runs/{id}/meetings/{meeting_id}/decision-points/{point_id}` · `PATCH /runs/{id}/meetings/{meeting_id}/issues/{issue_id}` · `POST /runs/{id}/meetings/{meeting_id}/intervene` |
+| 背景材料 | `GET /runs/{id}/materials` · `POST /runs/{id}/materials` · `GET /runs/{id}/materials/{name}` |
+| 模板 | `GET /templates/{template_key}` |
 | 事件 | `GET /runs/{id}/events`（SSE）· `GET /runs/{id}/events/history` · `GET /events/{id}` |
 | 工件 | `GET /runs/{id}/artifacts` · `GET/PATCH /runs/{id}/artifacts/{kind}` |
-| 人工门 | `GET /gates` · `GET /gates/{id}` · `POST /gates/{id}/approve` · `POST /gates/{id}/reject` |
+| 人工门 | `GET /gates` · `GET /gates/{id}` · `POST /gates/{id}/approve` · `POST /gates/{id}/reject` · `POST /gates/{id}/delegate` |
 | 任务 / 节点 | `GET/POST /runs/{id}/tasks` · `PATCH/DELETE /runs/{id}/tasks/{uid}` · `GET /nodes/{id}` · `POST /nodes/{id}/retry` |
 | 记忆 | `GET /memories` · `PATCH /memories/{id}` |
 | 统计 | `GET /analytics/overview` · `GET /analytics/trends` · `GET /analytics/status-distribution` · `GET /analytics/usage` · `GET /analytics/recent-runs` · `GET /analytics/failed-runs`（均支持 `days=7/30/90` 或 `start`/`end`） |
@@ -454,7 +463,7 @@ am-workflow/
 │                                    analytics
 ├── frontend/                        Vite + React 18 + TS + AntD 5 + @xyflow/react + zustand
 │   └── src/{pages,panels,canvas,api,store,styles}
-├── templates/sdlc_workflow.json     固定 SDLC 模板（8 阶段 18 节点 5 门）
+├── templates/sdlc_workflow.json     固定 SDLC 模板（9 阶段 17 节点 6 门）
 ├── docs/                            设计规格、选型调研、评审体系、迭代记录、测试案例
 ├── data/                            SQLite 与密钥（git 忽略）
 ├── runs/                            运行产物与工作区（git 忽略）
@@ -470,7 +479,7 @@ am-workflow/
 ```powershell
 cd backend
 ..\.venv\Scripts\python.exe -m pytest tests -q
-# 119 passed in ~6s
+# 589 passed in ~70s
 ```
 
 覆盖范围：图与任务解析、front-matter、预算估算、门禁通过 / 驳回 / 升级重试、供应商与模型 CRUD、模板绑定校验、计划章节索引 / 错误码 / 波次 / 关键路径 / 环路径、计划 API（生成 / 编辑 / save 与 run 提交 / 幂等 / 归档）、并发闸门 / 节点超时 / 退避重试 / seq 缓存 / 取消收据 / metrics、模型发现与导入去重、评审节点 / 阻塞回退 / 轮次用尽 / 评审 API 与指标、三方讨论、数据统计（空窗口不除零 / 成功率 / 失败计数 / 平均耗时 / Token / 成本空态 / 时间筛选 / 趋势补零 / 状态分布 / 非法参数 400）。
@@ -497,7 +506,7 @@ npm run build        # 产物 dist/，由 FastAPI 托管
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/设计规格说明书.md`](docs/设计规格说明书.md) | 设计基线 v0.2：领域模型、节点模型、状态机、门、工件、事件、恢复 |
-| [`docs/想法到需求确认-会议式流程设计.md`](docs/想法到需求确认-会议式流程设计.md) | 前半段设计基线（尚未实现）：会议运行时、讨论 / 评审 / 确认三种会议、确认点机制（人工或模型判定）、会话与上下文模块 |
+| [`docs/想法到需求确认-会议式流程设计.md`](docs/想法到需求确认-会议式流程设计.md) | 前半段设计基线（已实现，真实模型验收待补）：会议运行时、讨论 / 评审 / 确认三种会议、确认点机制（人工或模型判定）、会话与上下文模块 |
 | [`docs/research/前沿技术调研与技术选型.md`](docs/research/前沿技术调研与技术选型.md) | 选型论据（工作流引擎、Agent 编排、可观测性对标） |
 | [`docs/评审与测试体系设计.md`](docs/评审与测试体系设计.md) | 三级评审 + 四级测试 + 缺陷闭环 + 质量钩子 + 调度拆屏障 |
 | [`docs/评审与验收门.md`](docs/评审与验收门.md) | 代码评审 Agent、阻塞自动回退、验收门、评审面板与指标 |
@@ -535,6 +544,9 @@ npm run build        # 产物 dist/，由 FastAPI 托管
 
 ### 能力缺口
 
+- **前半段升级前的运行不能续跑**：模板的前半段已换成会议式节点，旧运行没有会议记录，恢复时找不到对应的会议协议；这类运行需要重新创建。
+- **群聊式发言界面与工件侧栏渲染未做**：会议详情以账本、参会者与发言列表（最近五十条）呈现，没有逐条气泡式群聊视图；工件侧栏对会议纪要仍是纯文本渲染。
+- **真实模型验收待补**：前半段的参数默认值与实际效果尚未用真实模型校准，结论与数字见[会议式流程设计 §3.3](docs/想法到需求确认-会议式流程设计.md)（待接入真实供应商后回填）。
 - Anthropic / Gemini 适配器暂为伪流式；无 MCP 工具接入、无容器化执行、无向量检索与记忆面板、无多 run 调度看板、无执行看板。
 - 无 Alembic：schema 演进只支持「加列」（启动时幂等补齐），改列 / 删除列需手写迁移。
 - 无 CI 流水线：测试与类型检查需本地执行（`.github` 目前只有 CODEOWNERS）。
@@ -547,7 +559,7 @@ npm run build        # 产物 dist/，由 FastAPI 托管
 
 | 里程碑 | 目标 | 关键事项 |
 | --- | --- | --- |
-| **M1** | 把「能跑通」变成「跑得稳」 | 事件驱动解锁替代波次屏障；Anthropic / Gemini 真流式与工具调用；记忆抽取接入；attempt 级模型归因与成本报表；前半段改为会议式流程（[设计基线](docs/想法到需求确认-会议式流程设计.md)，尚未实现） |
+| **M1** | 把「能跑通」变成「跑得稳」 | 事件驱动解锁替代波次屏障；Anthropic / Gemini 真流式与工具调用；记忆抽取接入；attempt 级模型归因与成本报表；前半段改为会议式流程（✅ 2026-11-27 已实现，真实模型验收待补，见[设计文档](docs/想法到需求确认-会议式流程设计.md)） |
 | **M1.5** | 让证据更硬 | 由 `test` 角色从需求独立派生验收测试；`verify` 支持覆盖率与自定义命令；评审接入真实 diff |
 | **M2** | 走向真实工程 | worktree / 临时目录级隔离 + 合并节点；多 worker 租约与外部锁；容器化执行；MCP 工具接入 |
 | **M3** | 走向团队 | 认证与多租户、审计日志、执行看板与多 run 调度、向量记忆与记忆面板 |

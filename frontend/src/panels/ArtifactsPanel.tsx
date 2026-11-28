@@ -6,7 +6,7 @@ import { api } from "../api/client";
 import type { ArtifactRecord } from "../api/types";
 
 const KIND_LABEL: Record<string, string> = {
-  idea: "想法", discussion: "讨论稿", proposal: "建设方案", review: "评审意见",
+  idea: "想法", discussion: "会议纪要", proposal: "建设方案", review: "评审与确认报告",
   requirement: "需求规格", design: "设计规格", task: "任务清单", test: "测试记录",
   changelog: "变更日志",
 };

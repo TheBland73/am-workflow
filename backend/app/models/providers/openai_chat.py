@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 import httpx
 
+from app.conversation.telemetry import parse_cached_tokens
 from app.models.providers.base import ProtocolAdapter
 from app.models.types import (
     GenParams,
@@ -200,6 +201,7 @@ class OpenAIChatAdapter(ProtocolAdapter):
                     if chunk.get("usage"):
                         usage.input_tokens = chunk["usage"].get("prompt_tokens") or 0
                         usage.output_tokens = chunk["usage"].get("completion_tokens") or 0
+                        usage.cached_tokens = parse_cached_tokens(chunk["usage"])
                     for choice in chunk.get("choices") or []:
                         delta = choice.get("delta") or {}
                         piece = delta.get("content")

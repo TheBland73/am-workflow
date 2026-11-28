@@ -137,6 +137,10 @@ async def execute_node(ctx: NodeContext) -> dict:
         return await _run_verify(ctx)
     if ctx.type == "REVIEW":
         return await _run_review(ctx)
+    if ctx.type == "MEETING":
+        from app.meeting.runner import run_meeting
+
+        return await run_meeting(ctx)
     if ctx.type == "TASKGRAPH":
         return await _run_taskgraph(ctx)
     if ctx.type in ("DECISION",):
@@ -175,9 +179,22 @@ async def _run_doc_agent(ctx: NodeContext) -> dict:
     budget = ContextBudget(model.context_window, model.max_output_tokens)
     system_prompt = build_system(template["system_prompt"], memory, doc_output_rules(kind))
     instruction = (ctx.config or {}).get("instruction") or f"完成「{ctx.name}」节点的工作。"
-    user_prompt = build_user(
-        brief=instruction, artifacts=artifacts, feedback=ctx.feedback, budget=budget
-    )
+    revised: tuple[str, str] | None = None
+    if ctx.feedback and not (ctx.config or {}).get("append"):
+        # 带着反馈重跑是修订，不是重写：把上一版完整交给模型，让它逐条处理反馈
+        last_version = _artifact_body(ctx.run_id, kind)
+        if last_version:
+            revised = (f"{kind}（上一版）", last_version)
+            instruction += (
+                "\n这是一次修订：在上一版的基础上逐条处理反馈，不重写反馈没有涉及的内容；"
+                "每处修改的下面用一行“修改说明：”写明对应哪条意见。")
+    try:
+        user_prompt = build_user(
+            brief=instruction, artifacts=artifacts, feedback=ctx.feedback, budget=budget,
+            previous=revised,
+        )
+    except ValueError as exc:
+        raise NodeFailure(str(exc), fatal=True) from exc
     result = await run_agent(
         run_id=ctx.run_id, node_id=ctx.node_id, attempt_id=ctx.attempt_id, model=model,
         system_prompt=system_prompt, user_prompt=user_prompt, toolbox=None,

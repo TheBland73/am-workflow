@@ -7,104 +7,169 @@
 """
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.artifacts.store import parse_front_matter
 from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Artifact, Gate, Node, Run
+from app.db.models import Artifact, DecisionPoint, Gate, Meeting, Node, Run
+from app.engine.feedback import with_feedback
 from app.engine.node_actions import downstream_nodes
+from app.models.budget import truncate_to_tokens
 
-PENDING_SECTION = "未决项"
-PENDING_TITLE = "讨论未决项（需人工拍板）"
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+PENDING_TITLE = "待确认问题（需要你决定）"
+_MEETING_LABELS = {"discussion": "讨论会议", "review": "评审会议", "confirm": "需求确认会议"}
+_REPORT_KINDS = {"discussion": "discussion", "review": "review", "confirm": "review"}
+_VERDICT_NAMES = {"accept": "接受", "conditional": "有条件接受", "return": "退回",
+                  "pass": "通过", "fail": "不通过"}
+_RANK = {"blocker": 0, "major": 1, "minor": 2}
 
 
 class GateError(ValueError):
     pass
 
 
-def _extract_pending_questions(body: str) -> list[str]:
-    """按段落作用域提取讨论稿的未决项（`- [ ]` 行）。
-
-    优先定位标题恰为「未决项」的小节（规范是 `### 未决项`，兼容 `##` 等层级），只收集
-    该标题之后、下一个同级或更高级标题之前的勾选项，避免把共识/证据/分歧里的勾选项
-    误当未决项。找不到该标题时退回全文扫描，兼容没有该小节的旧工件。
-    """
-    lines = [line.strip() for line in body.splitlines()]
-    start: int | None = None
-    level = 0
-    for index, line in enumerate(lines):
-        match = _HEADING_RE.match(line)
-        if match and match.group(2) == PENDING_SECTION:
-            start = index + 1
-            level = len(match.group(1))
-            break
-    if start is None:
-        return [line for line in lines if line.startswith("- [ ]")]
-    items: list[str] = []
-    for line in lines[start:]:
-        match = _HEADING_RE.match(line)
-        if match and len(match.group(1)) <= level:
-            break
-        if line.startswith("- [ ]"):
-            items.append(line)
-    return items
-
-
 def _pending_questions(s, run_id: str) -> list[str]:
-    """提取讨论稿蒸馏部分的未决项（`- [ ]` 行），供方案确认门卡片展示。
+    """账本里待定的决策点，供方案确认门的卡片展示。
 
     必须复用调用方 session（连接池 size=1，另开 session 会在池上死等）。
+    取最近一场讨论会议的账本；讨论会议还没开过时返回空列表。
     """
+    meeting = (s.query(Meeting)
+               .filter(Meeting.run_id == run_id, Meeting.protocol == "discussion")
+               .order_by(Meeting.id.desc())
+               .first())
+    if meeting is None:
+        return []
+    rows = (s.query(DecisionPoint)
+            .filter(DecisionPoint.meeting_id == meeting.id,
+                    DecisionPoint.status == "deferred")
+            .order_by(DecisionPoint.id.asc())
+            .all())
+    return [f"- [ ] {row.index} {row.title}：{row.conclusion or '各方理由见会议纪要'}"
+            for row in rows]
+
+
+def _artifact_body_in_session(s, run_id: str, kind: str, limit: int = 2000) -> str:
+    """在同一会话里读工件正文（连接池 size=1，不能在这里再开 session）。"""
     row = (
         s.query(Artifact)
-        .filter(Artifact.run_id == run_id, Artifact.kind == "discussion",
-                Artifact.status == "active")
+        .filter(Artifact.run_id == run_id, Artifact.kind == kind)
         .order_by(Artifact.version.desc())
         .first()
     )
     if row is None:
-        return []
+        return ""
     path = Path(row.path)
     if not path.is_absolute():
         path = settings.base_dir / path
-    if not path.exists():
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    _meta, body = parse_front_matter(text)
+    return truncate_to_tokens(body.strip(), limit)
+
+
+def _blocking_lines(meeting: Meeting) -> list[str]:
+    state = dict(meeting.state_json or {})
+    params = dict((meeting.config_json or {}).get("params") or {})
+    if meeting.protocol == "review":
+        line = str(params.get("min_blocking_severity") or "major")
+        limit = _RANK.get(line, _RANK["major"])
+        rows = [issue for issue in state.get("issues") or []
+                if issue.get("standing", True)
+                and _RANK.get(issue.get("severity"), _RANK["minor"]) <= limit]
+    elif meeting.protocol == "confirm":
+        rows = list(state.get("items") or [])
+    else:
+        rows = []
+    lines = []
+    for row in rows[:5]:
+        location = row.get("location") or row.get("requirement") or row.get("index") or "—"
+        lines.append(f"- {row.get('id', '')} [{location}] {row.get('problem') or ''}")
+    return lines
+
+
+def _upstream_lines(s, node: Node | None, run_id: str) -> list[str]:
+    """上游会议的结论、轮次、前置检查，以及仍然成立的阻塞意见与报告要点。"""
+    if node is None:
         return []
-    _meta, body = parse_front_matter(path.read_text(encoding="utf-8"))
-    return _extract_pending_questions(body)
+    by_key = {row.node_key: row for row in s.query(Node).filter(Node.run_id == run_id).all()}
+    lines: list[str] = []
+    for dep_key in node.deps_json or []:
+        dep = by_key.get(dep_key)
+        if dep is None or dep.type != "MEETING":
+            continue
+        meeting = (s.query(Meeting).filter(Meeting.node_id == dep.id)
+                   .order_by(Meeting.id.desc()).first())
+        if meeting is None:
+            continue
+        state = dict(meeting.state_json or {})
+        label = _MEETING_LABELS.get(meeting.protocol, meeting.protocol)
+        pieces = [f"{label}（第 {meeting.round or 1} 轮）"]
+        verdict = str(state.get("verdict") or "")
+        if verdict:
+            pieces.append(f"结论：{_VERDICT_NAMES.get(verdict, verdict)}")
+        if "precheck_ok" in state:
+            pieces.append("前置检查通过" if state.get("precheck_ok")
+                          else f"前置检查未通过：{state.get('precheck_reason') or ''}")
+        lines.append("上游会议：" + "，".join(pieces) + "。")
+        blocking = _blocking_lines(meeting)
+        if blocking:
+            lines.append("仍然成立且达到阻塞线的前五条意见：")
+            lines.extend(blocking)
+        report_kind = _REPORT_KINDS.get(meeting.protocol)
+        if report_kind:
+            excerpt = _artifact_body_in_session(s, run_id, report_kind)
+            if excerpt:
+                lines.append("报告要点：")
+                lines.append(excerpt)
+    return lines
 
 
 def gate_payload(s, gate: Gate) -> dict:
-    """人工门对外 payload：request_gate / get_gate / run 快照共用同一份字段。
+    """门对外 payload：request_gate / get_gate / run 快照共用同一份字段。
 
     必须复用调用方 session（连接池 size=1，另开 session 会在池上死等）。
-    方案确认门（gate_proposal）的 description 追加讨论稿未决项；描述里已含该段落时
-    不重复追加，保证多次读取（刷新/重载）幂等。
+    会议内确认点（门上带类型）的标题与描述存在门的载荷里；工件确认点沿用节点配置，
+    方案确认门的描述追加讨论里的未决议题。描述里已含该段落时不重复追加，保证幂等。
     """
     node = s.get(Node, gate.node_id)
     config = dict(node.config_json or {}) if node is not None else {}
     node_key = node.node_key if node is not None else ""
-    description = config.get("description") or ""
-    if node_key == "gate_proposal" and PENDING_TITLE not in description:
+    payload = dict(gate.payload_json or {})
+    description = str(payload.get("description") or "") if gate.kind else (config.get("description") or "")
+    if node_key == "gate_proposal" and not gate.kind and PENDING_TITLE not in description:
         pending = _pending_questions(s, gate.run_id)
         if pending:
             description += f"\n\n{PENDING_TITLE}：\n" + "\n".join(pending)
+    if config.get("check") and not gate.kind:
+        upstream = _upstream_lines(s, node, gate.run_id)
+        if upstream:
+            description += "\n\n" + "\n".join(upstream)
+    hint = str(config.get("hint") or "").strip()
+    if hint:
+        description = (description.rstrip() + "\n\n" + hint).strip()
+    title = (payload.get("title") if gate.kind else None) or config.get("title")
     return {
         "id": gate.id,
         "run_id": gate.run_id,
         "node_id": gate.node_id,
         "node_key": node_key,
+        "meeting_id": gate.meeting_id,       # 会议内确认点所属的会议；人工门为空
         "status": gate.status,
         "feedback": gate.feedback,
         "decided_by": gate.decided_by,
         "created_at": gate.created_at.isoformat() if gate.created_at else None,
         "decided_at": gate.decided_at.isoformat() if gate.decided_at else None,
-        "title": config.get("title") or (node.name if node is not None else ""),
+        "title": title or (node.name if node is not None else ""),
         "description": description,
         "artifact": config.get("artifact"),
+        "kind": gate.kind or "",
+        "payload": payload,
+        "decision": dict(gate.decision_json or {}),
     }
 
 
@@ -165,8 +230,10 @@ def _reset(node: Node) -> None:
 
 
 def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
-                target_node: str | None = None, decided_by: str = "human") -> dict:
-    """执行门决策。reject 时必须提供 feedback 与 target_node（节点 key）。"""
+                target_node: str | None = None, decided_by: str = "human",
+                data: dict | None = None) -> dict:
+    """执行门决策。工件确认点驳回时必须提供 feedback 与 target_node；
+    会议内确认点的通过和驳回都只是把决定记在门上，让会议续开。"""
     if action not in ("approve", "reject"):
         raise GateError("action 只能是 approve 或 reject")
     with session_scope() as s:
@@ -178,6 +245,12 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
         gate_node = s.get(Node, gate.node_id)
         if gate_node is None:
             raise GateError("门节点不存在")
+        if not str(decided_by or "").startswith("model:"):
+            # 人做出任何决定：模型连续驳回的计数清零
+            config = dict(gate_node.config_json or {})
+            if "auto_rejects" in config:
+                config.pop("auto_rejects", None)
+                gate_node.config_json = config
         run = s.get(Run, gate.run_id)
         run_id = gate.run_id
         approve_artifact: str | None = None
@@ -187,17 +260,32 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
         gate.decided_at = now
         reset_keys: list[str] = []
 
+        if gate_node.type == "MEETING" and gate.kind:
+            # 会议内确认点（门上带类型）：决定存在门上，节点回到待调度；驳回不需要目标节点。
+            # 会议节点上的失败转人工门、恢复时补开的门没有类型，仍走下面工件门的规则。
+            gate.status = "approved" if action == "approve" else "rejected"
+            gate.decision_json = {"action": action, "feedback": feedback or "", "data": data or {}}
+            gate_node.status = "pending"
+            if run:
+                run.status = "running"
+                run.error = None
+            s.flush()
+            return {"gate_id": gate.id, "run_id": run_id, "status": gate.status, "action": action,
+                    "feedback": feedback, "target_node": None, "reset_nodes": [],
+                    "checkpoint": True}
+
         if action == "approve":
             gate.status = "approved"
-            config = dict(gate_node.config_json or {})
+            gate.decision_json = {"action": "approve", "feedback": feedback or "",
+                                  "data": data or {}}
+            config = with_feedback(dict(gate_node.config_json or {}), None)
             if config.get("escalation"):
                 # 失败转人工：人工确认后重试该节点，而不是把失败节点标记为完成
                 gate_node.status = "pending"
-                for key in ("feedback", "escalation", "escalation_reason"):
+                for key in ("escalation", "escalation_reason"):
                     config.pop(key, None)
             else:
                 gate_node.status = "done"
-                config.pop("feedback", None)
                 approve_artifact = config.get("artifact")
             gate_node.config_json = config
             if run:
@@ -215,9 +303,11 @@ def decide_gate(*, gate_id: int, action: str, feedback: str | None = None,
             if target.id == gate_node.id:
                 raise GateError("目标节点不能是人工门自身")
             gate.status = "rejected"
+            gate.decision_json = {"action": "reject", "feedback": feedback or "",
+                                  "data": data or {}}
             gate_node.status = "pending"
             target.status = "pending"
-            target.config_json = {**(target.config_json or {}), "feedback": feedback}
+            target.config_json = with_feedback(target.config_json, feedback, "reject")
             reset_keys.append(target.node_key)
             for downstream in downstream_of(target.id, nodes):
                 if downstream.id == gate_node.id:

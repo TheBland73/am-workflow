@@ -51,6 +51,10 @@ def render_front_matter(meta: dict, body: str) -> str:
             lines.append(f"inputs: [{', '.join(str(i) for i in items)}]")
         else:
             lines.append(f"{key}: {value}")
+    # 工件自己的附加字段（如评审报告的 review_type）跟在固定键之后
+    for key, value in meta.items():
+        if key not in _META_KEYS and value is not None:
+            lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines) + "\n\n" + body.strip() + "\n"
 
@@ -80,6 +84,16 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     return meta, parts[2].lstrip("\n")
 
 
+def _record(row: Artifact) -> dict:
+    return {
+        "kind": row.kind,
+        "path": row.path,
+        "version": row.version,
+        "status": row.status,
+        "created_by_node": row.created_by_node,
+    }
+
+
 def latest_artifact(run_id: str, kind: str) -> dict | None:
     with session_scope() as s:
         row = (
@@ -88,19 +102,22 @@ def latest_artifact(run_id: str, kind: str) -> dict | None:
             .order_by(Artifact.version.desc())
             .first()
         )
-        if not row:
-            return None
-        return {
-            "kind": row.kind,
-            "path": row.path,
-            "version": row.version,
-            "status": row.status,
-            "created_by_node": row.created_by_node,
-        }
+        return _record(row) if row else None
 
 
-def read_artifact(run_id: str, kind: str) -> str | None:
-    record = latest_artifact(run_id, kind)
+def artifact_version(run_id: str, kind: str, version: int) -> dict | None:
+    """某一版的工件记录；没有这一版返回 None。"""
+    with session_scope() as s:
+        row = (
+            s.query(Artifact)
+            .filter(Artifact.run_id == run_id, Artifact.kind == kind, Artifact.version == version)
+            .first()
+        )
+        return _record(row) if row else None
+
+
+def read_record(record: dict | None) -> str | None:
+    """读一条工件记录指向的正文；没有记录或文件不存在返回 None。"""
     if not record:
         return None
     path = Path(record["path"])
@@ -111,8 +128,14 @@ def read_artifact(run_id: str, kind: str) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
+def read_artifact(run_id: str, kind: str) -> str | None:
+    return read_record(latest_artifact(run_id, kind))
+
+
 def write_artifact(run_id: str, kind: str, body: str, *, created_by: str | None = None,
-                   inputs: list[str] | None = None, status: str = "draft") -> dict:
+                   inputs: list[str] | None = None, status: str = "draft",
+                   extra_meta: dict | None = None) -> dict:
+    """写一个新版本。extra_meta 是工件自己的附加字段，写进 front-matter，不能覆盖固定的六个键。"""
     if kind not in ARTIFACT_KINDS:
         raise ValueError(f"未知工件类型：{kind}")
     with session_scope() as s:
@@ -139,6 +162,7 @@ def write_artifact(run_id: str, kind: str, body: str, *, created_by: str | None 
             "inputs": inputs or [],
             "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
+        meta.update({key: value for key, value in (extra_meta or {}).items() if key not in meta})
         text = render_front_matter(meta, body)
         directory = artifacts_dir(run_id)
         versioned = directory / f"{kind}.v{version}.md"

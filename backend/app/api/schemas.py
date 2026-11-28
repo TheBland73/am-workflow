@@ -59,17 +59,43 @@ class ModelPatch(BaseModel):
 
 
 class TemplatePatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
     system_prompt: str | None = None
     tools_json: list[str] | None = None
-    default_model_id: int | None = None
+    default_model_id: int | None = Field(default=None, ge=1)
     max_steps: int | None = None
     stop_condition: list[str] | None = None
+    meta: dict | None = None
+
+
+class TemplateCreate(BaseModel):
+    role_key: str = Field(min_length=2, max_length=40, pattern=r"^[a-z][a-z0-9_]+$")
+    name: str = Field(min_length=1, max_length=120)
+    system_prompt: str = Field(min_length=1)
+    tools_json: list[str] = Field(default_factory=list)
+    memory_scope: str = "agent"
+    max_steps: int = Field(default=3, ge=1, le=64)
+    default_model_id: int | None = Field(default=None, ge=1)
+    meta: dict = Field(default_factory=dict)
+
+
+class MaterialIn(BaseModel):
+    name: str = Field(default="", max_length=80)      # 留空时自动编号
+    content: str = Field(min_length=1, max_length=200_000)
 
 
 class RunIn(BaseModel):
     idea: str = Field(min_length=1, max_length=20000)
     template_key: str = "sdlc_v1"
     budget_tokens: int | None = None
+    config: dict | None = None                        # 运行级配置：automation / params / rosters
+    materials: list[MaterialIn] = Field(default_factory=list, max_length=50)
+
+
+class RunConfigPatch(BaseModel):
+    automation: dict | None = None
+    params: dict | None = None
+    rosters: dict | None = None
 
 
 class ArtifactPatch(BaseModel):
@@ -83,6 +109,7 @@ class GateDecision(BaseModel):
     decided_by: str = "human"
     artifact_body: str | None = None
     artifact_kind: str | None = None
+    data: dict | None = None
 
 
 class TaskIn(BaseModel):

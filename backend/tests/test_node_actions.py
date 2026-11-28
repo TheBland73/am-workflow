@@ -632,3 +632,119 @@ def test_downstream_helpers_share_single_implementation() -> None:
     assert set(from_gates) == {"b", "c", "d"}
     assert _downstream is downstream_of   # 旧私有名兼容
     _finish(run_id)
+
+
+# ---------------- 会议节点：跳过校验与反馈动作的衔接（H4 Step 2） ----------------
+def _add_meeting(run_id: str, status: str = "waiting_human") -> int:
+    ids = _add_nodes(run_id, [{
+        "key": "discuss", "type": "MEETING", "status": status,
+        "config": {"protocol": "discussion", "artifact": "discussion"},
+    }])
+    return ids["discuss"]
+
+
+def _meeting_ctx(run_id: str, node_id: int) -> "NodeContext":
+    from app.engine.runners import NodeContext
+
+    node = _node(node_id)
+    return NodeContext(
+        run_id=run_id, node_id=node_id, node_key=node.node_key, type=node.type,
+        name=node.name, phase=node.phase, config=dict(node.config_json or {}),
+        assignee={}, attempt_id=0, attempt_no=1, feedback=None, idea="",
+    )
+
+
+def test_meeting_skip_requires_an_output_artifact(api) -> None:
+    """会议节点还没有产出工件时不可跳过：下游会缺纪要/方案/报告。"""
+    run_id = _new_run()
+    node_id = _add_meeting(run_id)
+
+    response = api.post(f"/api/nodes/{node_id}/skip", json={"reason": "跳过"})
+    code, detail = _error(response)
+    assert response.status_code == 409 and code == "meeting_artifact_missing"
+    assert detail["details"]["artifact"] == "discussion"
+    assert detail["details"]["node_key"] == "discuss"
+    assert _node(node_id).status == "waiting_human"
+    assert _detail(api, node_id)["can_skip"] is False
+
+    # 会议产出过工件（任意版本）之后，跳过放行。
+    with session_scope() as s:
+        s.add(Artifact(run_id=run_id, kind="discussion", path="discussion.md",
+                       version=1, created_by_node="discuss", status="active"))
+    assert _detail(api, node_id)["can_skip"] is True
+    ok = api.post(f"/api/nodes/{node_id}/skip", json={"reason": "产出已存在"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["status"] == "skipped"
+    _finish(run_id)
+
+
+def test_meeting_skip_ignores_artifacts_from_other_nodes(api) -> None:
+    """别的节点写的同名工件不算这场会议的产出。"""
+    run_id = _new_run()
+    node_id = _add_meeting(run_id)
+    with session_scope() as s:
+        s.add(Artifact(run_id=run_id, kind="discussion", path="discussion.md",
+                       version=1, created_by_node="review", status="active"))
+    response = api.post(f"/api/nodes/{node_id}/skip")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "meeting_artifact_missing"
+    _finish(run_id)
+
+
+def test_retry_with_feedback_on_a_meeting_reopens_it(api) -> None:
+    """带反馈的重试要走 with_feedback 口径：会议运行时靠 kind/seq 认出待复议的反馈。"""
+    from app.meeting import runner as meeting_runner
+    from app.meeting import store as meeting_store
+
+    run_id = _new_run()
+    node_id = _add_meeting(run_id)
+    meeting_id = meeting_store.create_meeting(
+        run_id=run_id, node_id=node_id, node_key="discuss",
+        protocol="discussion", charter={}, config={})
+    meeting_store.update_meeting(meeting_id, state_json={"handled_feedback_seq": 0})
+
+    response = api.post(f"/api/nodes/{node_id}/retry", json={"feedback": "补一条导出周报"})
+    assert response.status_code == 200, response.text
+    config = _node(node_id).config_json
+    assert (config["feedback"], config["feedback_kind"], config["feedback_seq"]) == (
+        "补一条导出周报", "user", 1)
+    assert meeting_runner._enter(_meeting_ctx(run_id, node_id), "discussion")[1] == "feedback"
+    _finish(run_id)
+
+
+def test_injected_feedback_on_a_meeting_reopens_it(api) -> None:
+    """注入反馈同样要能被会议运行时识别（不重跑节点，下次执行时复议）。"""
+    from app.meeting import runner as meeting_runner
+    from app.meeting import store as meeting_store
+
+    run_id = _new_run()
+    node_id = _add_meeting(run_id, status="waiting_human")
+    meeting_id = meeting_store.create_meeting(
+        run_id=run_id, node_id=node_id, node_key="discuss",
+        protocol="discussion", charter={}, config={})
+    meeting_store.update_meeting(meeting_id, state_json={"handled_feedback_seq": 0})
+
+    response = api.post(f"/api/nodes/{node_id}/feedback", json={"feedback": "评审认为登录需要复议"})
+    assert response.status_code == 200, response.text
+    config = _node(node_id).config_json
+    assert (config["feedback"], config["feedback_kind"], config["feedback_seq"]) == (
+        "评审认为登录需要复议", "user", 1)
+    assert _node(node_id).status == "waiting_human"
+    assert meeting_runner._enter(_meeting_ctx(run_id, node_id), "discussion")[1] == "feedback"
+    _finish(run_id)
+
+
+def test_retry_without_feedback_clears_a_stale_user_feedback(api) -> None:
+    """不带反馈的重试要清掉上一次的意见与来路，否则会议会把旧意见再复议一遍。"""
+    run_id = _new_run()
+    node_id = _add_meeting(run_id)
+    _update_node(node_id, config_json={
+        "protocol": "discussion", "artifact": "discussion",
+        "feedback": "旧意见", "feedback_kind": "user", "feedback_seq": 3,
+    })
+    response = api.post(f"/api/nodes/{node_id}/retry")
+    assert response.status_code == 200, response.text
+    config = _node(node_id).config_json
+    assert "feedback" not in config and "feedback_kind" not in config
+    assert config["feedback_seq"] == 3          # 序号只增不减，避免旧会议误判为新反馈
+    _finish(run_id)

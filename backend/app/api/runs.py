@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -10,19 +11,93 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 
-from app.api.schemas import RunIn
-from app.artifacts.store import latest_artifact, list_artifacts, read_artifact, write_artifact
+from app.api.schemas import MaterialIn, RunConfigPatch, RunIn
+from app.artifacts.store import (latest_artifact, list_artifacts, parse_front_matter,
+                                 read_artifact, read_record, write_artifact)
 from app.config import settings
+from app.conversation.policy import reset_policy_cache
 from app.db.base import session_scope
 from app.db.models import (
-    Artifact, Event, Gate, ModelEntry, Node, NodeAttempt, Run, Task, Workflow, new_run_id,
+    AgentTemplate, Artifact, Event, Gate, Meeting, MeetingTurn, ModelEntry, Node, NodeAttempt,
+    Run, Task, Workflow, new_run_id,
 )
 from app.engine.events import bus, emit, load_events, sse_format
 from app.engine.gates import GateError, gate_payload
+from app.engine.materials import (
+    check_materials, free_material_name, list_materials, read_material, save_material, total_chars,
+)
 from app.engine.orchestrator import orchestrator
-from app.engine.templates import instantiate_nodes, phase_names
+from app.engine.params import apply_run_config, run_of, validate_run_config
+from app.engine.templates import (instantiate_nodes, phase_names, role_suits_meeting,
+                                  workflow_definition)
 
 router = APIRouter(tags=["runs"])
+
+# 运行开始前，或有确认点挂起时，可以修改运行级配置
+EDITABLE_RUN_STATUSES = ("created", "waiting_human")
+
+
+def _run_or_404(run_id: str) -> dict:
+    with session_scope() as s:
+        run = s.get(Run, run_id)
+        if run is None:
+            raise HTTPException(404, "run 不存在")
+        return {"id": run.id, "status": run.status, "config": dict(run.config_json or {})}
+
+
+_ROSTER_MEETINGS = {"participants": "discussion", "reviewers": "review"}
+_MEETING_LABELS = {"discussion": "讨论", "review": "评审"}
+
+
+def _roster_errors(config: dict) -> list[str]:
+    """名单里点名的角色必须存在，并且适合这一组对应的会议（参会者→讨论、评审者→评审）。
+
+    结构不合法时交给 validate_rosters，这里不再二次崩溃。
+    """
+    rosters = config.get("rosters")
+    if not isinstance(rosters, dict):
+        return []
+    wanted = [key for group in rosters.values() if isinstance(group, dict)
+              for key in (group.get("role_keys") if isinstance(group.get("role_keys"), list) else [])
+              if isinstance(key, str) and key]
+    if not wanted:
+        return []
+    with session_scope() as s:
+        metas = {row[0]: (row[1] or {}) for row in
+                 s.query(AgentTemplate.role_key, AgentTemplate.meta_json)
+                 .filter(AgentTemplate.role_key.in_(wanted)).all()}
+    errors = [f"角色模板不存在：{key}" for key in wanted if key not in metas]
+    for group, meeting in _ROSTER_MEETINGS.items():
+        item = rosters.get(group)
+        keys = item.get("role_keys") if isinstance(item, dict) else None
+        if not (isinstance(keys, list) and keys):
+            continue
+        for key in keys:
+            if not isinstance(key, str) or not key or key not in metas:
+                continue                       # 不存在已单独报告
+            if not role_suits_meeting({"meta": metas[key]}, meeting):
+                errors.append(f"不适合参加{_MEETING_LABELS[meeting]}会议：{key}")
+    return errors
+
+
+def _merge_run_config(base: dict, patch: dict) -> dict:
+    """按分组浅合并一层：只改 params.discussion 时，params.context 等其他分组保持不变。"""
+    merged = dict(base)
+    for key in ("automation", "params", "rosters"):
+        if key not in patch:
+            continue
+        value = patch[key]
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            section = dict(current)
+            for name, item in value.items():
+                section[name] = ({**section[name], **item}
+                                 if isinstance(section.get(name), dict) and isinstance(item, dict)
+                                 else item)
+            merged[key] = section
+        else:
+            merged[key] = value
+    return merged
 
 
 def _iso(value) -> str | None:
@@ -35,34 +110,65 @@ def _run_dict(run: Run) -> dict:
         "current_phase": run.current_phase, "idea": run.idea_text,
         "created_at": _iso(run.created_at), "finished_at": _iso(run.finished_at),
         "budget_tokens": run.budget_tokens, "error": run.error,
+        "config": dict(run.config_json or {}),
     }
 
 
 @router.post("/runs", status_code=201)
 async def create_run(payload: RunIn) -> dict:
-    from app.engine.templates import workflow_definition
-
-    definition = workflow_definition(payload.template_key)
-    if not definition:
-        raise HTTPException(400, f"工作流模板不存在：{payload.template_key}")
+    """新建运行。配置与背景材料先全部校验，有任何不合法都不建运行。"""
+    try:
+        definition = workflow_definition(payload.template_key)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if payload.config is not None and not isinstance(payload.config, dict):
+        raise HTTPException(400, "运行级配置须是对象")
+    config = payload.config or {}
+    used: set[str] = set()
+    materials: list[tuple[str, str]] = []
+    for index, item in enumerate(payload.materials):
+        name = item.name.strip()
+        if not name:
+            name = free_material_name(used, index + 1)
+        used.add(name)
+        materials.append((name, item.content))
+    errors = (validate_run_config(definition, config) + _roster_errors(config)
+              + check_materials(materials))
+    if errors:
+        raise HTTPException(400, "运行级配置不合法：" + "；".join(errors))
     run_id = new_run_id()
     with session_scope() as s:
         wf = s.query(Workflow).filter(Workflow.template_key == payload.template_key).one_or_none()
         if wf is None:
             raise HTTPException(400, "工作流模板尚未初始化")
-        run = Run(
-            id=run_id, workflow_id=wf.id, status="created", idea_text=payload.idea,
-            budget_tokens=payload.budget_tokens or settings.default_budget_tokens,
-        )
-        s.add(run)
-    instantiate_nodes(run_id, definition)
-    record = write_artifact(run_id, "idea", payload.idea, created_by="user",
-                            inputs=[], status="approved")
-    await emit(run_id, "run_created", None,
-               {"run_id": run_id, "template": payload.template_key,
-                "idea": payload.idea[:500]})
-    await emit(run_id, "artifact_written", None, record)
-    orchestrator.start(run_id)
+        s.add(Run(id=run_id, workflow_id=wf.id, status="created", idea_text=payload.idea,
+                  budget_tokens=payload.budget_tokens or settings.default_budget_tokens,
+                  config_json=config))
+    try:
+        instantiate_nodes(run_id, definition)
+        apply_run_config(run_id, definition, config)   # 生效参数写进会议节点
+        for name, content in materials:
+            save_material(run_id, name, content)
+        record = write_artifact(run_id, "idea", payload.idea, created_by="user",
+                                inputs=[], status="approved")
+        await emit(run_id, "run_created", None,
+                   {"run_id": run_id, "template": payload.template_key,
+                    "idea": payload.idea[:500]})
+        await emit(run_id, "artifact_written", None, record)
+        orchestrator.start(run_id)
+    except Exception as exc:
+        # 建运行后的任何一步失败都不能留下一个可被恢复流程拉起的 created 运行
+        with session_scope() as s:
+            row = s.get(Run, run_id)
+            if row is not None:
+                row.status = "failed"
+                row.error = f"创建运行失败：{exc}"[:2000]
+        shutil.rmtree(settings.runs_dir / run_id, ignore_errors=True)
+        try:
+            await emit(run_id, "run_error", None, {"error": f"创建运行失败：{exc}"[:500]})
+        except Exception:
+            pass
+        raise
     return get_run(run_id)
 
 
@@ -208,9 +314,113 @@ def _span_ms(start: datetime | None, end: datetime | None) -> int:
     return max(0, int((b - a).total_seconds() * 1000))
 
 
+# 前半段报告的结论取值 → 前端面板认的 pass/block（旧 REVIEW 节点的报告本来就是 pass/block）
+_PASS_VERDICTS = ("pass", "accept", "conditional")
+
+
+def _front_review_reports(run_id: str) -> list[dict]:
+    """前半段写出评审/确认报告的会议，按会议先后排列。
+
+    报告正文写在 review 工件里（front-matter 的 review_type 区分评审与确认报告），
+    版本记在会议状态 minutes_version；结论、意见/待办、摘要与阻塞数是写报告时
+    记进会议状态的。
+    """
+    with session_scope() as s:
+        run = s.get(Run, run_id)
+        if run is None:
+            return []
+        nodes = {row.id: row for row in s.query(Node).filter(Node.run_id == run_id)}
+        meetings = (s.query(Meeting)
+                    .filter(Meeting.run_id == run_id, Meeting.protocol.in_(("review", "confirm")))
+                    .order_by(Meeting.id.asc()).all())
+        reports = []
+        for row in meetings:
+            state = dict(row.state_json or {})
+            if not state.get("minutes_version"):
+                continue
+            node = nodes.get(row.node_id)
+            if node is None:
+                continue
+            verdict_raw = str(state.get("verdict") or "")
+            reports.append({
+                "node_id": row.node_id, "node_key": node.node_key, "node_name": node.name,
+                "node_status": node.status, "order_index": node.order_index,
+                "max_rounds": int((node.config_json or {}).get("max_rounds") or 3),
+                "meeting_id": row.id, "round": int(row.round or 1),
+                "review_type": "requirement" if row.protocol == "confirm" else "proposal",
+                "version": int(state.get("minutes_version") or 0),
+                "verdict_raw": verdict_raw,
+                "verdict": ("pass" if verdict_raw in _PASS_VERDICTS else "block") if verdict_raw
+                           else None,
+                "summary": str(state.get("summary") or ""),
+                "blocking": int(state.get("blocking") or 0),
+                "rows": list(state.get("issues") or []) if row.protocol == "review"
+                        else list(state.get("items") or []),
+                "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+                "run_status": run.status,
+            })
+    return reports
+
+
+def _front_report_issues(report: dict) -> list[dict]:
+    """报告里的意见/待办映射成前端问题清单的形状（task_uid 恒空：前半段没有可回退的任务）。"""
+    is_requirement = report["review_type"] == "requirement"
+    return [{
+        "severity": str(row.get("severity") or "minor"),
+        "task_uid": "",
+        "file": (str(row.get("requirement") or row.get("index") or "") if is_requirement
+                 else str(row.get("location") or "")),
+        "message": str(row.get("problem") or ""),
+        "suggestion": str(row.get("suggestion") or ""),
+    } for row in report["rows"]]
+
+
 @router.get("/runs/{run_id}/review")
 def get_run_review(run_id: str) -> dict:
-    """最新评审报告：结论、问题清单、报告正文与是否可回退。"""
+    """最新评审报告：结论、问题清单、报告正文与是否可回退。
+
+    前半段的评审/确认报告写在 review 工件里（front-matter 的 review_type），
+    结构化字段取自写出报告的那场会议的状态；旧运行的报告仍在 REVIEW 节点的
+    配置里（它写的工件没有 review_type），按节点取。
+    """
+    reports = _front_review_reports(run_id)
+    record = latest_artifact(run_id, "review")
+    meta, body = {}, ""
+    if record:
+        raw = read_record(record)
+        if raw:
+            meta, body = parse_front_matter(raw)
+            body = body.strip()
+    if str(meta.get("review_type") or "") in ("proposal", "requirement"):
+        report = next((r for r in reversed(reports)
+                       if r["version"] == (record or {}).get("version")), None)
+        if report is not None:
+            return {
+                "available": True,
+                "run_id": run_id,
+                "run_status": report["run_status"],
+                "node_id": report["node_id"],
+                "node_key": report["node_key"],
+                "node_status": report["node_status"],
+                "verdict": report["verdict"],
+                "summary": report["summary"],
+                "issues": _front_report_issues(report),
+                "blocking": report["blocking"],
+                "targets": [],
+                "round": report["round"],
+                "max_rounds": report["max_rounds"],
+                "reviewed_at": report["finished_at"],
+                "files": [],
+                "history": [{"round": r["round"], "verdict": r["verdict"],
+                             "issues": len(r["rows"]), "blocking": r["blocking"],
+                             "at": r["finished_at"], "summary": r["summary"][:300]}
+                            for r in reports if r["node_id"] == report["node_id"]],
+                "escalated": False,
+                "can_rework": False,
+                "artifact": record,
+                "body": body,
+                "review_type": report["review_type"],
+            }
     with session_scope() as s:
         run = s.get(Run, run_id)
         if run is None:
@@ -222,7 +432,7 @@ def get_run_review(run_id: str) -> dict:
             .first()
         )
         if node is None:
-            return {"available": False, "run_id": run_id, "status": run.status}
+            return {"available": False, "run_id": run_id, "run_status": run.status}
         config = dict(node.config_json or {})
         report = dict(config.get("review") or {})
         issues = report.get("issues")
@@ -251,10 +461,8 @@ def get_run_review(run_id: str) -> dict:
     payload["artifact"] = latest_artifact(run_id, "review")
     raw = read_artifact(run_id, "review")
     if raw:
-        from app.artifacts.store import parse_front_matter
-
-        _meta, body = parse_front_matter(raw)
-        payload["body"] = body.strip()
+        _meta, artifact_body = parse_front_matter(raw)
+        payload["body"] = artifact_body.strip()
     return payload
 
 
@@ -308,6 +516,18 @@ def run_metrics(run_id: str) -> dict:
             row.id: (float(row.price_in or 0), float(row.price_out or 0))
             for row in s.query(ModelEntry).all()
         }
+        compactions = int(
+            s.query(func.count(Event.id))
+            .filter(Event.run_id == run_id, Event.type == "context_compacted").scalar() or 0)
+        cached_tokens = int(
+            s.query(func.coalesce(func.sum(NodeAttempt.cached_tokens), 0))
+            .filter(NodeAttempt.node_id.in_(node_ids)).scalar() or 0) if node_ids else 0
+        meeting_total = int(
+            s.query(func.count(Meeting.id)).filter(Meeting.run_id == run_id).scalar() or 0)
+        meeting_turns = int(
+            s.query(func.count(MeetingTurn.id))
+            .join(Meeting, Meeting.id == MeetingTurn.meeting_id)
+            .filter(Meeting.run_id == run_id, MeetingTurn.content != "").scalar() or 0)
         run_created, run_finished, run_status = run.created_at, run.finished_at, run.status
 
     by_node: dict[int, list[NodeAttempt]] = {}
@@ -363,6 +583,18 @@ def run_metrics(run_id: str) -> dict:
     gate_counts = {"total": len(gates), "open": 0, "approved": 0, "rejected": 0}
     for g in gates:
         gate_counts[g.status] = gate_counts.get(g.status, 0) + 1
+    # 确认点按判定者分：模型以 model: 前缀认，程序是 program/proxy，其余算人工，没决定的是开着
+    checkpoints = {"human": 0, "program": 0, "model": 0, "open": 0}
+    for gate in gates:
+        decided_by = str(gate.decided_by or "")
+        if gate.status == "open":
+            checkpoints["open"] += 1
+        elif decided_by.startswith("model:"):
+            checkpoints["model"] += 1
+        elif decided_by in ("program", "proxy"):
+            checkpoints["program"] += 1
+        else:
+            checkpoints["human"] += 1
 
     # 评审指标：轮次、一次通过、阻塞/问题分布、评审耗时。
     severities = {"blocker": 0, "major": 0, "minor": 0}
@@ -390,6 +622,33 @@ def run_metrics(run_id: str) -> dict:
             "attempts": len(rows), "exec_ms": sum(ms),
             "blocks": sum(1 for h in history if str(h.get("verdict")) == "block"),
             "history": history[-8:],
+        })
+    # 前半段的评审/确认会议：每个节点取最近一场写出报告的会议，历史按会议先后。
+    # 一场运行不会同时有 REVIEW 节点与会议报告，两段不会重复计数。
+    front_reports = _front_review_reports(run_id)
+    front_by_node: dict[int, list[dict]] = {}
+    for report in front_reports:
+        front_by_node.setdefault(report["node_id"], []).append(report)
+    for node_id in sorted(front_by_node, key=lambda nid: front_by_node[nid][0]["order_index"]):
+        rows = front_by_node[node_id]
+        latest = rows[-1]
+        node_rows = by_node.get(node_id, [])
+        ms = [_span_ms(a.started_at, a.finished_at) for a in node_rows]
+        review_ms.extend(ms)
+        for issue in latest["rows"]:
+            severity = str(issue.get("severity") or "minor")
+            severities[severity] = severities.get(severity, 0) + 1
+        review_nodes.append({
+            "node_key": latest["node_key"], "name": latest["node_name"],
+            "verdict": latest["verdict"],
+            "round": latest["round"], "max_rounds": latest["max_rounds"],
+            "issues": len(latest["rows"]), "blocking": latest["blocking"],
+            "summary": latest["summary"], "reviewed_at": latest["finished_at"],
+            "attempts": len(node_rows), "exec_ms": sum(ms),
+            "blocks": sum(1 for r in rows if r["verdict"] == "block"),
+            "history": [{"round": r["round"], "verdict": r["verdict"], "issues": len(r["rows"]),
+                         "blocking": r["blocking"], "at": r["finished_at"],
+                         "summary": r["summary"][:300]} for r in rows],
         })
     latest_review = review_nodes[-1] if review_nodes else None
     first_pass = bool(
@@ -424,6 +683,16 @@ def run_metrics(run_id: str) -> dict:
             **gate_counts,
             "avg_decision_ms": int(sum(decision_ms) / len(decision_ms)) if decision_ms else 0,
             "open_wait_ms": sum(open_wait_ms),
+        },
+        "context": {
+            "compactions": compactions,
+            "cached_tokens": cached_tokens,
+            "cache_hit_rate": round(cached_tokens / tokens_in, 4) if tokens_in else 0,
+        },
+        "meetings": {
+            "total": meeting_total,
+            "turns": meeting_turns,
+            "checkpoints": checkpoints,
         },
         "events": events,
         "review": {
@@ -511,3 +780,62 @@ def event_detail(event_id: int) -> dict:
         return {"id": row.id, "run_id": row.run_id, "seq": row.seq,
                 "type": row.type, "node_id": row.node_id,
                 "ts": _iso(row.ts), "payload": row.payload_json or {}}
+
+
+@router.get("/templates/{template_key}")
+def template_detail(template_key: str) -> dict:
+    """模板定义：节点、参数表（硬限、建议范围、默认值）、自动化等级预设、判据文本。"""
+    try:
+        return workflow_definition(template_key)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/config")
+def get_run_config(run_id: str) -> dict:
+    run = _run_or_404(run_id)
+    return {"run_id": run_id, "status": run["status"], "config": run["config"],
+            "editable": run["status"] in EDITABLE_RUN_STATUSES}
+
+
+@router.patch("/runs/{run_id}/config")
+def patch_run_config(run_id: str, payload: RunConfigPatch) -> dict:
+    """修改运行级配置。参数只写进还没开始的会议节点；已经开过会的节点沿用它开始时的参数。"""
+    run = _run_or_404(run_id)
+    if run["status"] not in EDITABLE_RUN_STATUSES:
+        raise HTTPException(400, "运行级配置只能在运行开始前或有确认点挂起时修改")
+    config = _merge_run_config(run["config"], payload.model_dump(exclude_unset=True))
+    definition = workflow_definition(run_of(run_id)["template_key"])
+    errors = validate_run_config(definition, config) + _roster_errors(config)
+    if errors:
+        raise HTTPException(400, "运行级配置不合法：" + "；".join(errors))
+    apply_run_config(run_id, definition, config, only_pending=True)
+    with session_scope() as s:
+        s.get(Run, run_id).config_json = config
+    reset_policy_cache(run_id)
+    return {"run_id": run_id, "config": config}
+
+
+@router.get("/runs/{run_id}/materials")
+def list_run_materials(run_id: str) -> dict:
+    _run_or_404(run_id)
+    return {"items": list_materials(run_id), "total_chars": total_chars(run_id),
+            "max_chars": settings.materials_max_chars}
+
+
+@router.post("/runs/{run_id}/materials", status_code=201)
+def add_run_material(run_id: str, payload: MaterialIn) -> dict:
+    _run_or_404(run_id)
+    try:
+        return save_material(run_id, payload.name.strip(), payload.content)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/materials/{name}")
+def read_run_material(run_id: str, name: str) -> dict:
+    _run_or_404(run_id)
+    try:
+        return {"name": name, "content": read_material(run_id, name)}
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "材料不存在") from exc

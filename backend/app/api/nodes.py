@@ -32,6 +32,7 @@ _ACTION_ERROR_STATUS = {
     "node_not_retryable": 409,
     "node_not_skippable": 409,
     "gate_node_protected": 400,
+    "meeting_artifact_missing": 409,
     "run_terminal": 409,
     "status_conflict": 409,
     "feedback_required": 400,

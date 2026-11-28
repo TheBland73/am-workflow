@@ -1,8 +1,11 @@
 import type {
-  AgentTemplate, AnalyticsDistribution, AnalyticsFailedRuns, AnalyticsOverview, AnalyticsRange, AnalyticsRecentRuns, AnalyticsTrends, AnalyticsUsage, ArtifactRecord, Gate, ModelEntry, NodeActionResponse, NodeDetail,
-  PlanActivity, PlanDetail, PlanEvent, PlanListItem, PlanPhases, PlanPoint, PlanTask,
-  Preset, Provider, RemoteModel, ResetNodeBody, RetryNodeBody, Run, RunMetrics,
-  RunReview, SkipNodeBody, Snapshot, StreamEvent, Task, TestResult,
+  AgentTemplate, AnalyticsDistribution, AnalyticsFailedRuns, AnalyticsOverview, AnalyticsRange,
+  AnalyticsRecentRuns, AnalyticsTrends, AnalyticsUsage, ArtifactRecord, DecisionPoint,
+  GateListItem, MaterialIn, MaterialRecord, MeetingDetail, MeetingSummary, MeetingTurn,
+  ModelEntry, NodeActionResponse, NodeDetail, Participant, ParticipantIn, PlanActivity,
+  PlanDetail, PlanEvent, PlanListItem, PlanPhases, PlanPoint, PlanTask, Preset, Provider,
+  RemoteModel, ResetNodeBody, RetryNodeBody, Run, RunConfig, RunMetrics, RunReview,
+  SkipNodeBody, Snapshot, StreamEvent, Task, TemplateDefinition, TestResult,
 } from "./types";
 
 const BASE = import.meta.env.VITE_API_BASE || "/api";
@@ -42,10 +45,22 @@ export const api = {
   health: () => request<{ ok: boolean; app: string }>("/health"),
 
   listRuns: () => request<{ items: Run[] }>("/runs"),
-  createRun: (idea: string, templateKey = "sdlc_v1", budgetTokens?: number) =>
+  createRun: (
+    idea: string,
+    templateKey = "sdlc_v1",
+    budgetTokens?: number,
+    config?: RunConfig,
+    materials?: MaterialIn[],
+  ) =>
     request<Snapshot>("/runs", {
       method: "POST",
-      body: JSON.stringify({ idea, template_key: templateKey, budget_tokens: budgetTokens }),
+      body: JSON.stringify({
+        idea,
+        template_key: templateKey,
+        budget_tokens: budgetTokens,
+        config,
+        materials,
+      }),
     }),
   getRun: (runId: string) => request<Snapshot>(`/runs/${runId}`),
   metrics: (runId: string) => request<RunMetrics>(`/runs/${runId}/metrics`),
@@ -65,12 +80,66 @@ export const api = {
     action: "approve" | "reject",
     body: {
       feedback?: string; target_node?: string; decided_by?: string;
-      artifact_kind?: string; artifact_body?: string;
+      artifact_kind?: string; artifact_body?: string; data?: Record<string, unknown>;
     },
   ) => request<Record<string, unknown>>(`/gates/${gateId}/${action}`, {
     method: "POST", body: JSON.stringify(body),
   }),
-  gates: (runId: string) => request<{ items: Gate[] }>(`/gates?run_id=${runId}`),
+  delegateGate: (gateId: number) =>
+    request<{ delegated: boolean; gate_id: number; to: string }>(`/gates/${gateId}/delegate`, {
+      method: "POST",
+    }),
+  gates: (runId: string) => request<{ items: GateListItem[] }>(`/gates?run_id=${runId}`),
+
+  /* ---------- 会议、确认点、运行级配置、背景材料、自定义角色 ---------- */
+  templateDefinition: (key: string) => request<TemplateDefinition>(`/templates/${key}`),
+  runConfig: (runId: string) =>
+    request<{ run_id: string; status: string; config: RunConfig; editable: boolean }>(
+      `/runs/${runId}/config`,
+    ),
+  patchRunConfig: (runId: string, body: RunConfig) =>
+    request<{ run_id: string; config: RunConfig }>(`/runs/${runId}/config`, {
+      method: "PATCH", body: JSON.stringify(body),
+    }),
+  listMaterials: (runId: string) =>
+    request<{ items: MaterialRecord[]; total_chars: number; max_chars: number }>(
+      `/runs/${runId}/materials`,
+    ),
+  addMaterial: (runId: string, body: MaterialIn) =>
+    request<MaterialRecord>(`/runs/${runId}/materials`, {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  readMaterial: (runId: string, name: string) =>
+    request<{ name: string; content: string }>(
+      `/runs/${runId}/materials/${encodeURIComponent(name)}`,
+    ),
+
+  listMeetings: (runId: string) =>
+    request<{ items: MeetingSummary[] }>(`/runs/${runId}/meetings`),
+  meetingDetail: (runId: string, meetingId: number) =>
+    request<MeetingDetail>(`/runs/${runId}/meetings/${meetingId}`),
+  meetingTurns: (runId: string, meetingId: number, sinceSeq = 0, limit = 200) =>
+    request<{ items: MeetingTurn[]; last_seq: number }>(
+      `/runs/${runId}/meetings/${meetingId}/turns?since_seq=${sinceSeq}&limit=${limit}`,
+    ),
+  meetingMinutes: (runId: string, meetingId: number) =>
+    request<{ kind: string; version: number; body: string }>(
+      `/runs/${runId}/meetings/${meetingId}/minutes`,
+    ),
+  intervene: (runId: string, meetingId: number, content: string) =>
+    request<{ id: number; status: string }>(`/runs/${runId}/meetings/${meetingId}/intervene`, {
+      method: "POST", body: JSON.stringify({ content }),
+    }),
+  replaceParticipants: (runId: string, meetingId: number, participants: ParticipantIn[]) =>
+    request<{ meeting_id: number; participants: Participant[] }>(
+      `/runs/${runId}/meetings/${meetingId}/participants`,
+      { method: "PUT", body: JSON.stringify({ participants }) },
+    ),
+  patchIssue: (runId: string, meetingId: number, issueId: string, accepted: boolean) =>
+    request<Record<string, unknown>>(
+      `/runs/${runId}/meetings/${meetingId}/issues/${encodeURIComponent(issueId)}`,
+      { method: "PATCH", body: JSON.stringify({ accepted }) },
+    ),
 
   artifacts: (runId: string) =>
     request<{ items: ArtifactRecord[] }>(`/runs/${runId}/artifacts`),
@@ -147,23 +216,16 @@ export const api = {
   templates: () => request<{ items: AgentTemplate[] }>("/agent-templates"),
   patchTemplate: (id: number, body: Record<string, unknown>) =>
     request<AgentTemplate>(`/agent-templates/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-
-  /* ---------- 数据统计（ANALYTICS） ---------- */
-  /** 六个接口共用同一个 `days` 参数，保证卡片、图表、列表的统计范围一致。 */
-  analyticsOverview: (range: AnalyticsRange) =>
-    request<AnalyticsOverview>(`/analytics/overview?days=${range}`),
-  analyticsTrends: (range: AnalyticsRange) =>
-    request<AnalyticsTrends>(`/analytics/trends?days=${range}`),
-  analyticsDistribution: (range: AnalyticsRange) =>
-    request<AnalyticsDistribution>(`/analytics/status-distribution?days=${range}`),
-  analyticsUsage: (range: AnalyticsRange) =>
-    request<AnalyticsUsage>(`/analytics/usage?days=${range}`),
-  analyticsRecentRuns: (range: AnalyticsRange, status?: string | null, limit = 10) =>
-    request<AnalyticsRecentRuns>(
-      `/analytics/recent-runs?days=${range}&limit=${limit}${status ? `&status=${status}` : ""}`,
-    ),
-  analyticsFailedRuns: (range: AnalyticsRange, limit = 10) =>
-    request<AnalyticsFailedRuns>(`/analytics/failed-runs?days=${range}&limit=${limit}`),
+  createTemplate: (body: {
+    role_key: string; name: string; system_prompt: string;
+    tools_json?: string[]; memory_scope?: string; max_steps?: number;
+    default_model_id?: number | null;
+    meta?: { description?: string; tags?: string[]; meeting_roles?: string[] };
+  }) => request<AgentTemplate>("/agent-templates", {
+    method: "POST", body: JSON.stringify(body),
+  }),
+  deleteTemplate: (id: number) =>
+    request<{ deleted: number }>(`/agent-templates/${id}`, { method: "DELETE" }),
 
   /* ---------- 编排工作台（ORCH-01） ---------- */
   plans: (status?: string) =>
@@ -231,6 +293,23 @@ export const api = {
   planPhases: (planId: string) => request<PlanPhases>(`/plans/${planId}/phases`),
   planActivity: (planId: string, limit = 50) =>
     request<PlanActivity>(`/plans/${planId}/activity?limit=${limit}`),
+
+  /* ---------- 数据统计（ANALYTICS） ---------- */
+  /** 六个接口共用同一个 `days` 参数，保证卡片、图表、列表的统计范围一致。 */
+  analyticsOverview: (range: AnalyticsRange) =>
+    request<AnalyticsOverview>(`/analytics/overview?days=${range}`),
+  analyticsTrends: (range: AnalyticsRange) =>
+    request<AnalyticsTrends>(`/analytics/trends?days=${range}`),
+  analyticsDistribution: (range: AnalyticsRange) =>
+    request<AnalyticsDistribution>(`/analytics/status-distribution?days=${range}`),
+  analyticsUsage: (range: AnalyticsRange) =>
+    request<AnalyticsUsage>(`/analytics/usage?days=${range}`),
+  analyticsRecentRuns: (range: AnalyticsRange, status?: string | null, limit = 10) =>
+    request<AnalyticsRecentRuns>(
+      `/analytics/recent-runs?days=${range}&limit=${limit}${status ? `&status=${status}` : ""}`,
+    ),
+  analyticsFailedRuns: (range: AnalyticsRange, limit = 10) =>
+    request<AnalyticsFailedRuns>(`/analytics/failed-runs?days=${range}&limit=${limit}`),
 };
 
 /** 订阅 run 的 SSE；返回取消订阅函数。事件类型逐个注册（后端用的是命名事件）。 */
@@ -247,6 +326,12 @@ export function subscribeRun(
     "node_skipped", "node_reset", "node_feedback_injected",
     "artifact_written", "task_created", "task_updated", "gate_requested", "gate_decided",
     "memory_written",
+    // 会议式前半段（详设 §12.5）
+    "meeting_started", "meeting_phase", "meeting_turn_started", "meeting_turn_finished",
+    "meeting_ledger_updated", "meeting_issue_updated", "meeting_suspended", "meeting_resumed",
+    "meeting_intervention_queued", "meeting_intervention_injected", "meeting_finished",
+    "checkpoint_decided", "review_round_started", "review_verdict", "review_blocked", "review_rework",
+    "context_compacted", "context_prefix_changed", "node_rerouted",
   ];
   const handler = (raw: MessageEvent) => {
     try {

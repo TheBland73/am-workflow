@@ -11,11 +11,14 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db.base import session_scope
-from app.db.models import Gate, Node, NodeAttempt, Run, Task, Workflow
+from app.db.models import Gate, Meeting, Node, NodeAttempt, Run, Task, Workflow
 from app.engine.events import emit
-from app.engine.gates import GateError, decide_gate as _decide_gate
+from app.engine.feedback import with_feedback
+from app.engine.gates import GateError, decide_gate as _decide_gate, gate_payload
 from app.engine.runners import NodeContext, NodeFailure, classify_failure, execute_node, lesson_for
 from app.engine.templates import phase_names
+from app.engine import judge
+from app.meeting import store
 
 TERMINAL = {"finished", "failed", "stopped"}
 
@@ -127,7 +130,14 @@ class Orchestrator:
     async def _run_node(self, run_id: str, node: dict,
                         slots: asyncio.Semaphore | None = None) -> None:
         if node["type"] == "HUMAN_GATE":
-            await self._open_human_gate(run_id, node)
+            decider = judge.gate_decider(run_id, dict(node.get("config") or {}),
+                                         node["node_key"])
+            if decider == "auto":
+                await self._auto_pass_gate(run_id, node)
+            elif decider == "model":
+                await self._judge_gate(run_id, node)
+            else:
+                await self._open_human_gate(run_id, node)
             return
         # 闸门放在建 attempt 之前：排队中的节点不应显示 running，也不应吃掉超时预算。
         async with (slots or self._slots()):
@@ -195,6 +205,18 @@ class Orchestrator:
             heartbeat.cancel()
 
         self._finish_attempt(attempt_id)
+        if result.get("suspended"):
+            # 会议在确认点挂起：门、节点与运行的状态已由会议运行器置好，这里只补一条事件。
+            # 挂起中的节点被多余调度时（already_waiting）不重复发，事件流不刷屏。
+            if not result.get("already_waiting"):
+                checkpoint = result.get("checkpoint") or {}
+                await emit(run_id, "meeting_suspended", node["id"], {
+                    "meeting_id": result.get("meeting_id"), "gate_id": checkpoint.get("id"),
+                    "kind": checkpoint.get("kind")})
+            return
+        if result.get("reroute"):
+            await self._handle_reroute(run_id, node, result["reroute"])
+            return
         if node["type"] == "REVIEW" and result.get("verdict") == "block":
             await self._handle_review_block(run_id, node, attempt_id, attempt_no, result)
             return
@@ -208,10 +230,111 @@ class Orchestrator:
     async def _open_human_gate(self, run_id: str, node: dict) -> None:
         from app.engine.gates import request_gate
 
-        self._update_node(node["id"], status="waiting_human")
+        hint = ""
+        if dict(node.get("config") or {}).get("check"):
+            try:
+                hint = judge.hint_for_gate(run_id, node)
+            except Exception:
+                hint = ""
+        self._update_node(node["id"], status="waiting_human",
+                          extra={"hint": hint} if hint else None,
+                          drop=None if hint else ["hint"])
         gate = request_gate(run_id, node["id"])
         self._set_run(run_id, status="waiting_human")
         await emit(run_id, "gate_requested", node["id"], gate)
+
+    async def _auto_pass_gate(self, run_id: str, node: dict) -> None:
+        """判定者是"自动"：不调模型、也不开门，直接完成并批准工件（详设 §5.3）。"""
+        config = dict(node.get("config") or {})
+        key = judge.checkpoint_key(config, node["node_key"])
+        with session_scope() as s:
+            gate = Gate(run_id=run_id, node_id=node["id"], status="approved", kind=key,
+                        payload_json={"title": config.get("title") or node["name"]},
+                        decision_json={"action": "approve", "option": "auto"},
+                        decided_by="program", decided_at=_now())
+            s.add(gate)
+            s.flush()
+            gate_id = gate.id
+            row = s.get(Node, node["id"])
+            if row is not None:
+                row.status = "done"
+            run = s.get(Run, run_id)
+            if run is not None:
+                run.status = "running"
+                run.error = None
+        artifact = config.get("artifact")
+        if artifact:
+            from app.artifacts.store import set_status
+
+            set_status(run_id, artifact, "approved")
+        decision = {"action": "approve", "option": "auto"}
+        await emit(run_id, "checkpoint_decided", node["id"], {
+            "gate_id": gate_id, "kind": key, "decided_by": "program", "decision": decision})
+        await emit(run_id, "gate_decided", node["id"], {
+            "gate_id": gate_id, "run_id": run_id, "status": "approved", "action": "approve",
+            "feedback": None, "target_node": None, "reset_nodes": [],
+            "decided_by": "program"})
+
+    async def _judge_gate(self, run_id: str, node: dict) -> str:
+        """判定者是"模型"：为这次判定建一条执行记录，调用裁决模型；判不了就留给人。"""
+        attempt_no = self._next_attempt_no(node["id"])
+        attempt_id = self._create_attempt(node["id"], attempt_no)
+        self._update_node(node["id"], status="running", drop=["retry_at"])
+        _, nodes = self._load(run_id)
+        deps = [item for item in nodes if item["node_key"] in (node.get("deps") or [])]
+        try:
+            result = await judge.judge_gate(run_id, node, deps, attempt_id)
+        except asyncio.CancelledError:
+            self._fail_attempt(attempt_id, "模型判定被取消")
+            raise
+        except Exception as exc:                      # 判不了就留给人，不拖垮整场运行
+            self._fail_attempt(attempt_id, f"模型判定失败：{exc}"[:2000])
+            return await self._gate_to_human(run_id, node, f"模型判定失败：{exc}")
+        self._finish_attempt(attempt_id)
+        await emit(run_id, "node_log", node["id"], {
+            "level": "warn" if result["action"] == "open" else "info",
+            "message": f"确认点判定：{result['action']}——{result.get('reason') or ''}"[:300]})
+        if result["action"] == "open":
+            with session_scope() as s:
+                gate = (s.query(Gate)
+                        .filter(Gate.node_id == node["id"], Gate.status == "open")
+                        .order_by(Gate.id.desc()).first())
+                body = gate_payload(s, gate) if gate is not None else None
+            if body is not None:
+                await emit(run_id, "gate_requested", node["id"], {
+                    **body, "reason": result.get("reason") or "模型判定无效，转人工"})
+                # 从 delegate 入口进来时门已存在（不走 request_gate），节点不会自己回到等人状态：
+                # 判不了就明确置回 waiting_human，门开着等人工。
+                # 门在判定期间已被处理（body 为 None）时不动节点与运行的状态——人的决定已经
+                # 把它们放到了正确的位置，再置回等人会让调度循环停摆。
+                self._update_node(node["id"], status="waiting_human")
+                self._set_run(run_id, status="waiting_human")
+        return result["action"]
+
+    async def _gate_to_human(self, run_id: str, node: dict, reason: str) -> str:
+        """判不了就留给人：已有决定的不动，否则保证有一扇开着的门，原因写进 hint。"""
+        with session_scope() as s:
+            latest = (s.query(Gate).filter(Gate.node_id == node["id"])
+                      .order_by(Gate.id.desc()).first())
+            action = str((latest.decision_json or {}).get("action") or "") if latest else ""
+            is_open = latest is not None and latest.status == "open"
+        if action in ("approve", "reject"):
+            return action
+        self._update_node(node["id"], status="waiting_human", extra={"hint": reason})
+        if not is_open:
+            from app.engine.gates import request_gate
+            request_gate(run_id, node["id"])
+        with session_scope() as s:
+            gate = (s.query(Gate)
+                    .filter(Gate.node_id == node["id"], Gate.status == "open")
+                    .order_by(Gate.id.desc()).first())
+            body = gate_payload(s, gate) if gate is not None else None
+        if body is not None:
+            await emit(run_id, "gate_requested", node["id"], {**body, "reason": reason})
+        self._set_run(run_id, status="waiting_human")
+        await emit(run_id, "node_log", node["id"], {
+            "level": "error", "message": reason[:300]})
+        return "open"
 
     # ---------- 失败回流 ----------
     async def _handle_failure(self, run_id: str, node: dict, attempt_id: int,
@@ -224,7 +347,9 @@ class Orchestrator:
         })
         if retry:
             delay = self._retry_delay(attempt_no)
-            extra: dict = {"retry_count": attempt_no}
+            seq = int((node["config"] or {}).get("feedback_seq") or 0)
+            extra: dict = {"retry_count": attempt_no, "feedback_kind": "auto_retry",
+                           "feedback_seq": seq + 1}
             if delay > 0:
                 extra["retry_at"] = (_now() + timedelta(seconds=delay)).isoformat()
             self._update_node(node["id"], status="pending", feedback=message, extra=extra)
@@ -245,7 +370,7 @@ class Orchestrator:
         from app.engine.gates import request_gate
 
         self._update_node(node["id"], status="waiting_human", feedback=message,
-                          drop=["retry_at"],
+                          drop=["retry_at", "feedback_kind"],
                           extra={"escalation": True, "escalation_reason": message})
         gate = request_gate(run_id, node["id"], feedback=message)
         self._set_run(run_id, status="waiting_human")
@@ -257,6 +382,96 @@ class Orchestrator:
         await emit(run_id, "gate_requested", node["id"], {
             **gate, "reason": "达到最大重试次数，转人工", "escalation": True,
         })
+
+    # ---------- 定点回流 ----------
+    async def _handle_reroute(self, run_id: str, node: dict, instruction: dict) -> None:
+        """把指令里的节点定点重开并带反馈（不级联），当前节点轮次加一；轮次用尽转人工。
+
+        评审、确认这类循环靠它承载：评审会议依赖讨论会议，所以讨论会议重跑完成之前，
+        评审会议不会被调度。extra_round 为真表示人已同意再评一轮：轮次和上限一起加一。
+        """
+        config = dict(node["config"] or {})
+        try:
+            round_no = max(1, int(config.get("round") or 1))
+            max_rounds = max(1, int(config.get("max_rounds") or 3))
+        except (TypeError, ValueError):
+            round_no, max_rounds = 1, 3
+        targets = [str(key) for key in (instruction.get("targets") or [])]
+        feedback = str(instruction.get("feedback") or "")
+        extra_round = bool(instruction.get("extra_round"))
+
+        if round_no >= max_rounds and not extra_round:
+            reason = f"回流已达 {max_rounds} 轮：{feedback[:500]}"
+            self._update_node(node["id"], status="waiting_human", feedback=reason,
+                              drop=["retry_at", "feedback_kind"],
+                              extra={"escalation": True, "escalation_reason": reason})
+            from app.engine.gates import request_gate
+
+            gate = request_gate(run_id, node["id"], feedback=reason)
+            self._set_run(run_id, status="waiting_human")
+            await emit(run_id, "node_rerouted", node["id"], {
+                "from": node["node_key"], "targets": targets, "round": round_no,
+                "max_rounds": max_rounds, "escalated": True})
+            await emit(run_id, "gate_requested", node["id"],
+                       {**gate, "reason": "回流轮次用尽，转人工", "escalation": True})
+            return
+
+        bump = {"round": round_no + 1}
+        if extra_round:
+            bump["max_rounds"] = max(max_rounds, round_no + 1)
+        self_feedback = str(instruction.get("self_feedback") or "").strip()
+        # 发起节点、目标节点与"已回流"标记放进同一个事务：进程级中断不会留下
+        # "轮次已加、目标没重开"或"目标对同一反馈重复返工"的半截状态。
+        reset: list[str] = []
+        with session_scope() as s:
+            initiator = s.get(Node, node["id"])
+            if initiator is not None:
+                cfg = dict(initiator.config_json or {})
+                if self_feedback:
+                    updated = with_feedback(cfg, self_feedback, "reroute_self")
+                    cfg = {**updated, **bump}
+                    cfg.pop("retry_at", None)
+                else:
+                    cfg = {**cfg, **bump}
+                    cfg.pop("retry_at", None)
+                    cfg.pop("feedback", None)
+                    cfg.pop("feedback_kind", None)
+                initiator.config_json = cfg
+                initiator.status = "pending"
+            rows = (
+                s.query(Node)
+                .filter(Node.run_id == run_id)
+                .order_by(Node.order_index.asc(), Node.id.asc())
+                .all()
+            )
+            for other in rows:
+                if other.node_key in targets and other.status != "running":
+                    updated = with_feedback(dict(other.config_json or {}), feedback, "reroute")
+                    cfg = {**updated}
+                    cfg.pop("retry_at", None)
+                    cfg.pop("retry_count", None)
+                    other.config_json = cfg
+                    other.status = "pending"
+                    reset.append(other.node_key)
+            # "已回流"的标记在目标节点确实重开之后才写（目标正在运行被跳过时不写）：
+            # 协议不再提前写，这样进程在编排器接受回流之前中断时，重入的协议会重新发起回流而不是空等返工。
+            if reset:
+                meeting = (
+                    s.query(Meeting)
+                    .filter(Meeting.node_id == node["id"])
+                    .order_by(Meeting.id.desc())
+                    .first()
+                )
+                if meeting is not None:
+                    meeting.state_json = {**(meeting.state_json or {}), "rework_pending": True}
+        await emit(run_id, "node_rerouted", node["id"], {
+            "from": node["node_key"], "targets": reset, "round": round_no + 1,
+            "max_rounds": bump.get("max_rounds", max_rounds), "escalated": False})
+        skipped = [key for key in targets if key not in reset]
+        if skipped:
+            await emit(run_id, "node_log", node["id"], {
+                "level": "warn",
+                "message": f"回流目标未重置（正在运行或不存在）：{'、'.join(skipped)}"})
 
     # ---------- 评审回流 ----------
     async def _handle_review_block(self, run_id: str, node: dict, attempt_id: int,
@@ -383,7 +598,10 @@ class Orchestrator:
     # ---------- 门决策入口（供 API 调用） ----------
     async def decide_gate(self, *, gate_id: int, action: str, feedback: str | None = None,
                           target_node: str | None = None, decided_by: str = "human",
-                          artifact_kind: str | None = None, artifact_body: str | None = None) -> dict:
+                          artifact_kind: str | None = None, artifact_body: str | None = None,
+                          data: dict | None = None) -> dict:
+        route = str((data or {}).get("route") or "").strip()
+        route_spec = self._route_spec(gate_id, route) if action == "approve" and route else None
         result: dict = {}
         edited: dict | None = None
         if artifact_kind and artifact_body:
@@ -393,16 +611,61 @@ class Orchestrator:
                 self._run_of_gate(gate_id), artifact_kind, artifact_body,
                 created_by=decided_by, status="approved",
             )
+        from app.db.models import Gate
+
+        with session_scope() as s:
+            gate_row = s.get(Gate, gate_id)
+            gate_kind = gate_row.kind if gate_row is not None else None
+            gate_meeting = gate_row.meeting_id if gate_row is not None else None
+            gate_node = gate_row.node_id if gate_row is not None else None
         result = _decide_gate(gate_id=gate_id, action=action, feedback=feedback,
-                              target_node=target_node, decided_by=decided_by)
+                              target_node=target_node, decided_by=decided_by, data=data)
         if edited:
             result["edited_artifact"] = edited
+        if route_spec is not None:
+            result["skipped_nodes"] = await self._skip_route_nodes(
+                result["run_id"], route_spec, route)
         await emit(result["run_id"], "gate_decided", None, result)
+        if gate_meeting is not None:
+            # 会议内确认点的人工决定：与委托、程序、模型四类判定者统一推 checkpoint_decided
+            await emit(result["run_id"], "checkpoint_decided", gate_node, {
+                "gate_id": gate_id, "kind": gate_kind, "decided_by": decided_by,
+                "decision": {"action": action, **(data or {})}})
         if action == "reject" and result.get("reset_nodes"):
             await emit(result["run_id"], "nodes_reset", None,
                        {"nodes": result["reset_nodes"], "target": target_node})
         self.kick(result["run_id"])
         return result
+
+    def _route_spec(self, gate_id: int, route: str) -> dict:
+        """通过时选择去向：必须在落决定之前校验，未知的去向让门保持开着。"""
+        with session_scope() as s:
+            gate = s.get(Gate, gate_id)
+            if gate is None:
+                raise GateError("门不存在")
+            node = s.get(Node, gate.node_id)
+            config = dict(node.config_json or {}) if node is not None else {}
+        for item in config.get("routes") or []:
+            if str(item.get("key") or "") == route:
+                return dict(item)
+        raise GateError("未知的去向")
+
+    async def _skip_route_nodes(self, run_id: str, spec: dict, route: str) -> list[str]:
+        """把去向里的节点逐个置为 skipped，各发一条带去向的 node_finished。"""
+        skipped: list[tuple[int, str]] = []
+        with session_scope() as s:
+            rows = {row.node_key: row
+                    for row in s.query(Node).filter(Node.run_id == run_id).all()}
+            for key in [str(item) for item in spec.get("nodes") or []]:
+                row = rows.get(key)
+                if row is None or row.status in ("done", "skipped", "running"):
+                    continue
+                row.status = "skipped"
+                skipped.append((row.id, key))
+        for node_id, key in skipped:
+            await emit(run_id, "node_finished", node_id, {
+                "node_key": key, "skipped": True, "route": route})
+        return [key for _, key in skipped]
 
     # ---------- 恢复 ----------
     async def recover(self) -> None:
@@ -427,8 +690,11 @@ class Orchestrator:
                 for node in s.query(Node).filter(Node.run_id == run_id, Node.status == "running").all():
                     node.status = "pending"
                     reset += 1
-            if reset:
-                await emit(run_id, "run_recovered", None, {"reset_nodes": reset})
+            # 被取消的运行（节点已回到待调度、没有 running 节点）也要留一条恢复事件：
+            # 它同样是"进程重启后由恢复流程重新拉起"，下游要靠这个事件确认恢复发生过。
+            if reset or status == "running":
+                await emit(run_id, "run_recovered", None,
+                           {"reset_nodes": reset, "status": status})
             if status == "waiting_human":
                 with session_scope() as s:
                     open_gate = (

@@ -61,6 +61,16 @@ def test_front_matter_roundtrip() -> None:
     assert body.strip().startswith("# 标题")
 
 
+def test_front_matter_keeps_extra_fields_after_the_fixed_ones() -> None:
+    # 工件可以带自己的附加字段（如评审报告的 review_type）：固定六键仍在前，附加字段跟在后面
+    meta = {"id": "r1-review", "kind": "review", "status": "reviewed", "version": 2,
+            "inputs": ["proposal"], "created": "2026-11-27T00:00:00+00:00",
+            "review_type": "proposal"}
+    parsed, _body = parse_front_matter(render_front_matter(meta, "# 评审报告"))
+    assert parsed["review_type"] == "proposal" and parsed["version"] == 2
+    assert list(parsed)[:6] == ["id", "kind", "status", "version", "inputs", "created"]
+
+
 def test_strip_outer_fence() -> None:
     assert strip_outer_fence("```markdown\n# x\n```") == "# x"
     assert strip_outer_fence("# x") == "# x"
@@ -89,22 +99,3 @@ def test_budget_estimate_and_truncate() -> None:
     assert truncated.startswith("你" * 9) and "截断" in truncated
 
 
-def test_sdlc_template_three_party_discussion() -> None:
-    from app.engine.templates import load_definition
-
-    definition = load_definition("sdlc_v1")
-    nodes = {n["key"]: n for n in definition["nodes"]}
-    assert len(definition["nodes"]) == 18
-    assert nodes["discuss_response"]["deps"] == ["discuss_con"]
-    assert nodes["discuss_mod"]["deps"] == ["discuss_response"]
-    assert nodes["proposal"]["deps"] == ["discuss_mod"]
-    assert nodes["discuss_response"]["assignee"]["role"] == "discuss_pro"
-
-
-def test_roles_include_discuss_mod() -> None:
-    from app.agents.templates.roles import ROLES
-
-    mod = next(r for r in ROLES if r["role_key"] == "discuss_mod")
-    assert mod["memory_scope"] == "agent"
-    assert mod["tools_json"] == []
-    assert len(ROLES) == 11

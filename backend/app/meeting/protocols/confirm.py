@@ -1,0 +1,955 @@
+"""需求确认协议（详设 §9）。
+
+步骤依次是：
+  intake    受理：用户在需求确认确认点上驳回时，把意见整理成核对清单里的条目
+  prepare   准备：建参会者、跑机械核对、把当前需求正文存进状态、写章程
+  expect    写预期：核对者只读账本，逐个已了结的决策点写下"需求里必须出现什么"
+  fidelity  忠实性核对：对照需求规格，逐个决策点给出忠实、走样或遗漏
+  quality   质量评审：按需求质量特性逐项检查，问题定位到需求编号
+  merge     汇总：程序把三处发现整理成清单，主席补全走样与遗漏落在哪条需求上
+  verdict   裁决：程序按清单得出结论；不通过时定点回流需求分析师
+  report    写确认报告（评审工件的新版本）
+
+引擎掌控流程：机械核对不过就不调模型、清单由程序生成、结论由程序得出；
+模型只负责写预期、核对、评审与归类。全部开新上下文，依据是决策点账本。
+"""
+from __future__ import annotations
+
+from typing import Callable
+
+from app.artifacts.store import latest_artifact, parse_front_matter, read_artifact
+from app.conversation.builder import Segment
+from app.engine.events import emit
+from app.engine.runners import NodeFailure
+from app.engine.templates import role_library, role_suits_meeting, role_template
+from app.meeting import confirm_rules, minutes, render, review_rules, store
+from app.meeting.calls import meeting_input_budget, speak, speak_many
+from app.meeting.protocols.base import (MeetingProtocol, advance, done, register_protocol,
+                                        reroute_or_escalate)
+
+Validator = Callable[[dict], list[str]]
+
+MODE_NAMES = {"chair": "评审主席", "checker": "语义核对者", "quality_reviewer": "质量评审者"}
+KIND_NAMES = {"mechanical": "机械核对", "distorted": "走样", "missing": "遗漏",
+              "added": "凭空新增", "quality": "质量评审"}
+RESULT_NAMES = {"faithful": "忠实", "distorted": "走样", "missing": "遗漏"}
+_FAIL_KINDS = ("mechanical", "distorted", "missing", "added")
+_QUALITY_CRITERIA = ("正确", "无歧义", "完整", "一致", "有优先级", "可验证", "可修改", "可追踪")
+_RANK = {"blocker": 0, "major": 1, "minor": 2}
+
+EXPECT_INSTRUCTION = (
+    "只依据决策点账本，逐个已了结的决策点写下：需求里必须出现什么内容，才算忠实于这个决策。"
+    "不要评价现状，也不要引用别的内容。只输出一个 JSON 对象：\n"
+    '{"expected": [{"index": "D1", "content": "需求里必须出现什么"}]}')
+FIDELITY_INSTRUCTION = (
+    "对照章程里的需求规格，逐个决策点判断需求是否忠实体现了账本里的结论："
+    "faithful（忠实）、distorted（走样）、missing（遗漏）。走样和遗漏必须写 reason。"
+    "如果某条需求的内容在账本里找不到依据，放进 added。只输出一个 JSON 对象：\n"
+    '{"checks": [{"index": "D1", "result": "faithful", "reason": ""}], '
+    '"added": [{"requirement": "R7", "reason": "为什么没有依据"}]}')
+QUALITY_INSTRUCTION = (
+    "按需求质量特性逐项检查需求规格：" + "、".join(_QUALITY_CRITERIA)
+    + "；另外检查是否越界写了实现细节。每条意见定位到需求编号。只输出一个 JSON 对象：\n"
+    '{"issues": [{"requirement": "R1", "criterion": "正确", "severity": "major", '
+    '"problem": "……", "suggestion": "……"}]}\n'
+    "没有问题的时候 issues 给空数组。")
+MERGE_INSTRUCTION = (
+    "下面是各方核对发现的条目清单（行首是序号）。请归类去重：不同人发现的同一问题只保留一条，"
+    "被去掉的重复条目把它的序号放进 duplicates；保留的条目输出到 items，"
+    "走样与遗漏的要补上它应当落在哪条需求上。只输出一个 JSON 对象：\n"
+    '{"items": [{"kind": "distorted", "index": "D2", "requirement": "R3", '
+    '"problem": "……", "suggestion": "……"}], "duplicates": ["3"]}')
+INTAKE_INSTRUCTION = (
+    "用户对需求确认结论提出了意见。请把它整理成核对清单里的条目：kind 取 quality，"
+    "写明对应的需求编号、问题与修改建议。只输出一个 JSON 对象：\n"
+    '{"items": [{"kind": "quality", "requirement": "R1", "problem": "……", '
+    '"suggestion": "……"}]}')
+
+
+# ---------------- 校验模型的结构化输出 ----------------
+def _validate_expected(indexes: list[str]) -> Validator:
+    def validate(data: dict) -> list[str]:
+        rows = data.get("expected")
+        if not isinstance(rows, list):
+            return ["expected 须是数组"]
+        if any(not isinstance(row, dict) for row in rows):
+            return ["expected 的每一项须是对象"]
+        if {str(row.get("index")) for row in rows} != set(indexes):
+            return [f"expected 须恰好覆盖这些决策点：{indexes}"]
+        return [f"{row.get('index')}：content 不能为空" for row in rows
+                if not isinstance(row.get("content"), str) or not row["content"].strip()]
+
+    return validate
+
+
+def _validate_fidelity(indexes: list[str]) -> Validator:
+    def validate(data: dict) -> list[str]:
+        rows = data.get("checks")
+        if not isinstance(rows, list):
+            return ["checks 须是数组"]
+        if any(not isinstance(row, dict) for row in rows):
+            return ["checks 的每一项须是对象"]
+        if {str(row.get("index")) for row in rows} != set(indexes):
+            return [f"checks 须恰好覆盖这些决策点：{indexes}"]
+        issues: list[str] = []
+        for row in rows:
+            result = row.get("result")
+            if result not in RESULT_NAMES:
+                issues.append(f"{row.get('index')}：result 须是 faithful、distorted、missing 之一")
+            elif result != "faithful" and not str(row.get("reason") or "").strip():
+                issues.append(f"{row.get('index')}：走样和遗漏必须写 reason")
+        added = data.get("added")
+        if added is not None:
+            if not isinstance(added, list):
+                issues.append("added 须是数组")
+            else:
+                for item in added:
+                    if (not isinstance(item, dict)
+                            or not str(item.get("requirement") or "").strip()
+                            or not str(item.get("reason") or "").strip()):
+                        issues.append("added 的每一项须有 requirement 与 reason")
+        return issues
+
+    return validate
+
+
+def _validate_quality(data: dict) -> list[str]:
+    rows = data.get("issues")
+    if not isinstance(rows, list):
+        return ["issues 须是数组"]
+    return [f"第 {position + 1} 条意见缺少 requirement 或 problem"
+            for position, row in enumerate(rows)
+            if not isinstance(row, dict)
+            or not str(row.get("requirement") or "").strip()
+            or not str(row.get("problem") or "").strip()]
+
+
+def _validate_items(*, allow_empty: bool) -> Validator:
+    def validate(data: dict) -> list[str]:
+        rows = data.get("items")
+        if not isinstance(rows, list):
+            return ["items 须是数组"]
+        if not allow_empty and not rows:
+            return ["items 须是非空数组"]
+        return [f"第 {position + 1} 条缺少 problem"
+                for position, row in enumerate(rows)
+                if not isinstance(row, dict)
+                or not str(row.get("problem") or "").strip()]
+
+    return validate
+
+
+def _validate_merge() -> Validator:
+    """主席归类步的输出：items 是保留的条目，duplicates 是被去掉的重复条目的清单序号。"""
+    def validate(data: dict) -> list[str]:
+        issues = _validate_items(allow_empty=True)(data)
+        duplicates = data.get("duplicates")
+        if duplicates is not None and not (
+                isinstance(duplicates, list)
+                and all(isinstance(row, (int, str)) for row in duplicates)):
+            issues.append("duplicates 须是序号数组")
+        return issues
+
+    return validate
+
+
+# ---------------- 会议状态与账本 ----------------
+def _flow(mtg) -> int:
+    """确认轮次：第一次确认、每次带着反馈续开或从等待返工恢复都加一。"""
+    return mtg.meeting_round()
+
+
+def _done(mtg, step: str) -> bool:
+    return (mtg.state().get("done") or {}).get(step) == _flow(mtg)
+
+
+def _mark(mtg, step: str) -> None:
+    done_map = dict(mtg.state().get("done") or {})
+    done_map[step] = _flow(mtg)
+    mtg.set_state(done=done_map)
+
+
+def _finish_step(mtg, step: str, **changes) -> None:
+    """产物与完成标记一次写完：崩溃重试不会把同一批条目写两遍。"""
+    done_map = dict(mtg.state().get("done") or {})
+    done_map[step] = _flow(mtg)
+    mtg.set_state(done=done_map, **changes)
+
+
+def _items(mtg) -> list[dict]:
+    return list(mtg.state().get("items") or [])
+
+
+def _chair(mtg) -> dict:
+    rows = mtg.participants("chair")
+    if not rows:
+        raise NodeFailure("需求确认会议缺少评审主席，无法继续", fatal=True)
+    return rows[0]
+
+
+def _checkers(mtg) -> list[dict]:
+    return mtg.participants("checker")
+
+
+def _quality_reviewers(mtg) -> list[dict]:
+    return mtg.participants("quality_reviewer")
+
+
+def _discussion(mtg) -> dict | None:
+    return store.latest_meeting(mtg.run_id, "discussion")
+
+
+def _review_meeting(mtg) -> dict | None:
+    return store.latest_meeting(mtg.run_id, "review")
+
+
+def _ledger_points(mtg) -> list[dict]:
+    meeting = _discussion(mtg)
+    return store.list_decision_points(meeting["id"]) if meeting else []
+
+
+def _spec_text(mtg) -> str:
+    raw = read_artifact(mtg.run_id, "requirement")
+    return parse_front_matter(raw)[1].strip() if raw else ""
+
+
+def _spec_bodies(text: str) -> dict:
+    return {item["id"]: item["body"] for item in confirm_rules.parse_requirements(text)}
+
+
+def _closed_indexes(points: list[dict]) -> list[str]:
+    return [point["index"] for point in confirm_rules.closed_points(points)]
+
+
+def _indexes_line(verb: str, indexes: list[str]) -> str:
+    return f"\n\n必须{verb}这些决策点：" + "、".join(indexes) + "。"
+
+
+def _where(item: dict) -> str:
+    parts = []
+    if item.get("requirement"):
+        parts.append(f"需求 {item['requirement']}")
+    if item.get("index"):
+        parts.append(f"决策点 {item['index']}")
+    return "、".join(parts) or "—"
+
+
+def _cell(value) -> str:
+    text = str(value or "").replace("|", "/").replace("\n", " ").strip()
+    return text or "—"
+
+
+def _next_number(items: list[dict], last_items: list[dict]) -> int:
+    numbers = []
+    for item in list(items) + list(last_items):
+        value = str(item.get("id") or "")
+        if value.startswith("C") and value[1:].isdigit():
+            numbers.append(int(value[1:]))
+    return max(numbers, default=0) + 1
+
+
+def _items_text(items: list[dict]) -> str:
+    lines = []
+    for item in items:
+        label = KIND_NAMES.get(item.get("kind"), item.get("kind") or "")
+        location = _where(item)
+        line = f"- {item.get('id', '')} [{label}] "
+        line += f"{location}：" if location != "—" else ""
+        line += item.get("problem") or ""
+        if item.get("suggestion"):
+            line += f"。建议：{item['suggestion']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _blocking(items: list[dict], line: str) -> list[dict]:
+    limit = _RANK.get(line, _RANK["major"])
+    return [item for item in items
+            if item.get("kind") in _FAIL_KINDS
+            or (item.get("kind") == "quality"
+                and _RANK.get(item.get("severity") or "minor", _RANK["minor"]) <= limit)]
+
+
+# ---------------- 章程 ----------------
+def _last_items_text(mtg) -> str:
+    state = mtg.state()
+    last = list(state.get("last_items") or [])
+    if not last:
+        return "（无）"
+    changed = set(state.get("changed") or [])
+    lines = []
+    for item in last:
+        requirement = str(item.get("requirement") or "")
+        if requirement:
+            handled = "已改动" if requirement in changed else "未改动"
+        elif item.get("origin") == "user":
+            # 没落到具体需求上的用户意见：程序判定不了它是否已处理，如实说明保留在清单里
+            handled = "未对应到具体需求，保留在清单里"
+        elif item.get("kind") == "mechanical":
+            handled = "按当前规格重新核对"
+        else:
+            handled = "本轮重新核对"
+        label = KIND_NAMES.get(item.get("kind"), item.get("kind") or "")
+        location = _where(item)
+        line = f"- {item.get('id', '')} [{label}] "
+        line += f"{location}：" if location != "—" else ""
+        line += f"{item.get('problem') or ''}（处理情况：{handled}）"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _charter_dict(mtg, *, include_spec: bool = True) -> dict:
+    state = mtg.state()
+    sections: list[dict] = []
+    if include_spec:                                  # 写预期时只看账本
+        sections.append({"title": "需求规格（当前版本）", "text": _spec_text(mtg)})
+    sections.append({
+        "title": "决策点账本",
+        "text": render.ledger_text(_ledger_points(mtg), round_no=_flow(mtg),
+                                   budget=10 ** 9).rstrip()})
+    if _flow(mtg) > 1:
+        sections.append({"title": "上一轮的核对清单与处理情况", "text": _last_items_text(mtg)})
+        sections.append({
+            "title": "改动过的需求",
+            "text": "\n".join(f"- {requirement}"
+                              for requirement in state.get("changed") or []) or "（无）"})
+    sections.append({
+        "title": "参与者",
+        "text": "\n".join(f"- {row['display_name']}（{MODE_NAMES.get(row['mode'], row['mode'])}）"
+                          for row in mtg.participants()) or "（无）"})
+    materials, _truncated = mtg.materials()
+    return {"title": "需求确认会议章程", "sections": sections, "materials": materials}
+
+
+def _charter(mtg, *, include_spec: bool = True) -> list[Segment]:
+    return render.charter_segments(_charter_dict(mtg, include_spec=include_spec),
+                                   input_budget=meeting_input_budget(mtg))
+
+
+# ---------------- 程序生成的清单 ----------------
+def _dedupe(rows: list[dict]) -> list[dict]:
+    """同一处的发现合并：走样与遗漏按决策点，凭空新增按需求，质量意见按需求与问题。"""
+    merged: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for row in rows:
+        kind = row["kind"]
+        if kind in ("distorted", "missing"):
+            key = (kind, row.get("index") or "")
+        elif kind == "added":
+            key = (kind, row.get("requirement") or "")
+        elif kind == "quality":
+            key = (kind, row.get("requirement") or "", row.get("problem") or "")
+        else:
+            key = (kind, row.get("problem") or "")
+        if key in merged:
+            existing = merged[key]
+            problem = row.get("problem") or ""
+            if problem and problem not in existing["problem"]:
+                existing["problem"] = (existing["problem"] + "；" + problem
+                                       if existing["problem"] else problem)
+            if not existing.get("suggestion") and row.get("suggestion"):
+                existing["suggestion"] = row["suggestion"]
+            continue
+        merged[key] = dict(row)
+        order.append(key)
+    return [merged[key] for key in order]
+
+
+def _program_items(mtg) -> list[dict]:
+    """清单里的程序部分：机械核对、走样与遗漏、凭空新增、达到阻塞线的质量意见。"""
+    state = mtg.state()
+    line = str(mtg.params().get("min_blocking_severity") or "major")
+    limit = _RANK.get(line, _RANK["major"])
+    rows: list[dict] = []
+    for finding in state.get("mechanical") or []:
+        rows.append({"kind": "mechanical", "requirement": "", "index": "",
+                     "severity": "blocker", "problem": str(finding), "suggestion": ""})
+    for row in state.get("fidelity") or []:
+        if row.get("result") in ("distorted", "missing"):
+            rows.append({"kind": row["result"], "requirement": "",
+                         "index": str(row.get("index") or ""), "severity": "blocker",
+                         "problem": str(row.get("reason") or ""), "suggestion": ""})
+    for row in state.get("added") or []:
+        rows.append({"kind": "added", "requirement": str(row.get("requirement") or ""),
+                     "index": "", "severity": "blocker",
+                     "problem": str(row.get("reason") or ""), "suggestion": ""})
+    for row in state.get("quality_issues") or []:
+        severity = row.get("severity") or "minor"
+        if _RANK.get(severity, _RANK["minor"]) > limit:
+            continue
+        rows.append({"kind": "quality", "requirement": row.get("location") or "",
+                     "index": "", "severity": severity,
+                     "problem": row.get("problem") or "",
+                     "suggestion": row.get("suggestion") or ""})
+    return _dedupe(rows)
+
+
+# ---------------- 协议 ----------------
+@register_protocol
+class ConfirmProtocol(MeetingProtocol):
+    name = "confirm"
+    steps = ("intake", "prepare", "expect", "fidelity", "quality", "merge", "verdict",
+             "report")
+
+    async def on_enter(self, mtg) -> None:
+        state = mtg.state()
+        mtg.consume_feedback()
+        state = mtg.state()
+        text = str(state.get("reopen_feedback") or "").strip()
+        if text and not state.get("intake_feedback"):
+            flow = _flow(mtg) + 1
+            speaker = ("评审意见" if state.get("feedback_kind") in ("reroute", "reroute_self")
+                       else "用户")
+            # 断点保护：反馈发言已经落盘就不再重复写（按轮次与内容去重，复议分支的记法）
+            existing = {turn["content"] for turn in store.round_turns(
+                mtg.meeting_id, round=flow, kinds=["user_feedback"])}
+            if text not in existing:
+                store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
+                               speaker_name=speaker, kind="user_feedback", content=text)
+            # 轮次、反馈的移交与滞留标记、旧报告字段、旧处置记录的清理一次写完：中途崩溃不会重复加轮
+            store.update_meeting(mtg.meeting_id, round=flow, phase="intake", state_json={
+                **state, "reopen_feedback": "", "intake_feedback": text,
+                "last_items": list(state.get("items") or []),
+                "rework_pending": False,
+                "verdict": None, "accepted_by_user": False,
+                "summary": None, "blocking": None, "gate_disposition": None})
+            mtg.reset_builder()
+            return
+        if state.get("rework_pending"):
+            flow = _flow(mtg) + 1
+            store.update_meeting(mtg.meeting_id, round=flow, phase="prepare", state_json={
+                **state, "rework_pending": False, "verdict": None,
+                "accepted_by_user": False,
+                "summary": None, "blocking": None, "gate_disposition": None})
+            mtg.reset_builder()
+
+    # ---------- 受理 ----------
+    async def step_intake(self, mtg):
+        if _done(mtg, "intake"):
+            return advance("prepare")
+        text = str(mtg.state().get("intake_feedback") or "").strip()
+        if not text:
+            _mark(mtg, "intake")
+            return advance("prepare")
+        if not mtg.participants("chair"):             # 还没建过参会者：先补准备
+            _mark(mtg, "intake")
+            return advance("prepare")
+        chair = _chair(mtg)
+        found = store.find_turn(mtg.meeting_id, phase="intake", round=_flow(mtg),
+                                kind="confirm_intake", speaker_id=chair["id"])
+        data = found["data"] if found else (await speak(
+            mtg, chair, kind="confirm_intake", turn_kind="confirm_intake",
+            charter=_charter(mtg),
+            segments=[Segment("append", f"## 用户的反馈\n{text}", name="反馈")],
+            instruction=INTAKE_INSTRUCTION, structured=_validate_items(allow_empty=False),
+            turn_round=_flow(mtg)))["data"]
+        items = _items(mtg)
+        number = _next_number(items, list(mtg.state().get("last_items") or []))
+        # 追加前按（轮次、出处、需求、问题）签名去重：崩溃重入按已落盘的发言重跑入账时，
+        # 同一批条目不会以新编号重复入账。
+        signatures = {(item.get("round"), item.get("origin"),
+                       item.get("requirement") or item.get("index"),
+                       item.get("problem")) for item in items}
+        for raw in data["items"]:
+            kind = str(raw.get("kind") or "quality")
+            if kind not in KIND_NAMES:
+                kind = "quality"
+            severity = raw.get("severity") if raw.get("severity") in _RANK else "blocker"
+            requirement = str(raw.get("requirement") or "").strip()
+            index = str(raw.get("index") or "").strip()
+            problem = str(raw.get("problem") or "").strip()
+            signature = (_flow(mtg), "user", requirement or index, problem)
+            if signature in signatures:
+                continue
+            signatures.add(signature)
+            items.append({
+                "id": f"C{number}", "kind": kind,
+                "requirement": requirement,
+                "index": index,
+                "severity": severity if kind == "quality" else "blocker",
+                "problem": problem,
+                "suggestion": str(raw.get("suggestion") or "").strip(),
+                "origin": "user", "round": _flow(mtg)})
+            number += 1
+        _finish_step(mtg, "intake", items=items, intake_feedback="")
+        return advance("prepare")
+
+    # ---------- 准备 ----------
+    async def step_prepare(self, mtg):
+        if _done(mtg, "prepare"):
+            state = mtg.state()
+            return advance("merge" if state.get("mechanical") else "expect")
+        if not read_artifact(mtg.run_id, "requirement"):
+            raise NodeFailure("需求确认会议需要需求规格工件，但规格还没有产出", fatal=True)
+        self._ensure_participants(mtg)
+        state = mtg.state()
+        flow = _flow(mtg)
+        text = _spec_text(mtg)
+        points = _ledger_points(mtg)
+        bodies = _spec_bodies(text)
+        changes: dict = {
+            "mechanical": confirm_rules.mechanical_check(text, points),
+            "spec": bodies,
+            # 每一轮的三处核对结果全量重来，上一轮的不带进本轮
+            "fidelity": [], "added": [], "quality_issues": [],
+        }
+        if flow > 1:
+            previous = dict(state.get("spec") or {})
+            changes["changed"] = confirm_rules.changed_requirements(previous, bodies)
+            changes["last_spec"] = previous
+        mtg.set_state(**changes)
+        store.update_meeting(mtg.meeting_id, charter_json=_charter_dict(mtg))
+        mtg.reset_builder()
+        # 先记完成标记再发事件：事件发送处被杀时重入不会重复发同一轮的轮次事件
+        # （事件本身可能丢失，与已登记的裁决事件抑制窗口同族）
+        _mark(mtg, "prepare")
+        await emit(mtg.run_id, "review_round_started", mtg.node_id, {
+            "meeting_id": mtg.meeting_id, "round": flow, "protocol": "confirm",
+            "incremental": flow > 1, "rounds_max": mtg.max_rounds()})
+        return advance("merge" if changes["mechanical"] else "expect")
+
+    def _ensure_participants(self, mtg) -> None:
+        existing = {(row["mode"], row["role_key"], row["display_name"])
+                    for row in mtg.participants()}
+
+        def add(row: dict, mode: str) -> None:
+            key = (mode, row.get("role_key"), row["display_name"])
+            if key in existing:
+                return
+            store.add_participant(
+                mtg.meeting_id, role_key=row.get("role_key"),
+                display_name=row["display_name"], mode=mode,
+                system_prompt=row.get("system_prompt") or "",
+                model_id=row.get("model_id"), source="template")
+            existing.add(key)
+
+        if not mtg.participants("chair"):
+            template = role_template("review_chair")
+            if template is None:
+                raise NodeFailure("角色库里没有评审主席（review_chair）", fatal=True)
+            add({"role_key": "review_chair", "display_name": template["name"],
+                 "system_prompt": template["system_prompt"], "model_id": None}, "chair")
+
+        discussion = _discussion(mtg)
+        if discussion is None:
+            raise NodeFailure("需求确认会议缺少讨论会议，无法取得核对者与账本", fatal=True)
+        base = store.list_participants(discussion["id"])
+        for row in base:
+            if row["mode"] in ("participant", "proxy"):
+                add(row, "checker")
+        if not mtg.participants("checker"):
+            raise NodeFailure("讨论会议没有可用的核对者，无法进行需求确认", fatal=True)
+        for row in self._quality_sources(mtg, base):
+            add(row, "quality_reviewer")
+        if not mtg.participants("quality_reviewer"):
+            raise NodeFailure("需求确认会议缺少质量评审者，无法继续", fatal=True)
+
+    def _quality_sources(self, mtg, base: list[dict]) -> list[dict]:
+        """质量评审者取评审会议的评审者各行；没有评审会议时按评审协议的名单规则取
+        （reviewers_max、reviewers_min 与固定人数与评审协议同一口径）。"""
+        review = _review_meeting(mtg)
+        if review is not None:
+            reviewers = [row for row in store.list_participants(review["id"])
+                         if row["mode"] == "reviewer"]
+            if reviewers:
+                return reviewers
+        library = {row["role_key"]: row for row in role_library()}
+        spec = (mtg.run_config().get("rosters") or {}).get("reviewers") or {}
+        configured = [str(key) for key in (spec.get("role_keys") or [])]
+        count = int(spec.get("count") or 0)
+        limit = int(mtg.params().get("reviewers_max") or 0)   # 0 表示不限制
+        if configured:
+            problems = [f"已不存在：{key}" for key in configured if key not in library]
+            problems += [f"不适合参加评审会议：{key}" for key in configured
+                         if key in library and not role_suits_meeting(library[key], "review")]
+            if problems:
+                raise NodeFailure("运行级配置点名的评审角色有问题：" + "；".join(problems)
+                                  + "，请修改运行级配置", fatal=True)
+            reviewers = [{"role_key": key, "display_name": library[key]["name"],
+                          "system_prompt": library[key]["system_prompt"], "model_id": None}
+                         for key in configured]
+        else:
+            reviewers = [row for row in base if row["mode"] == "participant"]
+            if not reviewers:
+                suitable = [row for row in library.values()
+                            if "review" in ((row.get("meta") or {}).get("meeting_roles") or [])]
+                reviewers = [{"role_key": row["role_key"], "display_name": row["name"],
+                              "system_prompt": row["system_prompt"], "model_id": None}
+                             for row in suitable[:3]]
+        if count:
+            reviewers = reviewers[:count]
+        if limit:
+            reviewers = reviewers[:limit]
+        minimum = int(mtg.params().get("reviewers_min") or 0)
+        if len(reviewers) < max(1, minimum):
+            raise NodeFailure(f"评审者人数不足：需要至少 {max(1, minimum)} 名，"
+                              f"当前只有 {len(reviewers)} 名", fatal=True)
+        return reviewers
+
+    # ---------- 写预期 ----------
+    async def step_expect(self, mtg):
+        if _done(mtg, "expect"):
+            return advance("fidelity")
+        state = mtg.state()
+        if state.get("mechanical"):
+            return advance("merge")                   # 机械核对不过：不调模型
+        if mtg.state().get("expected"):               # 写下的预期各轮沿用，不再重写
+            _mark(mtg, "expect")
+            return advance("fidelity")
+        if not bool(mtg.params().get("expected_first", True)):
+            _mark(mtg, "expect")
+            return advance("fidelity")
+        indexes = _closed_indexes(_ledger_points(mtg))
+        if not indexes:
+            _mark(mtg, "expect")
+            return advance("fidelity")
+        charter = _charter(mtg, include_spec=False)     # 只读账本，不看需求规格
+        checkers = _checkers(mtg)
+        results = await speak_many(mtg, [
+            {"participant": checker, "kind": "expect", "turn_kind": "expect",
+             "charter": charter, "segments": [],
+             "instruction": EXPECT_INSTRUCTION + _indexes_line("覆盖", indexes),
+             "structured": _validate_expected(indexes), "turn_round": _flow(mtg)}
+            for checker in checkers])
+        expected = dict(state.get("expected") or {})
+        for checker, result in zip(checkers, results):
+            expected[str(checker["id"])] = list(result["data"]["expected"])
+        _finish_step(mtg, "expect", expected=expected)
+        return advance("fidelity")
+
+    # ---------- 忠实性核对与质量评审 ----------
+    async def step_fidelity(self, mtg):
+        if _done(mtg, "fidelity"):
+            return advance("quality")
+        if mtg.state().get("mechanical"):
+            return advance("merge")
+        points = _ledger_points(mtg)
+        coverage = str(mtg.params().get("coverage") or "full")
+        checkers = _checkers(mtg)
+        assignments = self._assignments(mtg, checkers, points, coverage)
+        previous_added: list[str] = []
+        if _flow(mtg) > 1:
+            assignments = self._incremental_assignments(mtg, assignments)
+            # 详设 §9.4：上一轮"凭空新增"的需求在增量轮也要重新核对——
+            # 否则它结构性地漏出复核，分析没改的那条会让确认误判通过
+            previous_added = sorted({str(item.get("requirement"))
+                                     for item in mtg.state().get("last_items") or []
+                                     if item.get("kind") == "added" and item.get("requirement")})
+        active = [checker for checker in checkers if assignments.get(checker["id"])]
+        if not active and not previous_added:
+            _finish_step(mtg, "fidelity", fidelity=[], added=[])
+            return advance("quality")
+        if not active and previous_added:
+            active = [checkers[0]]              # 没有决策点要核对，也要有人复查上轮的凭空新增
+            assignments = {active[0]["id"]: []}
+        expected = dict(mtg.state().get("expected") or {})
+        charter = _charter(mtg)
+        calls = []
+        for checker in active:
+            indexes = assignments[checker["id"]]
+            own = [row for row in expected.get(str(checker["id"]), [])
+                   if str(row.get("index")) in set(indexes)]
+            segments = []
+            if own:
+                text = "\n".join(f"- {row['index']}：{row['content']}" for row in own)
+                segments.append(Segment("append", "## 你写下的预期\n" + text, name="预期"))
+            calls.append({
+                "participant": checker, "kind": "fidelity", "turn_kind": "fidelity",
+                "charter": charter, "segments": segments,
+                "instruction": FIDELITY_INSTRUCTION + _indexes_line("核对", indexes)
+                               + (f"\n上一轮发现这些需求凭空新增，请重新核对它们是否仍然没有账本"
+                                  f"依据（需求已删除或依据已补上就不再报）："
+                                  + "、".join(previous_added) if previous_added else ""),
+                "structured": _validate_fidelity(indexes), "turn_round": _flow(mtg)})
+        results = await speak_many(mtg, calls)
+        rows: list[dict] = []
+        added: list[dict] = []
+        for checker, result in zip(active, results):
+            data = result["data"]
+            for item in data.get("checks") or []:
+                rows.append({"index": str(item.get("index")), "result": item.get("result"),
+                             "reason": str(item.get("reason") or ""),
+                             "checker": checker["display_name"]})
+            for item in data.get("added") or []:
+                added.append({"requirement": str(item.get("requirement")),
+                              "reason": str(item.get("reason")),
+                              "checker": checker["display_name"]})
+        _finish_step(mtg, "fidelity", fidelity=rows, added=added)
+        return advance("quality")
+    def _assignments(self, mtg, checkers: list[dict], points: list[dict],
+                     coverage: str) -> dict[int, list[str]]:
+        """每个核对者本轮要核对的决策点。
+
+        full 是全部已了结的决策点；partitioned 是它在讨论会议的账本里表过态的那些，
+        需求方代理仍然核对全部（确认会议的参会者是讨论会议那几行的副本，按角色键对应回去）。
+        """
+        closed = _closed_indexes(points)
+        if coverage != "partitioned":
+            return {checker["id"]: list(closed) for checker in checkers}
+        discussion = _discussion(mtg)
+        base = store.list_participants(discussion["id"]) if discussion else []
+        assignments: dict[int, list[str]] = {}
+        for checker in checkers:
+            source = next((row for row in base
+                           if row["role_key"] == checker["role_key"]
+                           and row["display_name"] == checker["display_name"]), None)
+            if source is None:
+                # 对应不回去（临时角色等）：按全员核对处理，宁可多查也不漏查
+                assignments[checker["id"]] = list(closed)
+                continue
+            if source["mode"] == "proxy":
+                assignments[checker["id"]] = list(closed)
+                continue
+            assignments[checker["id"]] = [
+                point["index"] for point in points
+                if point["index"] in closed
+                and str(source["id"]) in (point.get("stances") or {})]
+        return assignments
+
+    def _incremental_assignments(self, mtg,
+                                 assignments: dict[int, list[str]]) -> dict[int, list[str]]:
+        """第 2 轮起只看上一轮标为走样或遗漏的决策点，以及改动过的需求所引用的决策点。"""
+        state = mtg.state()
+        targets: set[str] = set()
+        for item in state.get("last_items") or []:
+            if item.get("kind") in ("distorted", "missing") and item.get("index"):
+                targets.add(str(item["index"]))
+        changed = set(state.get("changed") or [])
+        if changed:
+            for row in confirm_rules.parse_matrix(_spec_text(mtg)):
+                if row["requirement"] in changed:
+                    targets |= set(row["points"])
+        return {pid: [index for index in indexes if index in targets]
+                for pid, indexes in assignments.items()}
+
+    async def step_quality(self, mtg):
+        if _done(mtg, "quality"):
+            return advance("merge")
+        state = mtg.state()
+        if state.get("mechanical"):
+            return advance("merge")
+        requirement_ids = [item["id"]
+                           for item in confirm_rules.parse_requirements(_spec_text(mtg))]
+        allowed = requirement_ids
+        if _flow(mtg) > 1:
+            marked = {item.get("requirement") for item in state.get("last_items") or []
+                      if item.get("kind") == "quality" and item.get("requirement")}
+            wanted = marked | set(state.get("changed") or [])
+            allowed = [requirement for requirement in requirement_ids if requirement in wanted]
+            if not allowed:
+                _finish_step(mtg, "quality", quality_issues=[])
+                return advance("merge")
+        reviewers = _quality_reviewers(mtg)
+        instruction = QUALITY_INSTRUCTION
+        if _flow(mtg) > 1:
+            instruction += "\n本轮只看这些需求：" + "、".join(allowed) + "。"
+        results = await speak_many(mtg, [
+            {"participant": reviewer, "kind": "quality", "turn_kind": "quality",
+             "charter": _charter(mtg), "segments": [], "instruction": instruction,
+             "structured": _validate_quality, "turn_round": _flow(mtg)}
+            for reviewer in reviewers])
+        issues: list[dict] = []
+        seen: set[tuple] = set()
+        for result in results:
+            for raw in result["data"].get("issues") or []:
+                requirement = str(raw.get("requirement") or "").strip()
+                if requirement not in requirement_ids:
+                    continue                          # 不是现有需求编号：不计入
+                if _flow(mtg) > 1 and requirement not in allowed:
+                    continue
+                normalized = review_rules.normalize_issue({
+                    "severity": raw.get("severity"), "category": "wording",
+                    "location": requirement, "problem": raw.get("problem"),
+                    "suggestion": raw.get("suggestion")})
+                key = (requirement, normalized["problem"], normalized["severity"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized["criterion"] = str(raw.get("criterion") or "")
+                issues.append(normalized)
+        _finish_step(mtg, "quality", quality_issues=issues)
+        return advance("merge")
+
+    # ---------- 汇总与裁决 ----------
+    async def step_merge(self, mtg):
+        if _done(mtg, "merge"):
+            return advance("verdict")
+        state = mtg.state()
+        flow = _flow(mtg)
+        intake_items = [item for item in state.get("items") or []
+                        if item.get("origin") == "user"
+                        and int(item.get("round") or 0) == flow]
+        if flow > 1:
+            # 没落到具体需求上的用户意见，程序无法判定它是否已经被处理，不能默认它已解决：
+            # 上一轮的这类条目原样带到本轮（编号与内容不变，只把轮次记为本轮），
+            # 清单因此非空，回流后不会变成"通过、0 条待办"；轮次用尽后走升级确认点由人决定。
+            existing_ids = {item.get("id") for item in intake_items}
+            intake_items.extend(
+                {**item, "round": flow} for item in state.get("last_items") or []
+                if item.get("origin") == "user" and not item.get("requirement")
+                and item.get("id") not in existing_ids)
+        program = _program_items(mtg)
+        # 详设 §9.4：机械核对不过时不调模型，清单是纯程序结果，直接进入编号入账
+        if program and not state.get("mechanical"):
+            # 详设 §9.2：主席把各方的核对条目去重归类，走样与遗漏的还要补上落点。
+            # 行首序号是去重的凭据：quality/added 条目没有决策点编号，按序号标记重复
+            listing = "\n".join(f"- {position}。 [{KIND_NAMES.get(item['kind'], item['kind'])}] "
+                                f"{_where(item)}：{item.get('problem') or ''}"
+                                for position, item in enumerate(program, start=1))
+            found = store.find_turn(mtg.meeting_id, phase="merge", round=flow,
+                                    kind="confirm_merge", speaker_id=_chair(mtg)["id"])
+            data = found["data"] if found else (await speak(
+                mtg, _chair(mtg), kind="confirm_merge", turn_kind="confirm_merge",
+                charter=_charter(mtg),
+                segments=[Segment("append", f"## 待归类的核对条目\n{listing}", name="条目清单")],
+                instruction=MERGE_INSTRUCTION, structured=_validate_merge(),
+                turn_round=flow))["data"]
+            fills: dict[str, str] = {}
+            for row in data.get("items") or []:
+                index = str(row.get("index") or "").strip()
+                requirement = str(row.get("requirement") or "").strip()
+                if index and requirement:
+                    fills.setdefault(index, requirement)
+            duplicates = {str(row) for row in data.get("duplicates") or []}
+            for item in program:
+                if item["kind"] in ("distorted", "missing") and not item["requirement"]:
+                    item["requirement"] = fills.get(item["index"], "")
+            # 只有质量意见与凭空新增可能被多名核对者重复报出；其余类别的序号被点名也不删
+            if duplicates:
+                program = [item for position, item in enumerate(program, start=1)
+                           if item["kind"] not in ("quality", "added")
+                           or str(position) not in duplicates]
+        number = _next_number(state.get("items") or [], state.get("last_items") or [])
+        # 已入账的同一批条目沿用旧编号（按轮次、出处、需求、问题签名匹配）：崩溃重入
+        # 重跑汇总时不会以新编号重复入账，也不会把已入账的条目挤掉。
+        existing = {(item.get("requirement") or "", item.get("index") or "",
+                     item.get("problem") or ""): item
+                    for item in state.get("items") or []
+                    if item.get("origin") == "program" and int(item.get("round") or 0) == flow}
+        merged: list[dict] = []
+        for item in program:
+            hit = existing.get((item.get("requirement") or "", item.get("index") or "",
+                                item.get("problem") or ""))
+            if hit is not None:
+                merged.append(hit)
+                continue
+            item = {**item, "id": f"C{number}", "origin": "program", "round": flow}
+            number += 1
+            merged.append(item)
+        _finish_step(mtg, "merge", items=list(intake_items) + merged)
+        return advance("verdict")
+
+    async def step_verdict(self, mtg):
+        if _done(mtg, "verdict"):
+            return advance("report")
+        line = str(mtg.params().get("min_blocking_severity") or "major")
+        items = _items(mtg)
+        verdict = confirm_rules.confirm_verdict(items, blocking_line=line)
+        already = int(mtg.state().get("verdict_round") or 0) == _flow(mtg)
+        mtg.set_state(verdict=verdict, verdict_round=_flow(mtg))
+        if not already:                               # 升级确认点恢复时不再重复发事件
+            await emit(mtg.run_id, "review_verdict", mtg.node_id, {
+                "meeting_id": mtg.meeting_id, "round": _flow(mtg), "protocol": "confirm",
+                "verdict": verdict, "blocking": len(_blocking(items, line)),
+                "issues": len(items)})
+        if verdict == "pass":
+            _mark(mtg, "verdict")
+            return advance("report")
+        feedback = "需求确认不通过，请按清单逐条修改：\n" + _items_text(items)
+        result = await reroute_or_escalate(
+            mtg, ["requirement"], feedback,
+            title="需求确认不通过", description=feedback[:3000],
+            summary="需求确认结论：不通过，回流需求分析师")
+        if result is None:                            # 人在确认点上接受现状
+            mtg.set_state(accepted_by_user=True)
+            _mark(mtg, "verdict")
+            return advance("report")
+        if result.action == "suspend":                # 回流轮次用尽：等人决定，决定前不推进
+            return result
+        # 回流标记（rework_pending/awaiting_rework）由编排器在接受回流之后写进会议状态：
+        # 这里提前写的话，进程在编排器接受之前中断，重入会加一轮去等一场没有发起的返工。
+        # 裁决这步也不记完成标记：重入时从本步重跑，程序重新裁决并再次发出回流指令。
+        mtg.set_state(last_items=items)
+        return result
+
+    # ---------- 报告 ----------
+    async def step_report(self, mtg):
+        state = mtg.state()
+        items = _items(mtg)
+        verdict = str(state.get("verdict") or "")
+        accepted_by_user = bool(state.get("accepted_by_user"))
+        precheck_ok, precheck_reason = self._precheck(verdict, accepted_by_user)
+        mtg.set_state(precheck_ok=precheck_ok, precheck_reason=precheck_reason)
+        report = self._write_report(mtg, items, verdict, accepted_by_user)
+        line = str(mtg.params().get("min_blocking_severity") or "major")
+        blocking = _blocking(items, line)
+        summary = (f"需求确认会议完成：结论 {'通过' if verdict == 'pass' else '不通过'}，"
+                   f"{len(items)} 条待办，{len(blocking)} 条阻塞")
+        # 纪要接口按会议记下的版本取；摘要与阻塞数留给 /runs/{id}/review 与指标按报告取
+        mtg.set_state(minutes_version=report["version"], summary=summary, blocking=len(blocking))
+        return done(summary, verdict=verdict, precheck_ok=precheck_ok,
+                    precheck_reason=precheck_reason, accepted_by_user=accepted_by_user,
+                    report=report, items=len(items), blocking=len(blocking))
+
+    def _precheck(self, verdict: str, accepted_by_user: bool) -> tuple[bool, str]:
+        if verdict == "pass" or accepted_by_user:
+            return True, ""
+        return False, "需求确认不通过，需求分析师需要按清单修改"
+
+    def _write_report(self, mtg, items: list[dict], verdict: str,
+                      accepted_by_user: bool) -> dict:
+        state = mtg.state()
+        latest = latest_artifact(mtg.run_id, "requirement") or {}
+        mechanical = list(state.get("mechanical") or [])
+        fidelity = list(state.get("fidelity") or [])
+        quality = list(state.get("quality_issues") or [])
+        conclusion = [f"结论：{'通过' if verdict == 'pass' else '不通过'}。"]
+        if accepted_by_user:
+            conclusion.append("人在回流轮次用尽的确认点上接受了现状。")
+        sections = [
+            ("程序核对结果", "\n".join(f"- {finding}" for finding in mechanical) or "全部通过"),
+            ("逐决策点的忠实性结论", _fidelity_table(fidelity)),
+            ("质量评审意见", _quality_table(quality)),
+            ("结论", "\n".join(conclusion)),
+            ("核对清单", _items_table(items)),
+        ]
+        return minutes.write_minutes(
+            mtg.run_id, kind="review", created_by="chair", inputs=["requirement"],
+            meeting=mtg.meeting(), participants=mtg.participants(),
+            points=_ledger_points(mtg), turns=store.list_turns(mtg.meeting_id, limit=100_000),
+            extra_sections=sections, meta={"review_type": "requirement"})
+
+
+def _fidelity_table(rows: list[dict]) -> str:
+    if not rows:
+        return "（无）"
+    lines = ["| 决策点 | 结论 | 理由 | 核对者 |", "|---|---|---|---|"]
+    for row in rows:
+        lines.append(f"| {_cell(row.get('index'))} | "
+                     f"{RESULT_NAMES.get(row.get('result'), row.get('result'))} | "
+                     f"{_cell(row.get('reason'))} | {_cell(row.get('checker'))} |")
+    return "\n".join(lines)
+
+
+def _quality_table(rows: list[dict]) -> str:
+    if not rows:
+        return "（无）"
+    lines = ["| 需求 | 检查维度 | 级别 | 问题 | 建议 |", "|---|---|---|---|---|"]
+    for row in rows:
+        severity = review_rules.SEVERITY_NAMES.get(row.get("severity"), row.get("severity"))
+        lines.append(f"| {_cell(row.get('location'))} | {_cell(row.get('criterion'))} | "
+                     f"{severity} | {_cell(row.get('problem'))} | "
+                     f"{_cell(row.get('suggestion'))} |")
+    return "\n".join(lines)
+
+
+def _items_table(items: list[dict]) -> str:
+    if not items:
+        return "（无）"
+    lines = ["| 编号 | 类别 | 需求 | 决策点 | 问题 | 建议 |", "|---|---|---|---|---|---|"]
+    for item in items:
+        lines.append(f"| {item.get('id', '')} | "
+                     f"{KIND_NAMES.get(item.get('kind'), item.get('kind'))} | "
+                     f"{_cell(item.get('requirement'))} | {_cell(item.get('index'))} | "
+                     f"{_cell(item.get('problem'))} | {_cell(item.get('suggestion'))} |")
+    return "\n".join(lines)

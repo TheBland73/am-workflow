@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Button, Checkbox, Drawer, Empty, Input, Modal, Spin, Tag, message,
+  Button, Checkbox, Drawer, Empty, Input, Modal, Spin, Table, Tag, message,
 } from "antd";
 import { Link, useParams } from "react-router-dom";
 import { api, subscribeRun } from "../api/client";
 import type {
-  ArtifactRecord, Node, Snapshot, StreamEvent,
+  ArtifactRecord, Gate, Node, Snapshot, StreamEvent,
 } from "../api/types";
 import Dial from "../canvas/Dial";
 import ExecutionMap from "../canvas/ExecutionMap";
@@ -14,13 +14,29 @@ import { heldKeys } from "../canvas/graphLayout";
 import GateConsole from "../panels/GateConsole";
 import NodeInspector from "../panels/NodeInspector";
 import type { NodeActionRequest } from "../panels/NodeInspector";
+import {
+  decidedByLabel, isSameFamilyDecision, phaseLabel, SAME_FAMILY_HINT,
+  statusLabel as pointStatusLabel, verdictLabel,
+} from "../panels/meetingLabels";
 
 const ARTIFACT_LABELS: Record<string, string> = {
-  idea: "想法", discussion: "讨论", proposal: "方案", review: "评审",
+  idea: "想法", discussion: "会议纪要", proposal: "方案", review: "评审与确认报告",
   requirement: "需求", design: "设计", task: "任务", test: "测试", changelog: "交付日志",
 };
 const ARTIFACT_KINDS = Object.keys(ARTIFACT_LABELS);
 const SEV_LABEL: Record<string, string> = { blocker: "阻塞", major: "重要", minor: "建议" };
+
+const MEETING_STATUS_LABEL: Record<string, string> = {
+  active: "进行中", suspended: "已挂起", waiting_rework: "等待返工",
+  completed: "已完成", abandoned: "已放弃",
+};
+
+/** 这些事件会改变会议详情（步骤、发言、确认点状态），收到后失效会议查询。 */
+const MEETING_EVENTS = new Set([
+  "meeting_started", "meeting_phase", "meeting_turn_finished", "meeting_ledger_updated",
+  "meeting_suspended", "meeting_resumed", "meeting_finished",
+  "meeting_intervention_injected", "checkpoint_decided", "gate_decided",
+]);
 // 事件抽屉里 node_id 改为显示 node_key，比数字列宽：仅本抽屉内联放宽，不改全局 .log-line。
 const LOG_LINE_STYLE = { gridTemplateColumns: "58px 74px minmax(0, 1fr)" };
 
@@ -57,6 +73,13 @@ function durationText(start: string | null, end: string | null) {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+/** 评审面板标题：前半段按 report 的 review_type 区分方案评审/需求确认，旧 REVIEW 节点兜底回代码评审。 */
+function reviewHeading(reviewType?: "proposal" | "requirement") {
+  if (reviewType === "proposal") return { eyebrow: "PROPOSAL REVIEW", title: "方案评审" };
+  if (reviewType === "requirement") return { eyebrow: "REQUIREMENT REVIEW", title: "需求确认" };
+  return { eyebrow: "CODE REVIEW", title: "代码评审" };
+}
+
 function eventText(event: StreamEvent) {
   const payload = event.payload ?? {};
   const key = String(payload.node_key ?? "");
@@ -85,7 +108,49 @@ function eventText(event: StreamEvent) {
     case "task_updated": return `更新任务 ${String(payload.task_uid ?? "")}`;
     case "node_tool_call": return `${key} 调用 ${String(payload.name ?? "")}`;
     case "node_tool_result": return `${key} 工具返回${payload.is_error ? "（错误）" : ""}`;
+    case "node_log": return String(payload.message ?? "");
     case "memory_written": return `写入记忆 ${String(payload.subject ?? "")}`;
+    // 会议式前半段（详设 §12.5）
+    case "meeting_started": return "会议开始";
+    case "meeting_phase":
+      return `进入：${phaseLabel(String(payload.phase ?? ""))}（第 ${String(payload.round ?? "")} 轮）`;
+    case "meeting_turn_started": return `${String(payload.speaker ?? "")} 开始发言`;
+    case "meeting_turn_finished":
+      return `${String(payload.speaker ?? "")}：${String(payload.summary ?? "")}`;
+    case "meeting_ledger_updated":
+      return payload.roster
+        ? "参会名单已更新"
+        : `账本更新（第 ${String(payload.version ?? "")} 版）`;
+    case "meeting_issue_updated": return `评审意见改判：${payload.accepted ? "已采纳" : "不采纳"}`;
+    case "meeting_suspended": return "会议在确认点挂起";
+    case "meeting_resumed": return "会议续开";
+    case "meeting_intervention_queued": return "插话已排队";
+    case "meeting_intervention_injected": return "插话已注入";
+    case "meeting_finished": return "会议完成";
+    case "checkpoint_decided": {
+      const text = `确认点已由${decidedByLabel(String(payload.decided_by ?? ""))}决定`;
+      return isSameFamilyDecision(payload.decision)
+        ? `${text}（${SAME_FAMILY_HINT}）`
+        : text;
+    }
+    case "review_round_started": return `评审第 ${String(payload.round ?? "")} 轮开始`;
+    case "review_verdict": return `结论：${verdictLabel(String(payload.verdict ?? ""))}`;
+    case "review_blocked":
+      return `评审第 ${String(payload.round ?? "")}/${String(payload.max_rounds ?? "")} 轮发现阻塞${payload.escalated ? "，已升级人工处理" : ""}`;
+    case "review_rework": {
+      const reworked = Array.isArray(payload.targets) ? payload.targets.length : 0;
+      return `人工回退 ${reworked} 个任务`;
+    }
+    case "context_compacted":
+      return `上下文已压缩（${String(payload.before_tokens ?? "")} → ${String(payload.after_tokens ?? "")} token）`;
+    case "context_prefix_changed": {
+      const segments = Array.isArray(payload.segments) ? payload.segments.map(String) : [];
+      return `冻结的内容被改动：${segments.join("、") || "—"}`;
+    }
+    case "node_rerouted": {
+      const targets = Array.isArray(payload.targets) ? payload.targets.map(String) : [];
+      return `定点回流到 ${targets.join("、") || "—"}（第 ${String(payload.round ?? "")} 轮）`;
+    }
     default: return event.type;
   }
 }
@@ -105,6 +170,9 @@ export default function RunPage() {
   const [reviewOpen, setReviewOpen] = useState(false);
   const [reworkUids, setReworkUids] = useState<string[]>([]);
   const [reworkNote, setReworkNote] = useState("");
+  const [meetingRef, setMeetingRef] = useState<{ nodeId: number; meetingId: number } | null>(null);
+  const [meetingLoading, setMeetingLoading] = useState(false);
+  const [intervention, setIntervention] = useState("");
 
   useEffect(() => {
     selectedNodeIdRef.current = selectedNodeId;
@@ -155,6 +223,40 @@ export default function RunPage() {
 
   const review = reviewQuery.data;
 
+  const meetingDetailQuery = useQuery({
+    queryKey: ["meeting", runId, meetingRef?.meetingId],
+    queryFn: () => api.meetingDetail(runId, meetingRef!.meetingId),
+    enabled: Boolean(meetingRef),
+    refetchInterval: (query) => {
+      const status = query.state.data?.meeting.status;
+      return status === "active" || status === "waiting_rework" ? 5000 : false;
+    },
+  });
+  const meetingTurnsQuery = useQuery({
+    queryKey: ["meeting-turns", runId, meetingRef?.meetingId],
+    // 后端按序号升序取"前 N 条"：要最近的 50 条，从总条数倒推起点
+    queryFn: () => api.meetingTurns(
+      runId, meetingRef!.meetingId,
+      Math.max(0, (meetingDetailQuery.data?.turn_count ?? 0) - 50), 50,
+    ),
+    enabled: Boolean(meetingRef) && meetingDetailQuery.isSuccess,
+    refetchInterval: () => {
+      const status = meetingDetailQuery.data?.meeting.status;
+      return status === "active" || status === "waiting_rework" ? 5000 : false;
+    },
+  });
+
+  const intervene = useMutation({
+    mutationFn: () => api.intervene(runId, meetingRef!.meetingId, intervention.trim()),
+    onSuccess: () => {
+      messageApi.success("插话已排队，会议会在下一步处理");
+      setIntervention("");
+      client.invalidateQueries({ queryKey: ["meeting", runId, meetingRef?.meetingId] });
+      client.invalidateQueries({ queryKey: ["meeting-turns", runId, meetingRef?.meetingId] });
+    },
+    onError: (error: Error) => messageApi.error(error.message),
+  });
+
   useEffect(() => {
     // 只在评审阻塞时预选要返工的任务；通过后清空，避免把正常评审误显示成待返工。
     setReworkUids(review?.verdict === "block" ? review?.targets ?? [] : []);
@@ -193,6 +295,10 @@ export default function RunPage() {
         client.invalidateQueries({ queryKey: ["snapshot", runId] });
         client.invalidateQueries({ queryKey: ["metrics", runId] });
         client.invalidateQueries({ queryKey: ["review", runId] });
+        if (MEETING_EVENTS.has(event.type)) {
+          client.invalidateQueries({ queryKey: ["meeting", runId] });
+          client.invalidateQueries({ queryKey: ["meeting-turns", runId] });
+        }
         return;
       }
       if (event.type === "node_token") return;
@@ -204,6 +310,10 @@ export default function RunPage() {
       client.invalidateQueries({ queryKey: ["snapshot", runId] });
       client.invalidateQueries({ queryKey: ["metrics", runId] });
       client.invalidateQueries({ queryKey: ["review", runId] });
+      if (MEETING_EVENTS.has(event.type)) {
+        client.invalidateQueries({ queryKey: ["meeting", runId] });
+        client.invalidateQueries({ queryKey: ["meeting-turns", runId] });
+      }
     }, 0);
     return unsubscribe;
   }, [client, runId]);
@@ -292,8 +402,25 @@ export default function RunPage() {
   };
 
   // 选中节点：再次点击同一节点取消；详情由 nodeQuery 按 selectedNodeId 拉取。
-  const openNode = (node: Node) => {
+  // 会议节点同时打开会议详情抽屉（账本、参会者、发言、插话）。
+  const openNode = async (node: Node) => {
     setSelectedNodeId((current) => (current === node.id ? null : node.id));
+    if (node.type !== "MEETING") return;
+    setMeetingLoading(true);
+    try {
+      const { items } = await api.listMeetings(runId);
+      const mine = [...items].reverse().find((item) => item.node_id === node.id);
+      if (!mine) {
+        messageApi.error("这个会议节点还没有会议记录");
+        return;
+      }
+      setIntervention("");
+      setMeetingRef({ nodeId: node.id, meetingId: mine.id });
+    } catch (error) {
+      messageApi.error((error as Error).message);
+    } finally {
+      setMeetingLoading(false);
+    }
   };
 
   // 节点动作：短事务端点由后端实现，成功后刷新快照/指标/该节点详情（契约 §8）。
@@ -541,7 +668,10 @@ export default function RunPage() {
       {review?.available ? (
         <section className="ef-panel review-panel">
           <div className="review-title">
-            <h2><span className="ef-eyebrow">CODE REVIEW</span>代码评审</h2>
+            <h2>
+              <span className="ef-eyebrow">{reviewHeading(review.review_type).eyebrow}</span>
+              {reviewHeading(review.review_type).title}
+            </h2>
             <div className="review-figs">
               <b className={review.verdict === "pass" ? "is-pass" : "is-block"}>
                 {review.verdict === "pass" ? "PASS" : "BLOCK"}
@@ -555,9 +685,9 @@ export default function RunPage() {
             </div>
           </div>
           <p className="review-summary">{review.summary || "评审未给出摘要。"}</p>
-          {review.issues.length ? (
+          {review.issues?.length ? (
             <ul className="review-issues">
-              {review.issues.map((issue, index) => {
+              {review.issues?.map((issue, index) => {
                 const uid = issue.task_uid || "";
                 const checked = Boolean(uid) && reworkUids.includes(uid);
                 return (
@@ -600,7 +730,7 @@ export default function RunPage() {
                 onChange={(event) => setReworkNote(event.target.value)}
               />
             ) : (
-              <em className="review-locked">评审已归档，不可再回退</em>
+              <em className="review-locked">没有可回退的任务</em>
             )}
             <Button size="small" disabled={!review.body} onClick={() => setReviewOpen(true)}>
               查看报告
@@ -617,7 +747,7 @@ export default function RunPage() {
             </Button>
           </div>
           <div className="review-metricline">
-            <span>问题 {metrics?.review?.issues ?? review.issues.length}</span>
+            <span>问题 {metrics?.review?.issues ?? review.issues?.length ?? 0}</span>
             <span>阻塞 {metrics?.review?.severities?.blocker ?? 0}</span>
             <span>重要 {metrics?.review?.severities?.major ?? 0}</span>
             <span>建议 {metrics?.review?.severities?.minor ?? 0}</span>
@@ -700,7 +830,7 @@ export default function RunPage() {
           {visibleLogEvents.map((event, index) => (
             <div
               key={`${event.seq ?? index}-${event.type}`}
-              className={`log-line ${event.type.includes("fail") || event.type.includes("error") ? "is-error" : ""}`}
+              className={`log-line ${event.type.includes("fail") || event.type.includes("error") || event.type === "context_prefix_changed" ? "is-error" : ""}`}
               style={LOG_LINE_STYLE}
             >
               <time>{event.ts?.slice(11, 19) ?? "--:--:--"}</time>
@@ -736,6 +866,117 @@ export default function RunPage() {
           setLogOpen(true);
         }}
       />
+
+      <Drawer
+        open={Boolean(meetingRef) || meetingLoading}
+        onClose={() => {
+          setMeetingRef(null);
+          setMeetingLoading(false);
+          setIntervention("");
+        }}
+        title={meetingDetailQuery.data
+          ? `${nodes.find((node) => node.id === meetingRef?.nodeId)?.name ?? "会议"} · 会议详情`
+          : "会议详情"}
+        width={880}
+      >
+        {meetingLoading && <Spin />}
+        {!meetingLoading && meetingDetailQuery.isLoading && <Spin />}
+        {meetingDetailQuery.data && (() => {
+          const detail = meetingDetailQuery.data;
+          const turns = (meetingTurnsQuery.data?.items ?? []).slice(-50);
+          const status = detail.meeting.status;
+          const canIntervene = status === "active" || status === "waiting_rework";
+          const disabledReason = status === "suspended"
+            ? "会议在确认点挂起，处理完确认点后才能插话。"
+            : status === "completed"
+              ? "会议已结束，不能再插话。"
+              : status === "abandoned"
+                ? "会议已放弃，不能再插话。"
+                : "";
+          return (
+            <div className="meeting-detail">
+              <p className="ef-facts">
+                <span>步骤 <b>{phaseLabel(detail.meeting.phase)}</b></span>
+                <span>轮次 <b>{detail.meeting.round}</b></span>
+                <span>状态 <b>{MEETING_STATUS_LABEL[status] ?? status}</b></span>
+                <span>发言 <b>{detail.turn_count}</b></span>
+              </p>
+
+              <h4>参会者</h4>
+              <ul className="ef-facts" style={{ display: "block" }}>
+                {detail.participants.filter((item) => item.status === "active").map((item) => (
+                  <li key={item.id}>
+                    {item.display_name}
+                    <span style={{ color: "var(--ef-ink-2)" }}>
+                      {" "}· {item.mode}
+                      {item.role_key ? ` · ${item.role_key}` : ""}
+                      {item.model_id ? ` · 模型 #${item.model_id}` : ""}
+                    </span>
+                  </li>
+                ))}
+                {detail.participants.filter((item) => item.status === "active").length === 0 && (
+                  <li>（还没有参会者）</li>
+                )}
+              </ul>
+
+              <h4>决策点账本</h4>
+              <Table
+                size="small"
+                rowKey="id"
+                pagination={false}
+                dataSource={detail.decision_points}
+                locale={{ emptyText: "账本还是空的" }}
+                columns={[
+                  { title: "编号", dataIndex: "index", width: 70 },
+                  {
+                    title: "状态", dataIndex: "status", width: 100,
+                    render: (value: string) => pointStatusLabel(value),
+                  },
+                  { title: "标题", dataIndex: "title" },
+                  {
+                    title: "结论", dataIndex: "conclusion",
+                    render: (value: string | null) => value || "—",
+                  },
+                ]}
+              />
+
+              <h4>最近五十条发言</h4>
+              <div className="node-messages" style={{ maxHeight: 340, overflow: "auto" }}>
+                {turns.map((turn) => (
+                  <div key={turn.id} className="node-msg">
+                    <b>#{turn.seq} {turn.speaker_name}</b>
+                    <pre>{turn.content.slice(0, 1200)}</pre>
+                  </div>
+                ))}
+                {turns.length === 0 && <Empty description="还没有发言" image={Empty.PRESENTED_IMAGE_SIMPLE} />}
+              </div>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "flex-start" }}>
+                <Input.TextArea
+                  value={intervention}
+                  onChange={(event) => setIntervention(event.target.value)}
+                  placeholder={canIntervene ? "给会议插一句话；主持人会在下一步回应。" : disabledReason}
+                  disabled={!canIntervene}
+                  autoSize={{ minRows: 2, maxRows: 4 }}
+                />
+                <Button
+                  type="primary"
+                  loading={intervene.isPending}
+                  disabled={!canIntervene || !intervention.trim()}
+                  onClick={() => intervene.mutate()}
+                >
+                  插话
+                </Button>
+              </div>
+              {!canIntervene && disabledReason && (
+                <p style={{ color: "var(--ef-ink-2)", fontSize: 12, marginTop: 6 }}>
+                  {disabledReason}
+                </p>
+              )}
+            </div>
+          );
+        })()}
+      </Drawer>
 
       <Modal
         open={Boolean(artifact)}

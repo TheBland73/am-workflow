@@ -17,7 +17,7 @@ const COLORS: Record<string, { bg: string; border: string; text: string }> = {
 };
 
 const TYPE_LABEL: Record<string, string> = {
-  PASS: "入口", AGENT: "智能体", VERIFY: "验证", HUMAN_GATE: "人工门",
+  PASS: "入口", AGENT: "智能体", MEETING: "会议", VERIFY: "验证", HUMAN_GATE: "人工门",
   TASKGRAPH: "任务图", DECISION: "决策", RESTORE: "恢复", CHECKPOINT: "检查点",
 };
 

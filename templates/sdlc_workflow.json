@@ -1,72 +1,126 @@
 {
   "key": "sdlc_v1",
-  "name": "标准软件研发流程（W1）",
-  "description": "想法 → 讨论 → 方案 → 需求 → 设计 → 任务分解 → 并行执行 → 交付；含 5 个人工门。",
+  "name": "标准软件研发流程",
+  "description": "想法 → 讨论会议 → 建设方案 → 评审会议 → 需求规格 → 需求确认 → 设计 → 任务 → 执行 → 交付；确认点默认人工，可配置为模型判定。",
   "phases": [
     {"key": "idea", "name": "想法"},
     {"key": "discussion", "name": "讨论"},
     {"key": "proposal", "name": "方案"},
+    {"key": "review", "name": "多方评价"},
     {"key": "requirement", "name": "需求"},
     {"key": "design", "name": "设计"},
     {"key": "tasks", "name": "任务分解"},
     {"key": "execution", "name": "执行"},
     {"key": "delivery", "name": "交付"}
   ],
+  "automation_levels": {
+    "L1": {"clarify": "human", "roster": "human", "consensus": "human",
+           "proposal": "human", "review": "human", "requirement": "human"},
+    "L2": {"clarify": "human", "roster": "human", "consensus": "program",
+           "proposal": "human", "review": "human", "requirement": "human"},
+    "L3": {"clarify": "proxy", "roster": "auto", "consensus": "program_fallback",
+           "proposal": "auto", "review": "model", "requirement": "model"}
+  },
+  "params": {
+    "discussion": {
+      "participants_min": {"type": "int", "default": 3, "min": 1, "max": 99, "title": "参会人数下限",
+                           "recommend": "3–5", "hint": "建议 3–5 人；超过 10 人收益很小，耗时线性增长"},
+      "participants_max": {"type": "int", "default": 5, "min": 1, "max": 99, "title": "参会人数上限",
+                           "recommend": "3–5", "hint": "建议 3–5 人；上下限相等即为固定人数"},
+      "rounds_max": {"type": "int", "default": 20, "min": 1, "max": 99, "title": "讨论轮次上限",
+                     "recommend": "2–5", "hint": "通常 2–5 轮内收敛；这是兜底值"},
+      "exchanges_per_point": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "每个决策点的交锋次数（跨轮累计）"},
+      "stall_rounds": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "停滞判定轮数",
+                       "hint": "连续几轮无人改变立场就进入共识确认点"},
+      "proposal_check_rounds": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "方案复核轮次上限"},
+      "closure_rule": {"type": "str", "default": "unanimous", "choices": ["unanimous", "no_objection", "facilitator_rules"],
+                       "title": "闭合规则"},
+      "proxy_enabled": {"type": "bool", "default": false, "title": "启用需求方代理"},
+      "full_history": {"type": "bool", "default": false, "title": "全量历史",
+                       "hint": "仅供对照实验：每一轮带上此前所有轮次的逐字发言；关闭时为拼装视图"}
+    },
+    "review": {
+      "reviewers_min": {"type": "int", "default": 0, "min": 0, "max": 99, "title": "评审者人数下限",
+                        "hint": "0 表示不限制"},
+      "reviewers_max": {"type": "int", "default": 0, "min": 0, "max": 99, "title": "评审者人数上限",
+                        "hint": "0 表示不限制；建议至少一名评审者绑定不同家族的模型"},
+      "pre_brief": {"type": "bool", "default": true, "title": "评审前先写要点"},
+      "conference": {"type": "bool", "default": true, "title": "开启会议讨论"},
+      "rounds_max": {"type": "int", "default": 3, "min": 1, "max": 9, "title": "复审轮次上限"},
+      "min_blocking_severity": {"type": "str", "default": "major", "choices": ["blocker", "major"],
+                                "title": "阻塞线"}
+    },
+    "confirm": {
+      "coverage": {"type": "str", "default": "full", "choices": ["full", "partitioned"],
+                   "title": "核对覆盖方式"},
+      "expected_first": {"type": "bool", "default": true, "title": "先写预期再核对"},
+      "rounds_max": {"type": "int", "default": 3, "min": 1, "max": 9, "title": "需求复核轮次上限"},
+      "min_blocking_severity": {"type": "str", "default": "major", "choices": ["blocker", "major"],
+                                "title": "阻塞线"}
+    },
+    "gates": {
+      "max_auto_rejects": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "模型连续驳回上限"}
+    },
+    "context": {
+      "compact_at": {"type": "float", "default": 0.8, "min": 0.5, "max": 0.95, "title": "压缩触发阈值"},
+      "compact_to": {"type": "float", "default": 0.5, "min": 0.2, "max": 0.6, "title": "压缩后目标占用",
+                     "hint": "须比触发阈值至少低 20 个百分点"}
+    }
+  },
+  "rubrics": {
+    "proposal": "判断这份建设方案是否可以进入需求拆解：目标与成功标准是否明确；范围与不做什么是否写明；每个决策点是否有结论与依据；待确认问题是否已醒目列出。存在待确认问题不构成驳回的理由，它们会由用户在确认点上决定。",
+    "review": "判断方案是否可以确认：评审结论须为接受，或有条件接受且文字级修订已经过验证；逐条核对仍有争议的决策级意见是否已妥善处理。",
+    "requirement": "判断需求规格是否可以确认：确认结论须为通过；抽查追踪矩阵，确认没有追溯不到决策点的需求，也没有被遗漏的已了结决策点。",
+    "artifact": "判断这份工件是否完整、内部一致、可供下一环节直接使用。只依据工件本身与给定的检查单判断。"
+  },
   "nodes": [
     {
       "key": "idea", "type": "PASS", "name": "想法录入", "phase": "idea", "deps": [],
       "config": {}
     },
     {
-      "key": "discuss_pro", "type": "AGENT", "name": "讨论·主张", "phase": "discussion",
-      "deps": ["idea"], "assignee": {"role": "discuss_pro"},
-      "config": {"artifact": "discussion", "append": false,
-                 "instruction": "针对用户想法，提出一条可落地的建设路径（主张）。"}
-    },
-    {
-      "key": "discuss_con", "type": "AGENT", "name": "讨论·质疑", "phase": "discussion",
-      "deps": ["discuss_pro"], "assignee": {"role": "discuss_con"},
-      "config": {"artifact": "discussion", "append": true,
-                 "inputs": ["idea", "discussion"],
-                 "instruction": "阅读已有讨论稿（主张），输出「质疑」部分并追加到讨论稿。"}
-    },
-    {
-      "key": "discuss_response", "type": "AGENT", "name": "讨论·回应", "phase": "discussion",
-      "deps": ["discuss_con"], "assignee": {"role": "discuss_pro"},
-      "config": {"artifact": "discussion", "append": true,
-                 "inputs": ["idea", "discussion"],
-                 "instruction": "阅读讨论稿中的「质疑」部分（Q1..Qn），逐条回应：采纳/不采纳 + 理由 + 调整后的方案。输出「回应」部分并追加到讨论稿。"}
-    },
-    {
-      "key": "discuss_mod", "type": "AGENT", "name": "讨论·主持人蒸馏", "phase": "discussion",
-      "deps": ["discuss_response"], "assignee": {"role": "discuss_mod"},
-      "config": {"artifact": "discussion", "append": true,
-                 "inputs": ["idea", "discussion"],
-                 "instruction": "通读讨论稿全文，追加「共识蒸馏」部分：共识 / 分歧（引用原文，保留分歧）/ 证据 / 未决项。"}
-    },
-    {
-      "key": "proposal", "type": "AGENT", "name": "方案架构师", "phase": "proposal",
-      "deps": ["discuss_mod"], "assignee": {"role": "proposal"},
-      "config": {"artifact": "proposal", "inputs": ["idea", "discussion"],
-                 "instruction": "综合想法与讨论稿，输出建设方案，逐条回应质疑。"}
+      "key": "discuss", "type": "MEETING", "name": "讨论会议", "phase": "discussion",
+      "deps": ["idea"], "assignee": {"role": "facilitator"},
+      "config": {"protocol": "discussion", "artifact": "discussion", "timeout_s": 3600}
     },
     {
       "key": "gate_proposal", "type": "HUMAN_GATE", "name": "方案确认", "phase": "proposal",
-      "deps": ["proposal"],
-      "config": {"artifact": "proposal", "title": "方案确认",
-                 "description": "确认建设方案的范围与路线；驳回时请选择目标节点并写明反馈。"}
+      "deps": ["discuss"],
+      "config": {"artifact": "proposal", "check": "proposal", "title": "方案确认",
+                 "description": "确认建设方案：送 AI 评审（默认）、直接通过（跳过评审），或驳回并写明意见。",
+                 "routes": [{"key": "skip_review", "label": "直接通过（跳过评审）",
+                             "nodes": ["review", "gate_review"],
+                             "description": "不经过评审会议，直接进入需求拆解。"}]}
+    },
+    {
+      "key": "review", "type": "MEETING", "name": "评审会议", "phase": "review",
+      "deps": ["gate_proposal", "discuss"], "assignee": {"role": "review_chair"},
+      "config": {"protocol": "review", "artifact": "review", "timeout_s": 3600,
+                 "round": 1, "max_rounds": 3}
+    },
+    {
+      "key": "gate_review", "type": "HUMAN_GATE", "name": "评审裁决", "phase": "review",
+      "deps": ["review"],
+      "config": {"artifact": "proposal", "check": "review", "title": "评审裁决", "reject_target": "review",
+                 "description": "查看方案与评审报告：通过、编辑方案后通过，或驳回。驳回反馈会作为你提出的评审意见进入下一轮。"}
     },
     {
       "key": "requirement", "type": "AGENT", "name": "需求分析师", "phase": "requirement",
-      "deps": ["gate_proposal"], "assignee": {"role": "requirement"},
-      "config": {"artifact": "requirement", "inputs": ["proposal"],
-                 "instruction": "基于已确认方案产出 EARS 需求规格与验收标准。"}
+      "deps": ["gate_review"], "assignee": {"role": "requirement"},
+      "config": {"artifact": "requirement", "inputs": ["proposal", "discussion"],
+                 "instruction": "基于已确认的建设方案与决策点账本，产出 EARS 需求规格，并在末尾给出需求追踪矩阵与非需求类决策两张表。"}
     },
     {
-      "key": "gate_requirement", "type": "HUMAN_GATE", "name": "需求审查", "phase": "requirement",
-      "deps": ["requirement"],
-      "config": {"artifact": "requirement", "title": "需求审查",
-                 "description": "审查需求是否可验收；可直接编辑后通过。"}
+      "key": "confirm", "type": "MEETING", "name": "需求确认会议", "phase": "requirement",
+      "deps": ["requirement"], "assignee": {"role": "review_chair"},
+      "config": {"protocol": "confirm", "artifact": "review", "timeout_s": 3600,
+                 "round": 1, "max_rounds": 3}
+    },
+    {
+      "key": "gate_requirement", "type": "HUMAN_GATE", "name": "需求确认", "phase": "requirement",
+      "deps": ["confirm"],
+      "config": {"artifact": "requirement", "check": "requirement", "title": "需求确认", "reject_target": "confirm",
+                 "description": "查看需求规格与确认报告：通过、编辑需求后通过，或驳回。"}
     },
     {
       "key": "design", "type": "AGENT", "name": "系统设计师", "phase": "design",

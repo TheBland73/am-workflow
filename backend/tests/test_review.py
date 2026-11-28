@@ -320,3 +320,15 @@ def test_run_review_normalizes_json_and_writes_artifact(monkeypatch) -> None:
     from app.artifacts.store import read_artifact
 
     assert "代码评审报告" in (read_artifact(run_id, "review") or "")
+
+
+def test_review_endpoint_without_any_review_reports_run_status() -> None:
+    """既没有前半段报告工件、也没有 REVIEW 节点的运行：available=False，带运行状态。
+
+    前端 RunReview 类型要求 run_status 字段；这个分支此前写成 status，前端拿到的是空。
+    """
+    with TestClient(app) as client:
+        run_id = _new_run()
+        data = client.get(f"/api/runs/{run_id}/review").json()
+    assert data["available"] is False
+    assert data["run_status"] == "running"

@@ -1,7 +1,7 @@
 """上下文组装与预算截断（模型接入配置设计 §6）。"""
 from __future__ import annotations
 
-from app.models.budget import ContextBudget, truncate_to_tokens
+from app.models.budget import ContextBudget, estimate_tokens, truncate_to_tokens
 
 PLATFORM_RULES = """你是 AM-Workflow 多智能体研发工作流中的角色 Agent。
 
@@ -26,16 +26,35 @@ def build_system(role_prompt: str, memory: str = "", output_rules: str = "") -> 
 def fit_artifacts(artifacts: list[tuple[str, str]], token_budget: int) -> list[tuple[str, str]]:
     if not artifacts:
         return []
-    per = max(1200, token_budget // len(artifacts))
+    share = max(1, token_budget // len(artifacts))
+    # 单件下限只在总量装得下时生效：件数多时 1200 的下限会无上界地顶穿整段预算
+    per = share if 1200 * len(artifacts) > token_budget else max(1200, share)
     return [(label, truncate_to_tokens(text, per)) for label, text in artifacts]
 
 
 def build_user(*, brief: str, artifacts: list[tuple[str, str]] | None = None,
-               feedback: str | None = None, budget: ContextBudget | None = None) -> str:
+               feedback: str | None = None, budget: ContextBudget | None = None,
+               previous: tuple[str, str] | None = None) -> str:
+    """拼用户消息。previous 是修订时的上一版：它要完整保留，不能和其他输入均分预算。
+
+    上一版放不进模型预算时抛 ValueError——截断后当作全文写回会静默丢掉后半篇。
+    """
     sections: list[str] = [f"## 任务\n{brief.strip()}"]
-    if artifacts:
-        limit = budget.section("artifact") if budget else 8000
-        fitted = fit_artifacts(artifacts, limit)
+    limit = budget.section("artifact") if budget else 8000
+    if previous is not None:
+        label, text = previous
+        others = list(artifacts or [])
+        cost = estimate_tokens(text)
+        if cost + 1200 * len(others) > limit:
+            raise ValueError(
+                f"上一版太大（约 {cost} token），在模型预算内无法连同其他输入一起修订")
+        if others:
+            fitted = fit_artifacts(others, max(1, limit - cost))
+            blocks = [f"### {item_label}\n\n{item_text}" for item_label, item_text in fitted]
+            sections.append("## 输入工件\n\n" + "\n\n".join(blocks))
+        sections.append(f"## 上一版（修订基础）\n\n### {label}\n\n{text}")
+    elif artifacts:
+        fitted = fit_artifacts(list(artifacts), limit)
         blocks = [f"### {label}\n\n{text}" for label, text in fitted]
         sections.append("## 输入工件\n\n" + "\n\n".join(blocks))
     if feedback:
