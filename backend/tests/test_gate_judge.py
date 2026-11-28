@@ -86,6 +86,7 @@ _seeded_providers: list[int] = []
 @pytest.fixture(autouse=True)
 def _cleanup_seeded_models():
     init_db()
+    seed_defaults()          # 单独跑本文件时角色模板可能还没 seed 过，不能假设别的文件先跑
     with session_scope() as s:
         judge_row = s.query(AgentTemplate).filter(AgentTemplate.role_key == "judge").one()
         original_binding = judge_row.default_model_id

@@ -29,7 +29,7 @@
                            "recommend": "3–5", "hint": "建议 3–5 人；上下限相等即为固定人数"},
       "rounds_max": {"type": "int", "default": 20, "min": 1, "max": 99, "title": "讨论轮次上限",
                      "recommend": "2–5", "hint": "通常 2–5 轮内收敛；这是兜底值"},
-      "exchanges_per_point": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "每个决策点每轮交锋次数"},
+      "exchanges_per_point": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "每个决策点的交锋次数（跨轮累计）"},
       "stall_rounds": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "停滞判定轮数",
                        "hint": "连续几轮无人改变立场就进入共识确认点"},
       "proposal_check_rounds": {"type": "int", "default": 2, "min": 1, "max": 9, "title": "方案复核轮次上限"},
