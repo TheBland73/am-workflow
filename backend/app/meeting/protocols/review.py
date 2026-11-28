@@ -54,6 +54,10 @@ REVIEW_INSTRUCTION = (
     '{"strengths": ["优点"], "issues": [{"severity": "major", "category": "wording", '
     '"location": "章节或决策点编号", "problem": "哪里有问题", "suggestion": "怎么改"}]}\n'
     "没有问题时 issues 给空数组。")
+# 详设 §8.2：独立评审对照方案与自己写的要点（要点步开了才用这条指令）
+REVIEW_WITH_POINTS_INSTRUCTION = REVIEW_INSTRUCTION.replace(
+    "请对照方案与检查单做一次独立评审。",
+    "请对照方案、检查单与你先前写下的评审要点做一次独立评审。")
 REVIEW_DELTA_INSTRUCTION = (
     "这是增量复审：只核对上一轮每条决策级意见的处理结果，以及改动过的决策点与章节。"
     "另外报告你新看到的问题。只输出一个 JSON 对象：\n"
@@ -437,6 +441,33 @@ def _speaker_for(mtg, issue: dict) -> dict | None:
     return reviewers[0] if reviewers else None
 
 
+def _family_hint(mtg) -> str:
+    """详设 §8.1：没有一名评审者与讨论会议参会者属于不同家族时给一句提示。
+
+    家族判定用 judge.family_of（与裁决模型异构默认同一套口径）；有异家族评审者、
+    或有一侧的模型取不到时返回空。
+    """
+    from app.engine.judge import family_of
+    from app.meeting.calls import _model_for
+    discussion = _discussion(mtg)
+    if discussion is None:
+        return ""
+    base = [row for row in store.list_participants(discussion["id"])
+            if row.get("mode") in ("participant", "facilitator")]
+    base_models = [model.model_name for model in (_model_for(row) for row in base)
+                   if model is not None]
+    reviewer_models = [model.model_name for model in (_model_for(row) for row in
+                                                      mtg.participants("reviewer"))
+                       if model is not None]
+    if not base_models or not reviewer_models:
+        return ""
+    families = {family_of(name) for name in base_models}
+    if any(family_of(name) not in families for name in reviewer_models):
+        return ""
+    return ("评审者与讨论会议的参会者全部同属一个模型家族，评审意见可能有自我偏好，"
+            "建议复核；有异议可以在确认点上驳回")
+
+
 def _patch_round(mtg, step: str) -> None:
     """这一步没有状态产物，只记完成标记。"""
     _mark(mtg, step)
@@ -480,7 +511,9 @@ class ReviewProtocol(MeetingProtocol):
                 store.add_turn(mtg.meeting_id, round=flow, phase="intake", speaker_id=None,
                                speaker_name=speaker, kind="user_feedback", content=text)
             # 轮次、反馈的移交与滞留标记、旧报告字段、旧处置记录的清理一次写完：中途崩溃不会重复加轮
-            store.update_meeting(mtg.meeting_id, round=flow, phase="intake", state_json={
+            # 章程一并刷新：纪要头部的"会议信息"与插话回应不再读到上一轮的旧方案文本
+            store.update_meeting(mtg.meeting_id, round=flow, phase="intake",
+                                 charter_json=_charter_dict(mtg), state_json={
                 **state, "reopen_feedback": "", "intake_feedback": text,
                 "rework_pending": False,
                 "verdict": None, "accepted_by_user": False,
@@ -535,7 +568,14 @@ class ReviewProtocol(MeetingProtocol):
             return advance("points")
         if not read_artifact(mtg.run_id, "proposal"):
             raise NodeFailure("评审会议需要建设方案工件，但方案还没有产出", fatal=True)
+        if not _ledger_points(mtg):
+            raise NodeFailure("评审会议需要讨论会议的决策点账本，但账本是空的", fatal=True)
         self._ensure_participants(mtg)
+        hint = _family_hint(mtg)                      # 详设 §8.1 的评审者异家族检查
+        mtg.set_state(family_hint=hint)
+        if hint:
+            await emit(mtg.run_id, "node_log", mtg.node_id,
+                       {"level": "warn", "message": hint})
         state = mtg.state()
         if not state.get("checklist"):
             found = store.find_turn(mtg.meeting_id, phase="prepare", round=_flow(mtg),
@@ -664,10 +704,24 @@ class ReviewProtocol(MeetingProtocol):
             f"处置：{issue.get('disposition') or '—'}"
             for issue in _round_issues(mtg) if issue.get("category") == "decision"), name="上一轮意见")]
             if incremental else [])
+        # 详设 §8.2：独立评审对照方案与自己写的要点——把每名评审者在要点步写下的内容并进它的上下文
+        own_points: dict[int, Segment] = {}
+        if not incremental:
+            for reviewer in _reviewers(mtg):
+                found = store.find_turn(mtg.meeting_id, phase="points", round=_flow(mtg),
+                                        kind="review_points", speaker_id=reviewer["id"])
+                if found:
+                    own_points[reviewer["id"]] = Segment(
+                        "append", f"## 你写下的评审要点\n{found['content']}", name="评审要点")
         results = await speak_many(mtg, [
             {"participant": reviewer, "kind": kind, "turn_kind": kind,
-             "charter": charter, "segments": segments,
-             "instruction": REVIEW_DELTA_INSTRUCTION if incremental else REVIEW_INSTRUCTION,
+             "charter": charter,
+             "segments": (segments + [own_points[reviewer["id"]]]
+                          if reviewer["id"] in own_points else segments),
+             "instruction": (REVIEW_WITH_POINTS_INSTRUCTION
+                             if reviewer["id"] in own_points
+                             else (REVIEW_DELTA_INSTRUCTION if incremental
+                                   else REVIEW_INSTRUCTION)),
              "structured": structured, "turn_round": _flow(mtg)}
             for reviewer in _reviewers(mtg)])
         strengths = dict(mtg.state().get("strengths") or {})
@@ -875,7 +929,9 @@ class ReviewProtocol(MeetingProtocol):
         result = await reroute_or_escalate(
             mtg, ["discuss"], feedback,
             title="评审意见仍为阻塞", description=feedback[:3000],
-            summary="评审结论：退回讨论会议复议")
+            summary="评审结论：退回讨论会议复议",
+            extra_payload=({"family_hint": mtg.state()["family_hint"]}
+                           if mtg.state().get("family_hint") else None))
         if result is None:                            # 人在确认点上接受现状
             mtg.set_state(accepted_by_user=True)
             _patch_round(mtg, "verdict")
@@ -1021,9 +1077,9 @@ class ReviewProtocol(MeetingProtocol):
             ("评了什么", f"- 建设方案 v{latest.get('version', '?')}；评审 {_flow(mtg)} 轮"),
             ("谁评的", "\n".join(f"- {row['display_name']}（{MODE_NAMES.get(row['mode'], row['mode'])}）"
                                 for row in mtg.participants()) or "（无）"),
-            ("优点", "\n".join(strengths) or "（无）"),
             ("结论", "\n".join(conclusion)),
             ("问题清单及处置状态", "\n".join(review_rules.issue_lines(issues))),
+            ("优点", "\n".join(strengths) or "（无）"),
             ("保留的异议", "\n".join(dissent) or "（无）"),
         ]
         return minutes.write_minutes(

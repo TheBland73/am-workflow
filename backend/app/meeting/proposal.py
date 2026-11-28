@@ -36,9 +36,9 @@ def pending_section(clarifications: list[dict], points: list[dict]) -> str:
 
 
 def compose(draft: str, *, points: list[dict], clarifications: list[dict]) -> str:
-    """模型写的正文 + 决策点索引 + 待确认问题。"""
-    return (draft.strip() + "\n\n" + index_section(points) + "\n"
-            + pending_section(clarifications, points))
+    """模型写的正文 + 待确认问题 + 决策点索引（节顺序照详设 §7.8）。"""
+    return (draft.strip() + "\n\n" + pending_section(clarifications, points) + "\n"
+            + index_section(points))
 
 
 def _cell(value) -> str:

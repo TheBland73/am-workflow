@@ -41,7 +41,8 @@ def reroute(targets: list[str], feedback: str, *, self_feedback: str | None = No
 
 async def reroute_or_escalate(mtg: "MeetingSession", targets: list[str], feedback: str, *,
                               self_feedback: str | None = None, title: str,
-                              description: str, summary: str = "") -> StepResult | None:
+                              description: str, summary: str = "",
+                              extra_payload: dict | None = None) -> StepResult | None:
     """发起定点回流；回流轮次已用完时，先由人在一个确认点上决定怎么办。
 
     返回值就是调用它的步骤该返回的东西：
@@ -49,6 +50,7 @@ async def reroute_or_escalate(mtg: "MeetingSession", targets: list[str], feedbac
     - 轮次已用完、人还没决定：挂起（确认点类型是 escalation）；
     - 轮次已用完、人驳回并写了意见：带 extra_round 的回流指令，意见并入反馈，编排器放宽一轮；
     - 返回 None：人在确认点上选择通过，即接受现状、不再回流。调用它的步骤据此往下走。
+    extra_payload 并进升级确认点的载荷（如评审者的异家族提示，详设 §8.1）。
     """
     if mtg.round_no() < mtg.max_rounds():
         return reroute(targets, feedback, self_feedback=self_feedback, summary=summary)
@@ -64,7 +66,8 @@ async def reroute_or_escalate(mtg: "MeetingSession", targets: list[str], feedbac
         return suspend(await mtg.open_checkpoint(
             "escalation", title=title, description=description,
             payload={"targets": list(targets), "feedback": feedback[:2000],
-                     "round": mtg.round_no(), "max_rounds": mtg.max_rounds()}))
+                     "round": mtg.round_no(), "max_rounds": mtg.max_rounds(),
+                     **(extra_payload or {})}))
     if decision["action"] == "approve":
         mtg.ack_decision(decision, disposition={"kind": "escalation", "action": "approve"})
         return None

@@ -635,3 +635,53 @@ def test_confirm_round_started_is_not_re_emitted_after_a_crash(monkeypatch) -> N
     asyncio.run(protocol.step_prepare(mtg))
 
     assert calls["n"] == 1                          # 重入不再重复发同一轮的轮次事件
+
+
+def test_incremental_rounds_recheck_last_rounds_added_requirements(monkeypatch) -> None:
+    """详设 §9.4：上一轮"凭空新增"的需求增量轮也要重新核对，不能结构性地漏出复核。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(
+        fidelity='{"checks": [], "added": [{"requirement": "R7", "reason": "仍然没有账本依据"}]}'),
+        seen)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="fidelity", state={
+        "last_items": [{"kind": "added", "requirement": "R7", "reason": "矩阵来源是编造的"}]})
+    store.update_meeting(mtg.meeting_id, round=2)
+    store.add_participant(mtg.meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    store.add_participant(mtg.meeting_id, role_key="architect", display_name="架构师",
+                          mode="checker", system_prompt="你是核对者")
+    protocol = confirm_module.ConfirmProtocol()
+
+    asyncio.run(protocol.step_fidelity(mtg))
+
+    call = next(call for call in seen if call["kind"] == "fidelity")
+    assert "R7" in call["text"] and "凭空新增" in call["text"]
+    assert [row["requirement"] for row in _state(node_id)["added"]] == ["R7"]
+
+
+def test_the_chair_dedupes_the_program_findings(monkeypatch) -> None:
+    """详设 §9.2：主席把各方核对发现去重归类——同一问题不同措辞只保留一条。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(confirm_merge=(
+        '{"items": [{"kind": "quality", "index": "", "requirement": "R1", '
+        '"problem": "验收标准写得太模糊，没法核对", "suggestion": ""}], "duplicates": ["2"]}')),
+        seen)
+    run_id, node_id = _confirm_run()
+    mtg = _confirm_session(run_id, node_id, phase="merge", state={
+        "quality_issues": [
+            {"location": "R1", "problem": "验收标准写得太模糊，没法核对",
+             "severity": "major", "suggestion": "写清判定方式"},
+            {"location": "R1", "problem": "R1 的验收标准不可操作",
+             "severity": "major", "suggestion": "写清判定方式"},
+        ]})
+    store.add_participant(mtg.meeting_id, role_key="review_chair", display_name="评审主席",
+                          mode="chair", system_prompt="你是评审主席")
+    protocol = confirm_module.ConfirmProtocol()
+
+    asyncio.run(protocol.step_merge(mtg))
+
+    items = [item for item in _state(node_id)["items"] if item["origin"] == "program"]
+    assert len(items) == 1 and items[0]["requirement"] == "R1"
+    assert seen and "归类去重" in next(call["text"] for call in seen
+                                       if call["kind"] == "confirm_merge")

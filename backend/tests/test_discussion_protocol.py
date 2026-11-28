@@ -251,9 +251,10 @@ def test_meeting_reaches_a_proposal_with_two_human_checkpoints(monkeypatch) -> N
     assert "Markdown 即可" in _charter(node_id)["已澄清的问题"]
     meta, body = _proposal(run_id)
     assert meta["version"] == 1 and "## 待确认问题" in body and "## 决策点索引" in body
+    assert body.index("## 待确认问题") < body.index("## 决策点索引")   # 详设 §7.8 的节顺序
     assert "## 决策点账本" in parse_front_matter(read_artifact(run_id, "discussion"))[1]
     kinds = Counter(call["kind"] for call in seen)
-    assert kinds["position"] == 2 and kinds["claim"] == 4 and kinds["exchange_summary"] == 2
+    assert kinds["position"] == 2 and kinds["claim"] == 2 and kinds["exchange_summary"] == 2
     types = [event["type"] for event in load_events(run_id)]
     assert "meeting_ledger_updated" in types and "meeting_turn_finished" in types
     assert "context_prefix_changed" not in types        # 账本的正常更新不该报冻结段被改
@@ -339,14 +340,17 @@ def test_delegating_lets_the_facilitator_rule_and_keeps_dissent(monkeypatch) -> 
 
 
 def test_facilitator_rules_closure_rules_once_exchanges_are_used_up(monkeypatch) -> None:
+    """闭合规则是主持人裁决：交锋跨轮累计，第 2 轮重新表态仍未了结的才交主持人裁决。"""
     seen: list[dict] = []
-    install(monkeypatch, _replies(restance=_split), seen)
+    install(monkeypatch, _replies(restance=lambda text: ARCHITECT), seen)
     run_id, node_id = _meeting_run({"params": {"discussion": {"closure_rule": "facilitator_rules"}}})
 
     result = drive(run_id, node_id, _approve, idea=IDEA)
 
     assert result["done"] is True and _ledger(node_id)["D2"]["status"] == "ruled"
-    assert [call["kind"] for call in seen].count("ruling") == 1
+    assert result["rounds"] == 2
+    kinds = Counter(call["kind"] for call in seen)
+    assert kinds["restance"] == 4 and kinds["claim"] == 2 and kinds["ruling"] == 1
     assert "主持人裁决" in _charter(node_id)["闭合规则"]
 
 
@@ -361,6 +365,8 @@ def test_a_single_participant_skips_stances_and_debate(monkeypatch) -> None:
     assert result["done"] is True and result["rounds"] == 1
     assert kinds["position"] == 1 and "stance" not in kinds and "claim" not in kinds
     assert {point["status"] for point in _ledger(node_id).values()} == {"agreed"}
+    # 立场即共识：账本结论写他自己的立场，不是占位文案
+    assert "先做最小闭环" in _ledger(node_id)["D1"]["conclusion"]
 
 
 def test_a_fixed_headcount_is_enforced(monkeypatch) -> None:
@@ -1176,6 +1182,7 @@ def test_proxy_answers_are_recorded_with_evidence_or_as_assumptions(monkeypatch)
     answered = _charter(node_id)["已澄清的问题"]
     assert "需求方代理，依据背景材料或用户回答" in answered
     assert "需要导出周报" in answered and "按假设处理" in answered
+    assert "出处：简报：两周内可用" in answered                        # 详设 §7.6：出处原文进章程
 
 
 def _bare_meeting(run_id: str, node_id: int, phase: str) -> tuple[int, MeetingSession]:
@@ -1248,7 +1255,7 @@ def test_exchange_resumes_without_repeating_the_recorded_claim(monkeypatch) -> N
 
     assert result["done"] is True
     kinds = Counter(call["kind"] for call in seen)
-    assert kinds["claim"] == 3 and kinds["challenge"] == 3 and kinds["respond"] == 4
+    assert kinds["claim"] == 1 and kinds["challenge"] == 1 and kinds["respond"] == 2
 
 
 def test_reopen_reuses_the_recorded_plan_and_ignores_unknown_indexes(monkeypatch) -> None:
@@ -1548,7 +1555,7 @@ def test_exchange_claim_is_salvaged_when_the_claim_number_is_lost(monkeypatch) -
 
     assert result["done"] is True
     kinds = Counter(call["kind"] for call in seen)
-    assert kinds["claim"] == 3 and kinds["challenge"] == 4 and kinds["respond"] == 4
+    assert kinds["claim"] == 1 and kinds["challenge"] == 2 and kinds["respond"] == 2
 
 
 def test_draft_speak_is_salvaged_after_a_crash(monkeypatch) -> None:

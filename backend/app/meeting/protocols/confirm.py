@@ -54,10 +54,11 @@ QUALITY_INSTRUCTION = (
     '"problem": "……", "suggestion": "……"}]}\n'
     "没有问题的时候 issues 给空数组。")
 MERGE_INSTRUCTION = (
-    "请把下面这些核对条目归类去重，并给走样与遗漏的条目补上它应当落在哪条需求上。"
-    "只输出一个 JSON 对象：\n"
+    "下面是各方核对发现的条目清单（行首是序号）。请归类去重：不同人发现的同一问题只保留一条，"
+    "被去掉的重复条目把它的序号放进 duplicates；保留的条目输出到 items，"
+    "走样与遗漏的要补上它应当落在哪条需求上。只输出一个 JSON 对象：\n"
     '{"items": [{"kind": "distorted", "index": "D2", "requirement": "R3", '
-    '"problem": "……", "suggestion": "……"}]}')
+    '"problem": "……", "suggestion": "……"}], "duplicates": ["3"]}')
 INTAKE_INSTRUCTION = (
     "用户对需求确认结论提出了意见。请把它整理成核对清单里的条目：kind 取 quality，"
     "写明对应的需求编号、问题与修改建议。只输出一个 JSON 对象：\n"
@@ -134,6 +135,20 @@ def _validate_items(*, allow_empty: bool) -> Validator:
                 for position, row in enumerate(rows)
                 if not isinstance(row, dict)
                 or not str(row.get("problem") or "").strip()]
+
+    return validate
+
+
+def _validate_merge() -> Validator:
+    """主席归类步的输出：items 是保留的条目，duplicates 是被去掉的重复条目的清单序号。"""
+    def validate(data: dict) -> list[str]:
+        issues = _validate_items(allow_empty=True)(data)
+        duplicates = data.get("duplicates")
+        if duplicates is not None and not (
+                isinstance(duplicates, list)
+                and all(isinstance(row, (int, str)) for row in duplicates)):
+            issues.append("duplicates 须是序号数组")
+        return issues
 
     return validate
 
@@ -609,12 +624,21 @@ class ConfirmProtocol(MeetingProtocol):
         coverage = str(mtg.params().get("coverage") or "full")
         checkers = _checkers(mtg)
         assignments = self._assignments(mtg, checkers, points, coverage)
+        previous_added: list[str] = []
         if _flow(mtg) > 1:
             assignments = self._incremental_assignments(mtg, assignments)
+            # 详设 §9.4：上一轮"凭空新增"的需求在增量轮也要重新核对——
+            # 否则它结构性地漏出复核，分析没改的那条会让确认误判通过
+            previous_added = sorted({str(item.get("requirement"))
+                                     for item in mtg.state().get("last_items") or []
+                                     if item.get("kind") == "added" and item.get("requirement")})
         active = [checker for checker in checkers if assignments.get(checker["id"])]
-        if not active:
+        if not active and not previous_added:
             _finish_step(mtg, "fidelity", fidelity=[], added=[])
             return advance("quality")
+        if not active and previous_added:
+            active = [checkers[0]]              # 没有决策点要核对，也要有人复查上轮的凭空新增
+            assignments = {active[0]["id"]: []}
         expected = dict(mtg.state().get("expected") or {})
         charter = _charter(mtg)
         calls = []
@@ -629,7 +653,10 @@ class ConfirmProtocol(MeetingProtocol):
             calls.append({
                 "participant": checker, "kind": "fidelity", "turn_kind": "fidelity",
                 "charter": charter, "segments": segments,
-                "instruction": FIDELITY_INSTRUCTION + _indexes_line("核对", indexes),
+                "instruction": FIDELITY_INSTRUCTION + _indexes_line("核对", indexes)
+                               + (f"\n上一轮发现这些需求凭空新增，请重新核对它们是否仍然没有账本"
+                                  f"依据（需求已删除或依据已补上就不再报）："
+                                  + "、".join(previous_added) if previous_added else ""),
                 "structured": _validate_fidelity(indexes), "turn_round": _flow(mtg)})
         results = await speak_many(mtg, calls)
         rows: list[dict] = []
@@ -750,18 +777,19 @@ class ConfirmProtocol(MeetingProtocol):
                         if item.get("origin") == "user"
                         and int(item.get("round") or 0) == flow]
         program = _program_items(mtg)
-        if any(item["kind"] in ("distorted", "missing") for item in program):
-            # 主席只做归类：给走样与遗漏的条目补上它应当落在哪条需求上
-            listing = "\n".join(f"- [{KIND_NAMES.get(item['kind'], item['kind'])}] "
+        if program:
+            # 详设 §9.2：主席把各方的核对条目去重归类，走样与遗漏的还要补上落点。
+            # 行首序号是去重的凭据：quality/added 条目没有决策点编号，按序号标记重复
+            listing = "\n".join(f"- {position}。 [{KIND_NAMES.get(item['kind'], item['kind'])}] "
                                 f"{_where(item)}：{item.get('problem') or ''}"
-                                for item in program)
+                                for position, item in enumerate(program, start=1))
             found = store.find_turn(mtg.meeting_id, phase="merge", round=flow,
                                     kind="confirm_merge", speaker_id=_chair(mtg)["id"])
             data = found["data"] if found else (await speak(
                 mtg, _chair(mtg), kind="confirm_merge", turn_kind="confirm_merge",
                 charter=_charter(mtg),
                 segments=[Segment("append", f"## 待归类的核对条目\n{listing}", name="条目清单")],
-                instruction=MERGE_INSTRUCTION, structured=_validate_items(allow_empty=True),
+                instruction=MERGE_INSTRUCTION, structured=_validate_merge(),
                 turn_round=flow))["data"]
             fills: dict[str, str] = {}
             for row in data.get("items") or []:
@@ -769,9 +797,13 @@ class ConfirmProtocol(MeetingProtocol):
                 requirement = str(row.get("requirement") or "").strip()
                 if index and requirement:
                     fills.setdefault(index, requirement)
+            duplicates = {str(row) for row in data.get("duplicates") or []}
             for item in program:
                 if item["kind"] in ("distorted", "missing") and not item["requirement"]:
                     item["requirement"] = fills.get(item["index"], "")
+            if duplicates:
+                program = [item for position, item in enumerate(program, start=1)
+                           if str(position) not in duplicates]
         number = _next_number(state.get("items") or [], state.get("last_items") or [])
         # 已入账的同一批条目沿用旧编号（按轮次、出处、需求、问题签名匹配）：崩溃重入
         # 重跑汇总时不会以新编号重复入账，也不会把已入账的条目挤掉。

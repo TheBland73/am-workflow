@@ -927,3 +927,103 @@ def test_review_round_started_names_the_protocol(monkeypatch) -> None:
     asyncio.run(review_module._round_started(mtg))
 
     assert emitted and emitted[0].get("protocol") == "review"
+
+
+def test_independent_review_reads_the_reviewers_own_points(monkeypatch) -> None:
+    """详设 §8.2：独立评审对照方案与自己写的要点——要点步的产出要进评审步的上下文。"""
+    seen: list[dict] = []
+    install(monkeypatch, _replies(), seen)
+    run_id, node_id = _review_run()
+
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    review_calls = [call for call in seen if call["kind"] == "review"]
+    assert review_calls
+    for call in review_calls:
+        assert "## 你写下的评审要点" in call["text"]
+        assert "决策点与方案是否一致" in call["text"]       # 要点步写下的 focus 进了上下文
+        assert "请对照方案、检查单与你先前写下的评审要点" in call["text"]
+
+
+def test_reviewers_family_mix_is_checked_at_prepare(monkeypatch) -> None:
+    """详设 §8.1：没有异家族评审者时，准备步给出提示（写进状态并发节点日志）。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    state = store.latest_meeting_for_node(node_id)["state"]
+    assert "评审者与讨论会议的参会者全部同属一个模型家族" in (state.get("family_hint") or "")
+    logs = [e for e in load_events(run_id) if e["type"] == "node_log"
+            and "自我偏好" in str(e["payload"].get("message") or "")]
+    assert logs
+
+
+def test_a_heterogeneous_reviewer_suppresses_the_family_hint(monkeypatch) -> None:
+    """有一名评审者绑定了别的家族的模型（评审者模式的行）：不给提示。"""
+    from types import SimpleNamespace
+    from app.meeting import calls as calls_module
+
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    other = SimpleNamespace(id=99_999, model_name="other-family-9x", display_name="其他家族",
+                            context_window=32768, max_output_tokens=4096)
+    base_model_for = calls_module._model_for
+
+    def split_model(participant):
+        if participant.get("mode") == "reviewer":
+            return other                            # 评审者全部换到另一个家族的模型
+        return base_model_for(participant)
+
+    monkeypatch.setattr(calls_module, "_model_for", split_model)
+
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    state = store.latest_meeting_for_node(node_id)["state"]
+    assert not (state.get("family_hint") or "")
+
+
+def test_escalation_checkpoint_carries_the_family_hint(monkeypatch) -> None:
+    """详设 §8.1 的"在确认点上提示"：升级确认点的载荷带上异家族提示。"""
+    install(monkeypatch, _replies(
+        review=json.dumps({"strengths": [], "issues": [DECISION]}),
+        review_merge=_merge(DECISION), author_response=_respond), None)
+    run_id, node_id = _review_run()
+    with session_scope() as s:
+        node = s.get(Node, node_id)
+        node.config_json = {**(node.config_json or {}), "round": 3, "max_rounds": 3}
+
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    with session_scope() as s:
+        gate = s.query(Gate).filter(Gate.run_id == run_id, Gate.kind == "escalation").one()
+    assert "评审者与讨论会议的参会者全部同属一个模型家族" in gate.payload_json.get("family_hint", "")
+
+
+def test_review_prepare_fails_without_a_ledger(monkeypatch) -> None:
+    """详设 §8.2 准备行"确认方案和账本齐全"：账本是空的带明确的错误失败，不按空账本评审。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+    from app.db.models import DecisionPoint, Meeting as MeetingRow
+    with session_scope() as s:
+        meeting_ids = [m.id for m in s.query(MeetingRow).filter(
+            MeetingRow.run_id == run_id).all()]
+        s.query(DecisionPoint).filter(
+            DecisionPoint.meeting_id.in_(meeting_ids)).delete(synchronize_session=False)
+
+    with pytest.raises(NodeFailure) as excinfo:
+        drive(run_id, node_id, _never, idea=IDEA)
+
+    assert "账本是空的" in str(excinfo.value)
+    assert excinfo.value.fatal is True
+
+
+def test_review_report_sections_follow_the_design_order(monkeypatch) -> None:
+    """详设 §8.7 报告节顺序：评了什么、谁评的、结论、问题清单、优点、保留的异议。"""
+    install(monkeypatch, _replies(), None)
+    run_id, node_id = _review_run()
+
+    drive(run_id, node_id, _approve, idea=IDEA)
+
+    body = parse_front_matter(read_artifact(run_id, "review"))[1]
+    assert body.index("## 结论") < body.index("## 问题清单及处置状态") < body.index("## 优点")

@@ -47,7 +47,9 @@ def test_compose_appends_index_and_pending_questions() -> None:
 
     body = compose("# 建设方案\n\n正文。", points=points, clarifications=clarifications)
 
-    assert body.startswith("# 建设方案\n\n正文。\n\n## 决策点索引")
+    # 详设 §7.8 的节顺序：正文、待确认问题、决策点索引
+    assert body.startswith("# 建设方案\n\n正文。\n\n## 待确认问题")
     assert "| D1 | 已一致 | 网页版 |" in body
     assert "- [ ] D2 登录：架构：成本太高" in body
     assert "- [ ] 假设：支持哪些平台——未知" in body
+    assert body.index("## 待确认问题") < body.index("## 决策点索引")

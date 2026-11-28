@@ -530,6 +530,7 @@ def _write_charter(mtg) -> None:
     clarifications = state.get("clarifications") or []
     answered = "\n".join(
         f"- 问：{item['question']}\n  答：{item['answer']}（{SOURCE_NAMES[item['source']]}）"
+        + (f"\n  出处：{str(item.get('evidence') or '')[:200]}" if item.get("evidence") else "")
         for item in clarifications) or "（没有需要澄清的问题）"
     rule = str(params.get("closure_rule") or "unanimous")
     materials, _truncated = mtg.materials()
@@ -876,9 +877,19 @@ class DiscussionProtocol(MeetingProtocol):
         members = mtg.participants("participant")
         open_points = _open_points(_points(mtg))
         if len(members) <= 1:
-            # 只有一名参会者：立场即共识，不经过表态和交锋
+            # 只有一名参会者：立场即共识，不经过表态和交锋；结论写他自己的立场，不写占位文案
+            stance = ""
+            if members:
+                found = store.find_turn(mtg.meeting_id, phase="positions",
+                                        round=mtg.meeting_round(), kind="position",
+                                        speaker_id=members[0]["id"])
+                if found:
+                    data = found.get("data") or {}
+                    stance = (str(data.get("route") or "").strip()
+                              or found["content"][:200])
+            conclusion = (f"唯一参会者的立场：{stance}" if stance else "唯一参会者的立场")
             for point in open_points:
-                _close(mtg, point["index"], "agreed", "唯一参会者的立场", "只有一名参会者")
+                _close(mtg, point["index"], "agreed", conclusion, "只有一名参会者")
             await _ledger_updated(mtg)
             return advance("reopen")
         charter = _charter(mtg)
@@ -903,45 +914,43 @@ class DiscussionProtocol(MeetingProtocol):
     # ---------- 交锋轮次 ----------
     async def step_exchange(self, mtg):
         members = mtg.participants("participant")
-        limit = max(1, int(mtg.params().get("exchanges_per_point") or 2))
         round_no = mtg.meeting_round()
         charter = _charter(mtg)
         by_id = {member["id"]: member for member in members}
         done = set(mtg.state().get("exchange_done") or [])
-        exchanges: dict[str, int] = {}
+        exchanges = dict(mtg.state().get("exchanges") or {})
         for point in _open_points(_points(mtg)):
             ranked = rank_speakers(point, [member["id"] for member in members])
             claimer = by_id[ranked[0]]
-            # 质疑者从最反对的一端开始轮换；交锋次数大于人数时按环取，不会越界
+            # 质疑者从最反对的一端开始按轮换；人数多于轮次时按环取，不会越界
             opponents = [voter for voter in reversed(ranked) if voter != ranked[0]]
             subject = f"决策点 {point['index']}「{point['title']}」：{point['question']}"
-            exchanges[point["index"]] = 0
-            for number in range(1, limit + 1):
-                mark = f"{point['index']}:{number}"
-                opponent = (opponents[(number - 1) % len(opponents)] if opponents
-                            else ranked[0])
-                challenger = by_id[opponent]
-                instructions = {
-                    "claim": f"关于{subject}，请主张你支持的立场，给出理由和依据。只写一段话。",
-                    "challenge": (f"关于{subject}，请质疑刚才的主张：指出它站不住的地方并给出理由；"
-                                  "如果你的立场不同，说明你支持什么。只写一段话。"),
-                    "respond": (f"关于{subject}，请回应刚才的质疑：采纳并说明你如何调整立场，"
-                                "或不采纳并说明理由。只写一段话。"),
-                }
-                for kind, speaker in (("claim", claimer), ("challenge", challenger),
-                                      ("respond", claimer)):
-                    if f"{mark}:{kind}" in done:
-                        continue
-                    # 认领式复用：发言落盘、编号还没写上时被杀，重入按发言行找回这一段
-                    await reuse_or_speak(
-                        mtg, f"exchange:{round_no}:{mark}:{kind}",
-                        participant=speaker, kind=kind, turn_kind=kind, charter=charter,
-                        segments=_view(mtg, _EXCHANGE_KINDS),
-                        decision_point_id=point["id"], turn_round=round_no,
-                        instruction=instructions[kind])
-                    _mark(mtg, f"{mark}:{kind}")
-                exchanges[point["index"]] += 1
-        mtg.set_state(exchanges={**(mtg.state().get("exchanges") or {}), **exchanges})
+            mark = f"{point['index']}@{round_no}"
+            opponent = (opponents[(round_no - 1) % len(opponents)] if opponents
+                        else ranked[0])
+            challenger = by_id[opponent]
+            instructions = {
+                "claim": f"关于{subject}，请主张你支持的立场，给出理由和依据。只写一段话。",
+                "challenge": (f"关于{subject}，请质疑刚才的主张：指出它站不住的地方并给出理由；"
+                              "如果你的立场不同，说明你支持什么。只写一段话。"),
+                "respond": (f"关于{subject}，请回应刚才的质疑：采纳并说明你如何调整立场，"
+                            "或不采纳并说明理由。只写一段话。"),
+            }
+            for kind, speaker in (("claim", claimer), ("challenge", challenger),
+                                  ("respond", claimer)):
+                if f"{mark}:{kind}" in done:
+                    continue
+                # 认领式复用：发言落盘、编号还没写上时被杀，重入按发言行找回这一段
+                await reuse_or_speak(
+                    mtg, f"exchange:{round_no}:{point['index']}:{kind}",
+                    participant=speaker, kind=kind, turn_kind=kind, charter=charter,
+                    segments=_view(mtg, _EXCHANGE_KINDS),
+                    decision_point_id=point["id"], turn_round=round_no,
+                    instruction=instructions[kind])
+                _mark(mtg, f"{mark}:{kind}")
+            # 每轮每个未决点交锋一次，次数跨轮累计（详设 §7.4：达到规定次数仍未了结的交主持人裁决）
+            exchanges[point["index"]] = int(exchanges.get(point["index"]) or 0) + 1
+        mtg.set_state(exchanges=exchanges)
         return advance()
 
     async def step_summary(self, mtg):
@@ -992,28 +1001,28 @@ class DiscussionProtocol(MeetingProtocol):
         members = mtg.participants("participant")
         round_no = mtg.meeting_round()
         params = mtg.params()
-        # 闭合规则是"主持人裁决"：交锋次数已满、仍未一致的交给主持人裁决
+        if not _open_points(_points(mtg)):
+            # 全部了结（如裁决或结算关掉了最后的点）：不再向模型要一次"对零个点重新表态"的回复
+            mtg.set_state(consensus_reason="all_closed")
+            return advance("consensus")
+        charter, view = _charter(mtg), _view(mtg, _ROUND_KINDS)
+        results = await speak_many(mtg, [
+            {"participant": member, "kind": "restance", "turn_kind": "restance",
+             "charter": charter, "segments": view, "instruction": RESTANCE_INSTRUCTION,
+             "structured": _validate_stances([point["index"] for point in
+                                              _open_points(_points(mtg))]),
+             "turn_round": round_no} for member in members])
+        for member, result in zip(members, results):
+            _apply_stances(mtg, member, result["data"])
+        outcome = _settle_round(mtg)
+        # 闭合规则是"主持人裁决"：跨轮累计的交锋次数已满、重新表态之后仍未了的，
+        # 由主持人裁决（详设 §7.4 的轮次顺序：交锋 → 重新表态 → 闭合计算）
         if str(params.get("closure_rule") or "unanimous") == "facilitator_rules":
             used_up = to_rule(_points(mtg), mtg.state().get("exchanges") or {},
                               int(params.get("exchanges_per_point") or 2))
             if used_up:
                 await self._rule(mtg, used_up)
                 mtg.reset_builder()                   # 裁决改写了账本，下一次调用以新账本为基线
-        remaining = _open_points(_points(mtg))
-        if not remaining:
-            # 裁决已经把最后的未决点关闭：不再向模型要一次"对零个点重新表态"的回复
-            mtg.set_state(consensus_reason="all_closed")
-            await _ledger_updated(mtg)
-            return advance("consensus")
-        charter, view = _charter(mtg), _view(mtg, _ROUND_KINDS)
-        results = await speak_many(mtg, [
-            {"participant": member, "kind": "restance", "turn_kind": "restance",
-             "charter": charter, "segments": view, "instruction": RESTANCE_INSTRUCTION,
-             "structured": _validate_stances([point["index"] for point in remaining]),
-             "turn_round": round_no} for member in members])
-        for member, result in zip(members, results):
-            _apply_stances(mtg, member, result["data"])
-        outcome = _settle_round(mtg)
         remaining = _open_points(_points(mtg))
         await _ledger_updated(mtg)
         mtg.reset_builder()                           # 结算可能关闭了决策点
@@ -1031,9 +1040,10 @@ class DiscussionProtocol(MeetingProtocol):
         if round_no >= int(mtg.state().get("rounds_limit") or _rounds_max(mtg)):
             mtg.set_state(consensus_reason="rounds_max")
             return advance("consensus")
-        # 进入下一轮：账本快照会更新，这是预期内的变化，不该报冻结段被改
+        # 进入下一轮：账本快照会更新，这是预期内的变化，不该报冻结段被改。
+        # 交锋次数跨轮累计，这里不清 exchanges
         store.update_meeting(mtg.meeting_id, round=round_no + 1)
-        mtg.set_state(stance_snapshot=snapshot(remaining), exchange_done=[], exchanges={})
+        mtg.set_state(stance_snapshot=snapshot(remaining), exchange_done=[])
         mtg.reset_builder()
         return advance("exchange")
 
