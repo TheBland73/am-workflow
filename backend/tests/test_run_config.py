@@ -315,3 +315,12 @@ def test_create_failure_does_not_leave_a_created_run(monkeypatch) -> None:
     with session_scope() as s:
         failed = s.query(Run).filter(Run.status == "failed").all()
     assert any((run.error or "").startswith("创建运行失败") for run in failed)
+
+
+def test_role_suits_meeting_treats_malformed_meta_as_unsuitable() -> None:
+    """适合的会议角色被写坏成字符串时按不适合处理，不让子串匹配放行。"""
+    from app.engine.templates import role_suits_meeting
+
+    assert role_suits_meeting({"meta": {"meeting_roles": "discussion_review"}}, "review") is False
+    assert role_suits_meeting({"meta": {"meeting_roles": ["discussion"]}}, "discussion") is True
+    assert role_suits_meeting({"meta": {}}, "review") is True

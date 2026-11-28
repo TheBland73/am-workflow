@@ -331,9 +331,15 @@ def test_orchestrator_parks_the_run_at_a_checkpoint_and_resumes_after_the_decisi
     with session_scope() as s:
         assert s.get(Node, node_id).status == "done"
         assert s.get(Run, run_id).status == "finished"
-        events = [e.type for e in s.query(Event).filter(Event.run_id == run_id).all()]
+        rows = [(e.type, e.payload_json) for e in
+                s.query(Event).filter(Event.run_id == run_id).all()]
+    events = [row[0] for row in rows]
     assert events.index("meeting_started") < events.index("meeting_suspended") < events.index(
         "meeting_resumed") < events.index("meeting_finished") < events.index("run_finished")
+    finished = [payload for kind, payload in rows if kind == "meeting_finished"][-1]
+    # 详设 §12.5：会议结束事件带轮次、发言数与用量
+    assert finished["round"] >= 1 and finished["turns"] >= 0
+    assert set(finished["usage"]) == {"tokens_in", "tokens_out", "cached_tokens"}
 
 
 def test_redundant_scheduling_does_not_repeat_meeting_suspended() -> None:

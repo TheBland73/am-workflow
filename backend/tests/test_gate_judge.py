@@ -708,3 +708,22 @@ def test_delegating_a_meeting_checkpoint_lets_the_meeting_continue_and_finish(mo
     # 没答的澄清问题按假设记进会议：会议确实从那个决定处续开了
     turns = [turn["content"] for turn in store.list_turns(meeting["id"])]
     assert any("按假设处理" in content for content in turns)
+
+
+def test_an_invalid_model_verdict_returns_the_node_to_waiting_human(monkeypatch) -> None:
+    """委托判定但模型输出无效：门保持开着等人，节点不能停在 running。"""
+    seen: list[dict] = []
+    install(monkeypatch, {"gate_points": POINTS, "gate_verdict": '{"verdict": "maybe"}'}, seen)
+    _no_kick(monkeypatch)
+    _seed_model()
+    run_id = _make_run({"automation": {"level": "L3"}})
+    _artifact(run_id, "proposal", PROPOSAL)
+    _meeting(run_id, "review", "review", state={"verdict": "accept", "precheck_ok": True})
+    gate = request_gate(run_id, _node_id(run_id, "gate_review"))
+
+    with TestClient(app) as client:
+        response = client.post(f"/api/gates/{gate['id']}/delegate")
+        assert response.status_code == 202, response.text
+        assert _wait(lambda: _status(run_id, "gate_review") == "waiting_human"),             "判定无效后节点没有回到等待人工"
+
+    assert _gate(gate["id"])["status"] == "open"

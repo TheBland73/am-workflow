@@ -195,7 +195,11 @@ def role_suits_meeting(role: dict, meeting: str) -> bool:
     接口的名单校验与三个协议的点名分支共用这条规则。
     """
     roles = (role.get("meta") or {}).get("meeting_roles")
-    return meeting in roles if roles is not None else True
+    if roles is None:
+        return True
+    if not isinstance(roles, list):
+        return False            # 元数据坏了（如被 PATCH 成字符串）：按不适合处理，不做子串匹配
+    return meeting in roles
 
 
 def role_template(role_key: str) -> dict | None:

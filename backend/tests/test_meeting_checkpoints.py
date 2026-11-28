@@ -150,6 +150,11 @@ def test_api_approve_passes_data_through(monkeypatch) -> None:
                                json={"data": {"option": "proceed"}})
     assert response.status_code == 200, response.text
     assert get_gate(gate_id)["decision"]["data"] == {"option": "proceed"}
+    from app.engine.events import load_events
+    decided = [e for e in load_events(mtg.run_id) if e["type"] == "checkpoint_decided"]
+    # 会议内确认点的人工决定也推 checkpoint_decided（与其它三类判定者同一可观测口径）
+    assert decided and decided[-1]["payload"]["kind"] == "consensus"
+    assert decided[-1]["payload"]["decided_by"] == "human"
 
 
 def test_artifact_gate_reject_still_requires_target() -> None:

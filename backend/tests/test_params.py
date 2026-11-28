@@ -91,3 +91,13 @@ def test_proposal_gate_does_not_accept_the_judge_model() -> None:
         definition, {"automation": {"checkpoints": {"gate_proposal": "model"}}})
     assert validate_run_config(
         definition, {"automation": {"checkpoints": {"gate_proposal": "auto"}}}) == []
+
+
+def test_numeric_params_reject_truncation_and_non_finite_values() -> None:
+    """整型参数不接受带小数的值，浮点参数不接受 NaN / inf（范围比较对它们失效）。"""
+    from app.engine.params import _coerce
+
+    assert _coerce("rounds", {"type": "int", "title": "轮次"}, 2.5)[1] == "轮次须是整数"
+    assert _coerce("rounds", {"type": "int", "title": "轮次"}, 2.0)[0] == 2
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert _coerce("threshold", {"type": "float", "title": "阈值"}, bad)[1] == "阈值须是数字"

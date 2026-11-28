@@ -344,6 +344,20 @@ def count_turns(meeting_id: int) -> int:
             MeetingTurn.meeting_id == meeting_id).scalar() or 0
 
 
+def turn_usage(meeting_id: int) -> dict:
+    """这场会议全部发言的用量合计：会议结束事件的载荷用。"""
+    with session_scope() as s:
+        row = (
+            s.query(func.coalesce(func.sum(MeetingTurn.tokens_in), 0),
+                     func.coalesce(func.sum(MeetingTurn.tokens_out), 0),
+                     func.coalesce(func.sum(MeetingTurn.cached_tokens), 0))
+            .filter(MeetingTurn.meeting_id == meeting_id)
+            .one()
+        )
+    return {"tokens_in": int(row[0]), "tokens_out": int(row[1]),
+            "cached_tokens": int(row[2])}
+
+
 def get_turn(meeting_id: int, turn_id: int) -> dict | None:
     """按编号取一条有内容的发言；步骤用状态里记下的编号找回自己那一步的发言。"""
     with session_scope() as s:

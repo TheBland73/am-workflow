@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from app.conversation.policy import policy_from_config, validate_context_policy
 from app.db.base import session_scope
 from app.db.models import Node, Run, Workflow
@@ -38,11 +40,15 @@ def _coerce(key: str, spec: dict, raw) -> tuple[object | None, str | None]:
         if kind == "int":
             if isinstance(raw, bool):
                 raise ValueError
+            if isinstance(raw, float) and not raw.is_integer():
+                raise ValueError                       # 2.5 不能静默截断成 2
             value: object = int(raw)
         elif kind == "float":
             if isinstance(raw, bool):
                 raise ValueError
             value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError                       # NaN / inf 不能通过范围比较
         elif kind == "bool":
             value = (str(raw).strip().lower() in ("1", "true", "yes", "on")) if isinstance(raw, str) else bool(raw)
         else:

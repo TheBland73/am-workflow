@@ -303,6 +303,9 @@ class Orchestrator:
             if body is not None:
                 await emit(run_id, "gate_requested", node["id"], {
                     **body, "reason": result.get("reason") or "模型判定无效，转人工"})
+            # 从 delegate 入口进来时门已存在（不走 request_gate），节点不会自己回到等人状态：
+            # 判不了就明确置回 waiting_human，门开着等人工
+            self._update_node(node["id"], status="waiting_human")
             self._set_run(run_id, status="waiting_human")
         return result["action"]
 
@@ -606,6 +609,13 @@ class Orchestrator:
                 self._run_of_gate(gate_id), artifact_kind, artifact_body,
                 created_by=decided_by, status="approved",
             )
+        from app.db.models import Gate
+
+        with session_scope() as s:
+            gate_row = s.get(Gate, gate_id)
+            gate_kind = gate_row.kind if gate_row is not None else None
+            gate_meeting = gate_row.meeting_id if gate_row is not None else None
+            gate_node = gate_row.node_id if gate_row is not None else None
         result = _decide_gate(gate_id=gate_id, action=action, feedback=feedback,
                               target_node=target_node, decided_by=decided_by, data=data)
         if edited:
@@ -614,6 +624,11 @@ class Orchestrator:
             result["skipped_nodes"] = await self._skip_route_nodes(
                 result["run_id"], route_spec, route)
         await emit(result["run_id"], "gate_decided", None, result)
+        if gate_meeting is not None:
+            # 会议内确认点的人工决定：与委托、程序、模型四类判定者统一推 checkpoint_decided
+            await emit(result["run_id"], "checkpoint_decided", gate_node, {
+                "gate_id": gate_id, "kind": gate_kind, "decided_by": decided_by,
+                "decision": {"action": action, **(data or {})}})
         if action == "reject" and result.get("reset_nodes"):
             await emit(result["run_id"], "nodes_reset", None,
                        {"nodes": result["reset_nodes"], "target": target_node})

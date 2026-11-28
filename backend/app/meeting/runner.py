@@ -151,5 +151,10 @@ async def run_meeting(ctx: NodeContext) -> dict:
         store.update_meeting(meeting_id, status=MEETING_WAITING_REWORK)
         return {"reroute": result.reroute, "meeting_id": meeting_id, "summary": result.summary}
     store.update_meeting(meeting_id, status=MEETING_COMPLETED, finished_at=True)
-    await emit(ctx.run_id, "meeting_finished", ctx.node_id, {"meeting_id": meeting_id})
+    meeting = store.get_meeting(meeting_id)
+    await emit(ctx.run_id, "meeting_finished", ctx.node_id, {
+        "meeting_id": meeting_id,
+        "round": meeting.get("round") or 0,
+        "turns": store.count_turns(meeting_id),
+        "usage": store.turn_usage(meeting_id)})
     return {"meeting_id": meeting_id, **result.extra, "summary": result.summary, "done": True}
